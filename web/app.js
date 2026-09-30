@@ -520,7 +520,7 @@
     const lastError = scan.last_error && typeof scan.last_error === 'object' ? scan.last_error : null;
     const failureCount = toNumber(pick(scan, 'consecutive_failures', 'consecutiveFailures'));
     const timestamp = lastSuccess ? `最近成功扫描：${readableTimestamp(lastSuccess)}` : '';
-    if (scanState === 'partial') return { status: 'starting', message: '部分数据未更新', title: '部分目录不可用或记录读取异常，已保留可用缓存；后台会自动重试。' };
+    if (scanState === 'partial') return { status: 'starting', message: '部分数据未更新', title: '部分目录不可用或记录读取异常，已保留本地历史用量；后台会自动重试。' };
     if (scanState === 'error' || scanState === 'degraded' || text(pick(body, 'status')).toLowerCase() === 'degraded') {
       const errorAt = lastError && lastError.at ? ` · 最近异常：${readableTimestamp(lastError.at)}` : '';
       const failures = failureCount ? ` · 连续失败 ${formatNumber(failureCount)} 次` : '';
@@ -545,6 +545,12 @@
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const payload = await response.json();
       if (state.healthController !== controller) return;
+      const history = document.getElementById('historyStatus');
+      if (history && payload.history && payload.history.mode === 'durable') {
+        const size = (Number(payload.history.database_bytes || 0) / 1048576).toFixed(1);
+        history.textContent = `历史已保存 · ${size} MB`;
+        history.title = `保存位置：${payload.history.database_path}。已采集的用量在删除 Codex 日志后仍保留；软件运行时自动采集。`;
+      }
       const health = healthStatus(payload);
       setScanStatus(health.status, health.message, health.title);
     } catch (error) {

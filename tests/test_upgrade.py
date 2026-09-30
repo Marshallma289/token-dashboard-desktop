@@ -33,12 +33,14 @@ class UpgradeTests(unittest.TestCase):
   a=usage('thread-a','same',150);a['payload']['usage']={'input_tokens':100,'output_tokens':50,'total_tokens':150}
   b=usage('thread-a','same',150,'2026-09-18T16:31:00Z');b['payload']['usage']={'input_tokens':90,'output_tokens':60,'total_tokens':150}
   write_lines(self.path,[session(),turn('test'),a,b]);self.db.scan();s=self.db.dashboard(0)['summary']
-  self.assertEqual((s['input_tokens'],s['output_tokens'],s['total_tokens']),(90,60,150))
+  self.assertEqual((s['input_tokens'],s['output_tokens'],s['total_tokens']),(370,80,450))
+  row=self.db._connection.execute('SELECT input_tokens,output_tokens,total_tokens FROM usage_records WHERE total_tokens=150').fetchone()
+  self.assertEqual(tuple(row),(90,60,150))
  def test_query_cache_invalidates_after_scan(self):
   with patch.object(self.db,'_fetch_rows',wraps=self.db._fetch_rows) as fetch:
    self.db.dashboard(0);self.db.dashboard(0);self.assertEqual(fetch.call_count,1)
    write_lines(self.path,[session(),turn('test'),usage('thread-a','new',900)]);self.db.scan()
-   self.assertEqual(self.db.dashboard(0)['summary']['total_tokens'],900);self.assertEqual(fetch.call_count,2)
+   self.assertEqual(self.db.dashboard(0)['summary']['total_tokens'],1200);self.assertEqual(fetch.call_count,2)
  def test_official_label_is_utf8(self):
   self.assertEqual(self.db.catalog.label('openai'),'OpenAI 官方')
 if __name__=='__main__':unittest.main()

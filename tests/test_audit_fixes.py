@@ -188,7 +188,7 @@ class AuditFixTests(unittest.TestCase):
                 self.assertEqual(health["status"], "degraded")
                 self.assertEqual(health["scan"]["state"], "error")
                 self.assertEqual(health["scan"]["last_error"]["category"], "RuntimeError")
-                self.assertNotIn("private", json.dumps(health))
+                self.assertNotIn("private", json.dumps(health["scan"]))
             finally:
                 db.close()
 

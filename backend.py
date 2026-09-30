@@ -33,7 +33,13 @@ from pricing import DEFAULT_PRICING, canonical_model
 
 
 APP_DIR = Path(__file__).resolve().parent
-DEFAULT_DB = APP_DIR / "codex-token-dashboard.sqlite3"
+def local_data_dir() -> Path:
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "CodexTokenDashboard"
+    return Path(os.environ.get("LOCALAPPDATA", Path.home())) / "CodexTokenDashboard"
+
+
+DEFAULT_DB = local_data_dir() / "usage.sqlite3"
 DEFAULT_PROVIDER_CONFIG = APP_DIR / "providers.json"
 PARSER_SCHEMA_VERSION = 3
 APP_VERSION = (Path(__file__).resolve().parent / "VERSION").read_text(encoding="utf-8").strip()
@@ -360,6 +366,7 @@ class RolloutParser:
 
         # Reset errors from the lightweight schema-detection pass; report
         # malformed lines exactly once from the real parse below.
+        self._has_modern = has_modern
         self._parse_errors = 0
         session_provider = "unknown"
         session_workspace = "Unknown"
@@ -615,7 +622,7 @@ class RolloutParser:
 
 
 class DashboardDB:
-    """Incremental SQLite cache and all dashboard aggregations."""
+    """Durable local usage history and dashboard aggregations."""
 
     def __init__(
         self,
@@ -643,9 +650,14 @@ class DashboardDB:
         self._connection = self._open_connection()
         self._connection.row_factory = sqlite3.Row
         with self._lock:
-            self._connection.execute("PRAGMA journal_mode=WAL")
-            self._connection.execute("PRAGMA synchronous=NORMAL")
-            self._create_schema()
+            try:
+                self._connection.execute("PRAGMA foreign_keys=ON")
+                self._connection.execute("PRAGMA journal_mode=WAL")
+                self._connection.execute("PRAGMA synchronous=FULL")
+                self._create_schema()
+            except Exception:
+                self._connection.close()
+                raise
 
     def _open_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(str(self.db_path), check_same_thread=False)
@@ -679,201 +691,264 @@ class DashboardDB:
 
     def close(self) -> None:
         with self._lock:
+            self._maintain_storage(force=True)
             self._connection.close()
 
     def _create_schema(self) -> None:
-        self._connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS source_files (
-                path TEXT PRIMARY KEY,
-                mtime_ns INTEGER NOT NULL,
-                size INTEGER NOT NULL,
-                scanned_at TEXT NOT NULL,
-                record_count INTEGER NOT NULL DEFAULT 0,
-                timezone TEXT NOT NULL DEFAULT '',
-                parser_version INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS usage_records (
-                record_key TEXT PRIMARY KEY,
-                source_path TEXT NOT NULL,
-                source_line INTEGER NOT NULL,
-                response_id TEXT,
-                thread_id TEXT,
-                timestamp TEXT NOT NULL,
-                day TEXT NOT NULL,
-                hour INTEGER NOT NULL,
-                provider TEXT NOT NULL,
-                provider_label TEXT NOT NULL,
-                model TEXT NOT NULL,
-                workspace TEXT NOT NULL,
-                input_tokens INTEGER NOT NULL,
-                output_tokens INTEGER NOT NULL,
-                cached_input_tokens INTEGER NOT NULL,
-                cache_write_input_tokens INTEGER NOT NULL,
-                reasoning_output_tokens INTEGER NOT NULL,
-                total_tokens INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS usage_sources (
-                source_key TEXT PRIMARY KEY,
-                logical_key TEXT NOT NULL,
-                source_path TEXT NOT NULL,
-                source_line INTEGER NOT NULL,
-                response_id TEXT,
-                thread_id TEXT,
-                timestamp TEXT NOT NULL,
-                day TEXT NOT NULL,
-                hour INTEGER NOT NULL,
-                provider TEXT NOT NULL,
-                provider_label TEXT NOT NULL,
-                model TEXT NOT NULL,
-                workspace TEXT NOT NULL,
-                input_tokens INTEGER NOT NULL,
-                output_tokens INTEGER NOT NULL,
-                cached_input_tokens INTEGER NOT NULL,
-                cache_write_input_tokens INTEGER NOT NULL,
-                reasoning_output_tokens INTEGER NOT NULL,
-                total_tokens INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_usage_day ON usage_records(day);
-            CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage_records(provider);
-            CREATE INDEX IF NOT EXISTS idx_usage_workspace ON usage_records(workspace);
-            CREATE INDEX IF NOT EXISTS idx_usage_source_logical ON usage_sources(logical_key);
-            CREATE INDEX IF NOT EXISTS idx_usage_source_path ON usage_sources(source_path);
-            DROP INDEX IF EXISTS idx_usage_response_id;
-            DROP INDEX IF EXISTS idx_usage_thread_response_id;
-            """
-        )
-        source_columns = {
-            str(row["name"])
-            for row in self._connection.execute("PRAGMA table_info(source_files)").fetchall()
-        }
-        if "timezone" not in source_columns:
-            self._connection.execute("ALTER TABLE source_files ADD COLUMN timezone TEXT NOT NULL DEFAULT ''")
-        if "parser_version" not in source_columns:
-            self._connection.execute("ALTER TABLE source_files ADD COLUMN parser_version INTEGER NOT NULL DEFAULT 0")
-
-        # Version 1 stored one deduplicated row directly in usage_records.
-        # Seed the new per-source ledger before rebuilding logical rows so a
-        # deployment never discards an existing cache merely because a root
-        # drive is temporarily unavailable.  Reachable files are reparsed on
-        # their next scan because their parser_version is still zero.
-        source_count = self._connection.execute("SELECT COUNT(*) FROM usage_sources").fetchone()[0]
-        if not source_count:
-            old_rows = self._connection.execute("SELECT * FROM usage_records").fetchall()
-            if old_rows:
+        # The history is authoritative, not a disposable copy of source files.
+        # A request points at one coherent snapshot; source references share it.
+        tables = {row[0] for row in self._connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        migrating = "usage_records" in tables
+        backup = None
+        if migrating:
+            backup = Path(str(self.db_path) + ".pre-history.bak")
+            if not backup.exists():
+                target = sqlite3.connect(str(backup))
                 try:
-                    backup = self._backup_before_source_ledger_migration()
-                    self._connection.execute("BEGIN")
-                    # v1 keys are physical path:line values while v2 keys are
-                    # logical request hashes. Clear only inside this
-                    # transaction, after the on-disk backup succeeds, so
-                    # rebuilding cannot leave both generations counted.
-                    self._connection.execute("DELETE FROM usage_records")
-                    keys = set()
-                    for row in old_rows:
-                        logical_key = self._logical_key(
-                            row["thread_id"], row["response_id"], row["source_path"], int(row["source_line"])
-                        )
-                        keys.add(logical_key)
-                        self._connection.execute(
-                            """
-                            INSERT OR IGNORE INTO usage_sources (
-                                source_key, logical_key, source_path, source_line, response_id, thread_id,
-                                timestamp, day, hour, provider, provider_label, model, workspace,
-                                input_tokens, output_tokens, cached_input_tokens,
-                                cache_write_input_tokens, reasoning_output_tokens, total_tokens
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                "legacy-cache:" + str(row["record_key"]), logical_key,
-                                row["source_path"], row["source_line"], row["response_id"], row["thread_id"],
-                                row["timestamp"], row["day"], row["hour"], row["provider"], row["provider_label"],
-                                row["model"], row["workspace"], row["input_tokens"], row["output_tokens"],
-                                row["cached_input_tokens"], row["cache_write_input_tokens"],
-                                row["reasoning_output_tokens"], row["total_tokens"],
-                            ),
-                        )
-                    self._rebuild_logical_records(keys)
-                    self._connection.commit()
-                    self.database_migration = {
-                        "status": "rebuilt_source_ledger",
-                        "backup": backup,
-                        "records": len(old_rows),
-                    }
-                except Exception:
-                    self._connection.rollback()
-                    raise
-        self._connection.commit()
-
-    def _backup_before_source_ledger_migration(self) -> str:
-        stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
-        backup_path = Path(str(self.db_path) + ".pre-source-ledger-" + stamp + ".bak")
-        backup = sqlite3.connect(str(backup_path))
+                    self._connection.backup(target)
+                finally:
+                    target.close()
         try:
-            self._connection.backup(backup)
-        finally:
-            backup.close()
-        return str(backup_path)
+            self._connection.execute("BEGIN")
+            if migrating:
+                for table in ("source_files", "usage_records", "usage_sources"):
+                    if table in tables:
+                        self._connection.execute(f"ALTER TABLE {table} RENAME TO legacy_{table}")
+            statements = [
+                """CREATE TABLE IF NOT EXISTS history_meta (
+                    key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID""",
+                """CREATE TABLE IF NOT EXISTS source_files (
+                    id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+                    mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL,
+                    scanned_at TEXT NOT NULL, record_count INTEGER NOT NULL DEFAULT 0,
+                    timezone TEXT NOT NULL DEFAULT '', parser_version INTEGER NOT NULL DEFAULT 0,
+                    usage_format TEXT NOT NULL DEFAULT '')""",
+                """CREATE TABLE IF NOT EXISTS history_contexts (
+                    id INTEGER PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL,
+                    workspace TEXT NOT NULL, UNIQUE(provider, model, workspace))""",
+                """CREATE TABLE IF NOT EXISTS history_snapshots (
+                    id INTEGER PRIMARY KEY, fingerprint BLOB NOT NULL UNIQUE,
+                    context_id INTEGER NOT NULL REFERENCES history_contexts(id), timestamp TEXT NOT NULL,
+                    day TEXT NOT NULL, hour INTEGER NOT NULL,
+                    input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+                    cached_input_tokens INTEGER NOT NULL, cache_write_input_tokens INTEGER NOT NULL,
+                    reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL)""",
+                """CREATE TABLE IF NOT EXISTS history_requests (
+                    logical_key BLOB PRIMARY KEY, snapshot_id INTEGER NOT NULL REFERENCES history_snapshots(id),
+                    retained_snapshot_id INTEGER REFERENCES history_snapshots(id)) WITHOUT ROWID""",
+                """CREATE TABLE IF NOT EXISTS history_sources (
+                    file_id INTEGER NOT NULL REFERENCES source_files(id), logical_key BLOB NOT NULL,
+                    snapshot_id INTEGER NOT NULL REFERENCES history_snapshots(id), source_line INTEGER NOT NULL,
+                    PRIMARY KEY(file_id, logical_key)) WITHOUT ROWID""",
+                "CREATE INDEX IF NOT EXISTS idx_history_logical ON history_sources(logical_key)",
+                "CREATE INDEX IF NOT EXISTS idx_history_day ON history_snapshots(day)",
+                """CREATE VIEW IF NOT EXISTS usage_records AS
+                    SELECT r.logical_key AS record_key, '' AS source_path, 0 AS source_line,
+                        NULL AS response_id, NULL AS thread_id, s.timestamp, s.day, s.hour,
+                        c.provider, c.provider AS provider_label, c.model, c.workspace,
+                        s.input_tokens, s.output_tokens, s.cached_input_tokens,
+                        s.cache_write_input_tokens, s.reasoning_output_tokens, s.total_tokens
+                    FROM history_requests r JOIN history_snapshots s ON s.id=r.snapshot_id
+                    JOIN history_contexts c ON c.id=s.context_id""",
+            ]
+            for statement in statements:
+                self._connection.execute(statement)
+            if migrating:
+                if "source_files" in tables:
+                    for row in self._connection.execute("SELECT * FROM legacy_source_files").fetchall():
+                        self._connection.execute("""INSERT INTO source_files
+                            (path, mtime_ns, size, scanned_at, record_count, timezone, parser_version)
+                            VALUES (?, ?, ?, ?, ?, ?, 0)""", (
+                            row["path"], row["mtime_ns"], row["size"], row["scanned_at"],
+                            row["record_count"], row["timezone"] if "timezone" in row.keys() else ""))
+                keys = set()
+                # Seed canonical rows even if an old per-source ledger is partial.
+                for row in self._connection.execute("SELECT * FROM legacy_usage_records").fetchall():
+                    key = self._history_key(row)
+                    snapshot = self._store_snapshot(key, row)
+                    self._retain_snapshot(key, snapshot)
+                    file_row = self._connection.execute(
+                        "SELECT id FROM source_files WHERE path=?", (row["source_path"],)).fetchone()
+                    if file_row:
+                        self._store_source(file_row[0], key, snapshot, row["source_line"])
+                    keys.add(key)
+                if "usage_sources" in tables:
+                    for row in self._connection.execute("SELECT * FROM legacy_usage_sources").fetchall():
+                        key = self._history_key(row)
+                        snapshot = self._store_snapshot(key, row)
+                        file_row = self._connection.execute(
+                            "SELECT id FROM source_files WHERE path=?", (row["source_path"],)).fetchone()
+                        if file_row:
+                            self._store_source(file_row[0], key, snapshot, row["source_line"])
+                        else:
+                            self._retain_snapshot(key, snapshot)
+                        keys.add(key)
+                # Legacy synthetic response ids identify cumulative-format files.
+                for old_table in ("legacy_usage_records", "legacy_usage_sources"):
+                    if old_table.removeprefix("legacy_") not in tables:
+                        continue
+                    for row in self._connection.execute(
+                            f"SELECT source_path, response_id FROM {old_table}"):
+                        self._connection.execute("UPDATE source_files SET usage_format=? WHERE path=?",
+                            ("legacy" if str(row["response_id"] or "").startswith("legacy:") else "modern",
+                             row["source_path"]))
+                self._connection.execute("""UPDATE history_requests SET retained_snapshot_id=NULL
+                    WHERE EXISTS (SELECT 1 FROM history_sources src
+                        WHERE src.logical_key=history_requests.logical_key
+                        AND src.snapshot_id=history_requests.retained_snapshot_id)""")
+                self._rebuild_logical_records(keys)
+                for table in ("usage_records", "usage_sources", "source_files"):
+                    if table in tables:
+                        self._connection.execute(f"DROP TABLE legacy_{table}")
+                self.database_migration = {"status": "durable_history", "backup": str(backup),
+                                           "records": len(keys)}
+            stored_timezone = self._connection.execute(
+                "SELECT value FROM history_meta WHERE key='timezone'").fetchone()
+            if not stored_timezone or stored_timezone[0] != self.timezone_name:
+                # Reproject retained timestamps too, even after all logs are gone.
+                for row in self._connection.execute("SELECT id, timestamp FROM history_snapshots").fetchall():
+                    _, day, hour = _parse_timestamp(row["timestamp"], timezone=self.timezone)
+                    self._connection.execute("UPDATE history_snapshots SET day=?, hour=? WHERE id=?",
+                                             (day, hour, row["id"]))
+                self._connection.execute("INSERT OR REPLACE INTO history_meta VALUES ('timezone', ?)",
+                                         (self.timezone_name,))
+            self._collect_unused_snapshots()
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+        # One-time physical compaction also enables automatic page reclamation.
+        if self._connection.execute("PRAGMA auto_vacuum").fetchone()[0] != 2:
+            self._connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
+            self._connection.execute("VACUUM")
+        self._connection.execute("PRAGMA journal_size_limit=1048576")
+        self._connection.execute("PRAGMA wal_autocheckpoint=256")
+        self._last_maintenance = time.monotonic()
+        self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     @staticmethod
-    def _logical_key(
-        thread_id: Optional[str], response_id: Optional[str], source_path: str, source_line: int
-    ) -> str:
+    def _logical_key(thread_id, response_id, source_path, source_line) -> str:
         if response_id:
             identity = "response\0%s\0%s" % (thread_id or "", response_id)
         else:
             identity = "source\0%s\0%d" % (source_path, source_line)
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
+    def _history_key(self, row) -> bytes:
+        if row["response_id"]:
+            return bytes.fromhex(self._logical_key(row["thread_id"], row["response_id"],
+                                                   row["source_path"], row["source_line"]))
+        # Old telemetry without request ids has no perfect identity. Use the
+        # session (or original filename), timestamp and usage rather than the
+        # absolute location so moving an identical log cannot count it again.
+        values = [row["thread_id"] or Path(row["source_path"]).name, row["timestamp"],
+                  row["provider"], row["model"], row["workspace"]]
+        values.extend(row[key] for key in self._token_columns())
+        return hashlib.sha256(json.dumps(values, ensure_ascii=False).encode("utf-8")).digest()
+
     @staticmethod
-    def _source_key(path: str, line: int) -> str:
-        return hashlib.sha256((path + "\0" + str(line)).encode("utf-8")).hexdigest()
+    def _token_columns():
+        return ("input_tokens", "output_tokens", "cached_input_tokens",
+                "cache_write_input_tokens", "reasoning_output_tokens", "total_tokens")
 
-    def _rebuild_logical_records(self, logical_keys: Iterable[str]) -> None:
-        """Rebuild changed request keys from all their independently stored sources."""
+    @staticmethod
+    def _snapshot_rank(row):
+        return (row["total_tokens"], sum(bool(row[key]) for key in
+                ("cached_input_tokens", "cache_write_input_tokens", "reasoning_output_tokens")),
+                sum(row[key] not in (None, "", "unknown", "Unknown") for key in
+                    ("model", "provider", "workspace")), row["timestamp"],
+                row["source_line"] if "source_line" in row.keys() else 0,
+                row["source_path"] if "source_path" in row.keys() else "")
 
-        for logical_key in set(logical_keys):
-            source_rows = self._connection.execute(
-                """
-                SELECT * FROM usage_sources
-                WHERE logical_key = ?
-                ORDER BY timestamp, source_path, source_line
-                """,
-                (logical_key,),
-            ).fetchall()
-            self._connection.execute("DELETE FROM usage_records WHERE record_key = ?", (logical_key,))
-            if not source_rows:
+    def _store_snapshot(self, key, row):
+        context = (row["provider"], row["model"], row["workspace"])
+        self._connection.execute("INSERT OR IGNORE INTO history_contexts(provider,model,workspace) VALUES (?,?,?)",
+                                 context)
+        context_id = self._connection.execute(
+            "SELECT id FROM history_contexts WHERE provider=? AND model=? AND workspace=?", context).fetchone()[0]
+        tokens = tuple(int(row[name]) for name in self._token_columns())
+        fingerprint = hashlib.sha256(key + json.dumps(
+            [*context, row["timestamp"], *tokens], ensure_ascii=False).encode("utf-8")).digest()
+        _, day, hour = _parse_timestamp(row["timestamp"], timezone=self.timezone)
+        self._connection.execute("""INSERT OR IGNORE INTO history_snapshots
+            (fingerprint,context_id,timestamp,day,hour,input_tokens,output_tokens,cached_input_tokens,
+             cache_write_input_tokens,reasoning_output_tokens,total_tokens) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (fingerprint, context_id, row["timestamp"], day, hour, *tokens))
+        return self._connection.execute(
+            "SELECT id FROM history_snapshots WHERE fingerprint=?", (fingerprint,)).fetchone()[0]
+
+    def _snapshot(self, snapshot_id):
+        return self._connection.execute("""SELECT s.*, c.provider,c.model,c.workspace
+            FROM history_snapshots s JOIN history_contexts c ON c.id=s.context_id WHERE s.id=?""",
+            (snapshot_id,)).fetchone()
+
+    def _store_source(self, file_id, key, snapshot_id, line):
+        previous = self._connection.execute("""SELECT snapshot_id, source_line FROM history_sources
+            WHERE file_id=? AND logical_key=?""", (file_id, key)).fetchone()
+        candidate = dict(self._snapshot(snapshot_id), source_line=line)
+        if previous:
+            prior = dict(self._snapshot(previous[0]), source_line=previous[1])
+            if self._snapshot_rank(prior) > self._snapshot_rank(candidate):
+                return
+        self._connection.execute("INSERT OR REPLACE INTO history_sources VALUES (?,?,?,?)",
+                                 (file_id, key, snapshot_id, line))
+
+    def _retain_snapshot(self, key, snapshot_id):
+        previous = self._connection.execute("SELECT retained_snapshot_id FROM history_requests WHERE logical_key=?",
+                                            (key,)).fetchone()
+        if previous and previous[0]:
+            if self._snapshot_rank(self._snapshot(previous[0])) > self._snapshot_rank(self._snapshot(snapshot_id)):
+                snapshot_id = previous[0]
+        self._connection.execute("""INSERT INTO history_requests VALUES (?,?,?)
+            ON CONFLICT(logical_key) DO UPDATE SET retained_snapshot_id=excluded.retained_snapshot_id""",
+            (key, snapshot_id, snapshot_id))
+
+    def _detach_source(self, file_id, keep_keys=(), retire_missing=False):
+        # A missing request means source cleanup, not negative usage. Keep one
+        # representative, not every deleted file, path, line or old snapshot.
+        keys = set()
+        for row in self._connection.execute("SELECT * FROM history_sources WHERE file_id=?", (file_id,)).fetchall():
+            key = row["logical_key"]
+            keys.add(key)
+            if key not in keep_keys and not retire_missing:
+                self._retain_snapshot(key, row["snapshot_id"])
+        self._connection.execute("DELETE FROM history_sources WHERE file_id=?", (file_id,))
+        return keys
+
+    def _rebuild_logical_records(self, logical_keys) -> None:
+        for key in set(logical_keys):
+            candidates = self._connection.execute("""SELECT s.*, c.provider,c.model,c.workspace,
+                refs.source_line, f.path AS source_path FROM history_sources refs
+                JOIN history_snapshots s ON s.id=refs.snapshot_id
+                JOIN history_contexts c ON c.id=s.context_id JOIN source_files f ON f.id=refs.file_id
+                WHERE refs.logical_key=?""", (key,)).fetchall()
+            retained = self._connection.execute(
+                "SELECT retained_snapshot_id FROM history_requests WHERE logical_key=?", (key,)).fetchone()
+            retained_id = retained[0] if retained else None
+            if retained_id:
+                candidates.append(self._snapshot(retained_id))
+            if not candidates:
+                self._connection.execute("DELETE FROM history_requests WHERE logical_key=?", (key,))
                 continue
-            # A correction is one coherent response snapshot, never column maxima.
-            # Prefer the fullest snapshot (total and optional breakdowns),
-            # then complete attribution and deterministic recency.
-            representative = max(source_rows, key=lambda row: (
-                row["total_tokens"],
-                sum(bool(row[key]) for key in ("cached_input_tokens",
-                    "cache_write_input_tokens", "reasoning_output_tokens")),
-                sum(row[key] not in (None, "", "unknown", "Unknown")
-                    for key in ("model", "provider", "workspace")),
-                row["timestamp"], row["source_line"], row["source_path"],
-            ))
-            maxima = representative
-            self._connection.execute(
-                """
-                INSERT INTO usage_records (
-                    record_key, source_path, source_line, response_id, thread_id,
-                    timestamp, day, hour, provider, provider_label, model, workspace,
-                    input_tokens, output_tokens, cached_input_tokens,
-                    cache_write_input_tokens, reasoning_output_tokens, total_tokens
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    logical_key, representative["source_path"], representative["source_line"],
-                    representative["response_id"], representative["thread_id"], representative["timestamp"],
-                    representative["day"], representative["hour"], representative["provider"],
-                    representative["provider_label"], representative["model"], representative["workspace"],
-                    maxima["input_tokens"], maxima["output_tokens"], maxima["cached_input_tokens"],
-                    maxima["cache_write_input_tokens"], maxima["reasoning_output_tokens"], maxima["total_tokens"],
-                ),
-            )
+            winner = max(candidates, key=self._snapshot_rank)
+            self._connection.execute("""INSERT INTO history_requests VALUES (?,?,?)
+                ON CONFLICT(logical_key) DO UPDATE SET snapshot_id=excluded.snapshot_id""",
+                (key, winner["id"], retained_id))
+
+    def _collect_unused_snapshots(self):
+        self._connection.execute("""DELETE FROM history_snapshots WHERE id NOT IN (
+            SELECT snapshot_id FROM history_requests UNION SELECT retained_snapshot_id FROM history_requests
+            WHERE retained_snapshot_id IS NOT NULL UNION SELECT snapshot_id FROM history_sources)""")
+        self._connection.execute("DELETE FROM history_contexts WHERE id NOT IN (SELECT context_id FROM history_snapshots)")
+
+    def _maintain_storage(self, force=False):
+        # Limit WAL and reclaim free pages without rewriting history each poll.
+        if not force and time.monotonic() - self._last_maintenance < 60:
+            return
+        self._connection.execute("PRAGMA incremental_vacuum(256)").fetchall()
+        self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self._last_maintenance = time.monotonic()
 
     def _files(self) -> List[Path]:
         found: Dict[str, Path] = {}
@@ -883,6 +958,14 @@ class DashboardDB:
             try:
                 if not root.is_dir():
                     self._unavailable_roots += 1
+                    # History no longer depends on file references, so a
+                    # definitely deleted root can shed its scanning indexes.
+                    try:
+                        root.stat()
+                    except FileNotFoundError:
+                        self._complete_roots.append(root)
+                    except OSError:
+                        pass
                     continue
                 errors = []
                 # os.walk reports enumeration failures; rglob can suppress them.
@@ -907,29 +990,15 @@ class DashboardDB:
 
     def scan(self) -> ScanResult:
         result = ScanResult()
-        self._complete_roots = []
-        self._unavailable_roots = 0
         files = self._files()
         result.unavailable_roots = self._unavailable_roots
         result.files_seen = len(files)
         seen = {str(path) for path in files}
         with self._lock:
-            existing_rows = self._connection.execute(
-                "SELECT path, mtime_ns, size, timezone, parser_version FROM source_files"
-            ).fetchall()
-            existing = {
-                str(row["path"]): (
-                    int(row["mtime_ns"]), int(row["size"]), str(row["timezone"]), int(row["parser_version"])
-                )
-                for row in existing_rows
-            }
-            active_roots = [root for root in self.roots if root.exists()]
-            removed_paths = [
-                path for path in existing
-                if path not in seen and any(_is_within(Path(path), root) for root in active_roots)
-            ]
+            existing = {row["path"]: row for row in self._connection.execute("SELECT * FROM source_files")}
             try:
                 self._connection.execute("BEGIN")
+                affected = set()
                 for path in files:
                     key = str(path)
                     try:
@@ -937,10 +1006,10 @@ class DashboardDB:
                     except OSError:
                         result.incomplete_files += 1
                         continue
-                    signature = (
-                        int(stat.st_mtime_ns), int(stat.st_size), self.timezone_name, PARSER_SCHEMA_VERSION
-                    )
-                    if existing.get(key) == signature:
+                    signature = (stat.st_mtime_ns, stat.st_size, self.timezone_name, PARSER_SCHEMA_VERSION)
+                    previous = existing.get(key)
+                    if previous and tuple(previous[name] for name in
+                            ("mtime_ns", "size", "timezone", "parser_version")) == signature:
                         result.files_unchanged += 1
                         continue
                     result.files_scanned += 1
@@ -954,83 +1023,49 @@ class DashboardDB:
                     if self.parser._read_failed or not stable:
                         result.incomplete_files += 1
                         continue
-                    old_keys = {
-                        str(row["logical_key"])
-                        for row in self._connection.execute(
-                            "SELECT logical_key FROM usage_sources WHERE source_path = ?", (key,)
-                        ).fetchall()
-                    }
-                    # Do not replace a usable migrated cache with an unreadable
-                    # file. A malformed tail with valid records still updates.
-                    if parse_errors and not records and old_keys:
-                        result.records_skipped += len(old_keys)
+                    # Never replace a previously good ledger from a damaged
+                    # read. New files may contribute valid rows; retry errors.
+                    if parse_errors and previous:
+                        result.records_skipped += previous["record_count"]
                         continue
-                    self._connection.execute("DELETE FROM usage_sources WHERE source_path = ?", (key,))
-                    added = 0
-                    skipped = 0
-                    affected_keys = set(old_keys)
+                    parsed = []
                     for record in records:
-                        u = record.usage
-                        logical_key = self._logical_key(
-                            record.thread_id, record.response_id, key, record.source_line
-                        )
-                        affected_keys.add(logical_key)
-                        self._connection.execute(
-                            """
-                            INSERT INTO usage_sources (
-                                source_key, logical_key, source_path, source_line, response_id, thread_id,
-                                timestamp, day, hour, provider, provider_label, model, workspace,
-                                input_tokens, output_tokens, cached_input_tokens,
-                                cache_write_input_tokens, reasoning_output_tokens, total_tokens
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                self._source_key(key, record.source_line), logical_key, key, record.source_line,
-                                record.response_id, record.thread_id, record.timestamp, record.day, record.hour,
-                                record.provider, record.provider_label, record.model, record.workspace,
-                                u.input_tokens, u.output_tokens, u.cached_input_tokens,
-                                u.cache_write_input_tokens, u.reasoning_output_tokens, u.total_tokens,
-                            ),
-                        )
-                        added += 1
-                    self._rebuild_logical_records(affected_keys)
-                    skipped = max(0, added - len({key for key in affected_keys if key not in old_keys}))
-                    self._connection.execute(
-                        """
-                        INSERT INTO source_files(path, mtime_ns, size, scanned_at, record_count, timezone, parser_version)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(path) DO UPDATE SET
-                            mtime_ns=excluded.mtime_ns,
-                            size=excluded.size,
-                            scanned_at=excluded.scanned_at,
-                            record_count=excluded.record_count,
-                            timezone=excluded.timezone,
-                            parser_version=excluded.parser_version
-                        """,
-                        (key, signature[0], signature[1], _now_iso(), added, self.timezone_name, PARSER_SCHEMA_VERSION),
-                    )
-                    result.records_added += added
-                    result.records_skipped += skipped
-
-                # Only prune disappeared files beneath roots that still exist;
-                # a disconnected/renamed root must not erase its cache.
-                for path, _signature in existing.items():
-                    if path in seen:
-                        continue
-                    if any(_is_within(Path(path), root) for root in self._complete_roots):
-                        old_keys = {
-                            str(row["logical_key"])
-                            for row in self._connection.execute(
-                                "SELECT logical_key FROM usage_sources WHERE source_path = ?", (path,)
-                            ).fetchall()
-                        }
-                        self._connection.execute("DELETE FROM usage_sources WHERE source_path = ?", (path,))
-                        self._rebuild_logical_records(old_keys)
-                        self._connection.execute("DELETE FROM source_files WHERE path = ?", (path,))
+                        row = dict(vars(record))
+                        row.update(vars(record.usage))
+                        parsed.append((self._history_key(row), row))
+                    new_keys = {logical for logical, _ in parsed}
+                    usage_format = "modern" if self.parser._has_modern else "legacy"
+                    if previous:
+                        # Old cumulative telemetry superseded by modern usage
+                        # must not survive as a second copy of the same calls.
+                        retire = previous["usage_format"] == "legacy" and usage_format == "modern"
+                        affected.update(self._detach_source(previous["id"], new_keys, retire))
+                    self._connection.execute("""INSERT INTO source_files
+                        (path,mtime_ns,size,scanned_at,record_count,timezone,parser_version,usage_format)
+                        VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET
+                        mtime_ns=excluded.mtime_ns,size=excluded.size,scanned_at=excluded.scanned_at,
+                        record_count=excluded.record_count,timezone=excluded.timezone,
+                        parser_version=excluded.parser_version,usage_format=excluded.usage_format""",
+                        (key, signature[0], signature[1], _now_iso(), len(new_keys),
+                         self.timezone_name, PARSER_SCHEMA_VERSION if not parse_errors else 0, usage_format))
+                    file_id = self._connection.execute("SELECT id FROM source_files WHERE path=?", (key,)).fetchone()[0]
+                    for logical, row in parsed:
+                        self._store_source(file_id, logical, self._store_snapshot(logical, row), row["source_line"])
+                    affected.update(new_keys)
+                    result.records_added += len(new_keys)
+                    result.records_skipped += len(parsed) - len(new_keys)
+                for path, previous in existing.items():
+                    if path not in seen and any(_is_within(Path(path), root) for root in self._complete_roots):
+                        affected.update(self._detach_source(previous["id"]))
+                        self._connection.execute("DELETE FROM source_files WHERE id=?", (previous["id"],))
                         result.files_removed += 1
+                self._rebuild_logical_records(affected)
+                if affected or result.files_removed:
+                    self._collect_unused_snapshots()
                 self._connection.commit()
                 if result.files_scanned or result.files_removed:
                     self._data_version += 1
+                self._maintain_storage()
             except Exception:
                 self._connection.rollback()
                 raise
@@ -1384,6 +1419,18 @@ class DashboardDB:
             "daily_model_summary": daily_model_usage,
         }
 
+    def storage_status(self) -> Dict[str, Any]:
+        with self._lock:
+            snapshots = self._connection.execute("SELECT COUNT(*) FROM history_snapshots").fetchone()[0]
+        size = 0
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                size += Path(str(self.db_path) + suffix).stat().st_size
+            except FileNotFoundError:
+                pass
+        return {"mode": "durable", "database_path": str(self.db_path),
+                "database_bytes": size, "snapshots": snapshots}
+
     def counts(self) -> Dict[str, int]:
         reader = sqlite3.connect(str(self.db_path), timeout=5.0)
         try:
@@ -1522,6 +1569,7 @@ class DashboardService:
             "last_scan": last_scan,
             "scan": scan,
             "database_recovery": self.database.database_recovery,
+            "history": self.database.storage_status(),
             **self.database.counts(),
         }
 

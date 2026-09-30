@@ -60,6 +60,30 @@ class UpdaterTests(unittest.TestCase):
                   for name in ('update.json', 'windows.zip', 'manifest.json')]
         return [json.dumps({'assets': assets}).encode(), json.dumps(update).encode()]
 
+    def test_macos_loads_system_ca_without_disabling_verification(self):
+        context = Mock()
+        opener = Mock()
+        opener.open.return_value.__enter__ = Mock(return_value=Mock(headers={}, read=Mock(return_value=b'')))
+        opener.open.return_value.__exit__ = Mock(return_value=False)
+        with patch.object(updater.sys, 'platform', 'darwin'), patch.object(updater.Path, 'is_file', return_value=True), \
+                patch.object(updater.ssl, 'create_default_context', return_value=context) as create, \
+                patch.object(updater, 'HTTPSHandler') as handler, patch.object(updater, 'build_opener', return_value=opener):
+            updater.fetch_bytes(updater.API, 1000)
+        create.assert_called_once_with()
+        context.load_verify_locations.assert_called_once_with(cafile='/etc/ssl/cert.pem')
+        handler.assert_called_once_with(context=context)
+
+    def test_other_platforms_use_default_verified_tls_context(self):
+        context = Mock()
+        opener = Mock()
+        opener.open.return_value.__enter__ = Mock(return_value=Mock(headers={}, read=Mock(return_value=b'')))
+        opener.open.return_value.__exit__ = Mock(return_value=False)
+        with patch.object(updater.sys, 'platform', 'win32'), \
+                patch.object(updater.ssl, 'create_default_context', return_value=context), \
+                patch.object(updater, 'build_opener', return_value=opener):
+            updater.fetch_bytes(updater.API, 1000)
+        context.load_verify_locations.assert_not_called()
+
     def test_windows_and_mac_valid_packages(self):
         for key in ('windows-x64', 'macos-arm64'):
             with self.subTest(key=key):

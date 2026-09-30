@@ -13,7 +13,7 @@ import threading
 import time
 from typing import Any, Iterable, Mapping, Optional
 
-from backend import DashboardDB, DashboardService, create_server, safe_csv_row
+from backend import DashboardDB, DashboardService, create_server, safe_csv_row, local_data_dir
 from updater import Updater, confirm_startup
 
 
@@ -49,13 +49,6 @@ def application_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
-
-
-def local_data_dir() -> Path:
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "CodexTokenDashboard"
-    base = Path(os.environ.get("LOCALAPPDATA", Path.home()))
-    return base / "CodexTokenDashboard"
 
 
 def _wait_for_webview_cleanup() -> None:

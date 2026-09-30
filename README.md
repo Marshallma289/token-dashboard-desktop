@@ -38,6 +38,16 @@ Windows x64 和 macOS arm64。两个构建使用同一个提交，产物的 `bui
 Mac 应用应放在可写的固定目录，例如用户的 `~/Applications`，不能直接在只读 DMG 或应用临时转移目录更新。
 源码模式保留原有开发运行方式，不自动覆盖源码；应用更新只替换程序，不上传本地统计数据库和日志。
 
+### 1.4.0 更新：独立本地历史
+
+- 软件运行时自动采集用量并事务写入本地 SQLite；已采集的历史在删除工作空间、线程或 Codex 日志后仍保留，重启软件也不会清空。
+- Mac 保存到 `~/Library/Application Support/CodexTokenDashboard/usage.sqlite3`，Windows 保存到 `%LOCALAPPDATA%\CodexTokenDashboard\usage.sqlite3`，桌面版和浏览器版共用这个独立目录。更新软件不会覆盖历史。
+- 只存 Token 数、UTC 时间和供应商/模型/工作空间归属，不复制对话正文、原始日志或密钥。线程/response 标识只保留用于去重的 SHA-256 摘要；重复归属字符串只存一次。
+- 同一请求跨文件、归档移动、删除后恢复只计一次；同一文件反复快照只保留一份完整候选。可读源中的同 ID 修订替换旧快照，各 Token 列来自同一个快照，不拼接列最大值。日志删除时最多保留该请求的一份历史候选。
+- 自动回收无引用快照和归属、删除失效文件索引，定期回收 SQLite 空闲页并截断 WAL。空间随真实请求增长，不随轮询次数、重复日志或快照修订次数增长；保留精确请求分布需要每个请求留一条记录，不承诺固定容量。
+- 首次升级会迁移旧数据库，保留一份固定文件名 `usage.sqlite3.pre-history.bak` 的迁移备份；不按扫描生成备份。页面底部显示历史库大小，悬浮可查看保存路径。
+- 软件关闭期间未采集、且已删除的日志无法补回。极老日志若缺少稳定请求标识，只能按已有元数据保守去重，不能据此保证与供应商账单一致。
+
 ### 1.3.0 更新
 
 - 新增桌面页面检查更新、下载进度和一键重启更新。
@@ -127,7 +137,7 @@ rollout JSONL 日志，将官方 OpenAI API 与不同 `model_provider` 的第三
 - 按官方公开价格估算的美元费用、计价覆盖率和未计价模型提示；
 - 1 / 7 / 30 / 90 天和全部历史筛选；
 - 供应商、工作空间筛选；
-- SQLite 增量缓存、2 秒轮询、SSE 实时刷新；
+- SQLite 持久历史、2 秒轮询、SSE 实时刷新；
 - 明暗主题与响应式界面；
 - JSON / CSV 导出；
 - 官方 API 和同名模型的第三方供应商独立归因。
@@ -231,8 +241,7 @@ python backend.py export --days 30 --format csv --output usage.csv
 python backend.py serve --root /path/to/sessions --root /path/to/archived_sessions
 ```
 
-默认数据库为项目目录下的 `codex-token-dashboard.sqlite3`。可以用 `--db`
-修改位置。
+默认数据库使用上述系统用户数据目录中的 `usage.sqlite3`，与工作空间无关。可以用 `--db` 修改位置；如果指定到工作空间内，删除该目录也会删除那份历史。旧浏览器版的项目目录缓存可通过 `--db /旧路径/codex-token-dashboard.sqlite3` 原地迁移，或在停用旧软件后将其复制到独立数据目录。
 
 ## 统计口径
 
@@ -276,7 +285,7 @@ python backend.py serve --root /path/to/sessions --root /path/to/archived_sessio
 它触发的后端模型调用若出现在本机日志中，会按对应模型单独计量。
 
 桌面数据库启动时会执行轻量完整性检查。若 SQLite 文件已损坏，程序会先把
-原文件及 WAL/SHM 副本重命名为带 UTC 时间戳的 `.corrupt-*.bak`，再重建缓存
+原文件及 WAL/SHM 副本重命名为带 UTC 时间戳的 `.corrupt-*.bak`，再重建账本
 并从 Codex 日志重新扫描；不会静默覆盖损坏文件。
 
 ## 本地 API
@@ -297,11 +306,11 @@ node --check web/app.js
 ```
 
 测试覆盖现代与旧版日志、多供应商/模型切换、重复 response、增量重扫、归档
-移动、北京时间跨 UTC 日期边界、五类聚合、静态资源、HTTP API 和 SSE。
+移动、源文件删除后的历史保留、恢复去重、紧凑迁移和空间回收、北京时间跨 UTC 日期边界、五类聚合、静态资源、HTTP API 和 SSE。
 
 ## 隐私
 
-数据库只保存 timestamp、workspace、thread/response 标识、provider、model 和
+数据库只保存 timestamp、workspace、thread/response 去重摘要、provider、model 和
 Token 计数。不会保存提示词、回复正文、工具参数、工具输出、加密 reasoning、
 环境变量或 API Key；不会读取 `auth.json`；网页不使用 CDN、分析脚本或遥测。
 

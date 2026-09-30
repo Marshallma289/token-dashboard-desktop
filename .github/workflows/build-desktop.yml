@@ -2,11 +2,16 @@ name: Build desktop packages
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -52,3 +57,24 @@ jobs:
             release/*.build-manifest.json
           if-no-files-found: error
           retention-days: 14
+
+  release:
+    name: Publish complete desktop update
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: desktop-*
+          path: release-artifacts
+      - name: Publish packages and update manifest atomically
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python publish_update.py release-artifacts

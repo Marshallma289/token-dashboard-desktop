@@ -31,6 +31,7 @@
           </div>
         </div>
         <span id="lastUpdated" class="updated-text">等待数据</span>
+        <button id="updateButton" class="reset-button update-button" type="button" aria-haspopup="dialog" aria-controls="updateDialog" hidden>检查更新</button>
         <button id="exportButton" class="export-button" type="button" title="导出当前筛选的每日模型用量">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 17v3h14v-3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
           <span>导出 CSV</span>
@@ -46,7 +47,7 @@
     </header>
 
     <main id="main" tabindex="-1">
-      <div class="overview-heading"><div><p class="eyebrow">YOUR LOCAL USAGE, AT A GLANCE</p><h2>用量总览<span class="version-tag" id="appVersion">v1.2.0</span></h2><p>了解消耗、发现趋势，让每一份 Token 都有迹可循。</p></div><a class="detail-link" href="#detailTitle">查看用量明细 <span aria-hidden="true">↗</span></a></div>
+      <div class="overview-heading"><div><p class="eyebrow">YOUR LOCAL USAGE, AT A GLANCE</p><h2>用量总览<span class="version-tag" id="appVersion">—</span></h2><p>了解消耗、发现趋势，让每一份 Token 都有迹可循。</p></div><a class="detail-link" href="#detailTitle">查看用量明细 <span aria-hidden="true">↗</span></a></div>
       <section class="control-panel" aria-label="看板筛选">
         <div class="control-group range-group">
           <span class="control-label">时间范围</span>
@@ -170,6 +171,14 @@
     <footer class="footer"><span>本地处理 · 隐私优先</span><span id="apiHint">公开参考价估算 · 未计价模型不计入费用 · 缓存与推理 Token 为子集</span></footer>
   </div>
   <div id="chartTooltip" class="chart-tooltip" role="tooltip" hidden></div>
+  <dialog id="updateDialog" class="update-dialog" aria-labelledby="updateTitle" aria-describedby="updateNotice">
+    <div class="panel-heading"><div><p class="eyebrow">APP UPDATE</p><h2 id="updateTitle">应用更新</h2></div><button id="updateCloseIcon" class="icon-button" type="button" aria-label="关闭更新面板" autofocus>×</button></div>
+    <dl class="update-versions"><div><dt>当前版本</dt><dd id="updateCurrentVersion">—</dd></div><div><dt>最新版本</dt><dd id="updateLatestVersion">—</dd></div></dl>
+    <p id="updateStatus" class="update-status" role="status" aria-live="polite">等待检查更新</p>
+    <div id="updateProgressWrap" class="update-progress-wrap" hidden><progress id="updateProgress" max="100" value="0" aria-label="更新下载进度"></progress><span id="updateProgressText" aria-hidden="true">0%</span></div>
+    <p id="updateNotice" class="update-notice">安装后自动重启，统计数据和设置会保留。</p>
+    <div class="update-actions"><button id="updateCloseButton" class="reset-button" type="button">关闭</button><button id="updateActionButton" class="export-button" type="button">检查更新</button></div>
+  </dialog>
   <script src="app.js" defer></script>
 </body>
 </html>

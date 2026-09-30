@@ -13,7 +13,7 @@
 
 ### 修改一次，生成两个版本
 
-共用私有仓库：[Marshallma289/token-dashboard-desktop](https://github.com/Marshallma289/token-dashboard-desktop)。
+共用公开仓库：[Marshallma289/token-dashboard-desktop](https://github.com/Marshallma289/token-dashboard-desktop)。
 在本目录修改并验证源码后，提交到仓库：
 
 ```sh
@@ -25,10 +25,25 @@ git push
 `.github/workflows/build-desktop.yml` 在每次提交、拉取请求或手动运行时，同时构建
 Windows x64 和 macOS arm64。两个构建使用同一个提交，产物的 `build-manifest.json`
 记录 `source_digest` 和源码提交；同一个提交的源码摘要应一致，便于确认价格表及界面同步。
-构建结果在 GitHub 仓库的 **Actions → Build desktop → Artifacts** 下载。
+构建结果在 GitHub 仓库的 **Actions → Build desktop → Artifacts** 下载；提交到 `main` 后，两端
+全部构建成功才发布完整的 [Release](https://github.com/Marshallma289/token-dashboard-desktop/releases/latest)。
 
-已安装的程序包含打包时的代码。修改源码后，须完成构建并替换两端应用，新价格才会生效；
-无需清空统计数据库。这里配置的是自动构建，不会静默替换用户电脑里的程序。
+已安装的程序包含打包时的代码。1.3.0 起，桌面窗口右上角提供“检查更新”；发现新发布后点击
+“立即更新”，软件下载对应系统的更新包、校验文件、退出并重启。统计数据、主题设置和供应商
+配置保留，原程序目录留作回退备份。检查更新无需 GitHub 登录，启动时会后台检查一次；不会静默安装。
+同一版本号的后续源码提交也能通过构建编号检测，不必为了增加模型计价修改多个版本文件。
+
+1.2.0 及更早版本没有更新入口，需手动安装一次 1.3.0 或更新版本，之后即可在软件内更新。
+下载失败、校验不符或目录不可写时，不关闭当前软件；新版无法启动确认时尝试恢复并打开旧版。
+Mac 应用应放在可写的固定目录，例如用户的 `~/Applications`，不能直接在只读 DMG 或应用临时转移目录更新。
+源码模式保留原有开发运行方式，不自动覆盖源码；应用更新只替换程序，不上传本地统计数据库和日志。
+
+### 1.3.0 更新
+
+- 新增桌面页面检查更新、下载进度和一键重启更新。
+- 使用 GitHub Releases 发布 Windows x64 与 macOS arm64 的完整更新，校验 SHA-256、文件清单和源码提交。
+- 更新失败可恢复旧程序；Windows 便携目录的 `providers.json` 及两端用户数据目录继续保留。
+- 后端显示版本、打包版本和更新版本统一读取 `VERSION`。
 
 本地构建先把项目复制到干净的临时目录，不包含个人配置、统计数据库或旧构建产物；
 验证和打包均在副本里完成。Windows 与 Mac 必须分别在各自系统构建。

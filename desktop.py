@@ -14,6 +14,7 @@ import time
 from typing import Any, Iterable, Mapping, Optional
 
 from backend import DashboardDB, DashboardService, create_server, safe_csv_row
+from updater import Updater, confirm_startup
 
 
 CSV_FIELDS = [
@@ -150,6 +151,21 @@ class DesktopBridge:
         # recursively inspect WinForms/WebView2 objects in frozen builds.
         self._window: Any = None
         self._preferences_lock = threading.Lock()
+        self._updater: Optional[Updater] = None
+
+    def _update_manager(self) -> Updater:
+        if self._updater is None:
+            self._updater = Updater(local_data_dir(), lambda: self._window.destroy())
+        return self._updater
+
+    def get_update_status(self) -> Mapping[str, Any]:
+        return self._update_manager().status()
+
+    def check_for_update(self) -> Mapping[str, Any]:
+        return self._update_manager().check()
+
+    def start_update(self) -> Mapping[str, Any]:
+        return self._update_manager().start()
 
     def load_preferences(self) -> Mapping[str, Any]:
         """Read only supported UI preferences, independent of the web origin."""
@@ -225,6 +241,7 @@ def main() -> int:
         return 1
 
     runtime: Optional[DesktopRuntime] = None
+    bridge: Optional[DesktopBridge] = None
     try:
         _wait_for_webview_cleanup()
         runtime = DesktopRuntime()
@@ -244,6 +261,9 @@ def main() -> int:
         if window is None:
             raise RuntimeError("无法创建客户端窗口")
         bridge.attach_window(window)
+        if '--update-job' in sys.argv:
+            job_path = Path(sys.argv[sys.argv.index('--update-job') + 1])
+            window.events.loaded += lambda: confirm_startup(job_path)
         webview.start(
             gui="edgechromium" if sys.platform == "win32" else None,
             debug=False,
@@ -259,6 +279,11 @@ def main() -> int:
         if runtime is not None:
             runtime.stop()
             _record_clean_exit()
+        if bridge is not None and bridge._updater is not None:
+            try:
+                bridge._updater.launch_installer()
+            except Exception as error:
+                _show_startup_error(f'无法启动更新安装器，原程序仍在：\n{error}')
 
 
 if __name__ == "__main__":

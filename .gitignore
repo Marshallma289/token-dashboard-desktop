@@ -15,3 +15,4 @@ Thumbs.db
 *.sqlite3*
 release/
 providers.json
+build-info.json

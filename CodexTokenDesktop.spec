@@ -14,7 +14,7 @@ a = Analysis(
     ['desktop.py'],
     pathex=[],
     binaries=[],
-    datas=[('web', 'web'), ('LICENSE', '.'), ('THIRD_PARTY_NOTICES.md', '.')],
+    datas=[('web', 'web'), ('VERSION', '.'), ('build-info.json', '.'), ('LICENSE', '.'), ('THIRD_PARTY_NOTICES.md', '.')],
     hiddenimports=['webview', *platform_imports],
     hookspath=[],
     hooksconfig={},

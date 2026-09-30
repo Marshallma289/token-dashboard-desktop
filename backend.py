@@ -36,7 +36,7 @@ APP_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = APP_DIR / "codex-token-dashboard.sqlite3"
 DEFAULT_PROVIDER_CONFIG = APP_DIR / "providers.json"
 PARSER_SCHEMA_VERSION = 3
-APP_VERSION = "1.2.0"
+APP_VERSION = (Path(__file__).resolve().parent / "VERSION").read_text(encoding="utf-8").strip()
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")

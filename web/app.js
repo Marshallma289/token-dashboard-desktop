@@ -47,6 +47,96 @@
     return window.pywebview && window.pywebview.api ? window.pywebview.api : null;
   }
 
+  const updater = { initialized: false, pending: false, timer: null, status: { state: 'idle' } };
+  const updateBusyStates = new Set(['checking', 'downloading', 'ready', 'installing']);
+
+  function updateBridge() {
+    const bridge = desktopBridge();
+    return bridge && ['get_update_status', 'check_for_update', 'start_update'].every(name => typeof bridge[name] === 'function') ? bridge : null;
+  }
+
+  function renderUpdateStatus(status) {
+    updater.status = status && typeof status === 'object' ? status : { state: 'error', message: '更新服务未返回有效状态，请重试。' };
+    const current = updater.status;
+    const busy = updateBusyStates.has(current.state) || updater.pending;
+    const messages = {
+      idle: '等待检查更新', checking: '正在检查更新…', available: '发现新版本，可以立即更新。',
+      current: '当前已是最新版本。', downloading: '正在下载…', ready: '下载完成，正在准备安装…',
+      installing: '正在安装，应用即将自动重启…', error: '更新失败，请检查网络后重试。',
+      unsupported: '仅打包后的桌面程序支持自动安装更新。'
+    };
+    $('#updateCurrentVersion').textContent = text(current.current_version, '—');
+    $('#updateLatestVersion').textContent = text(current.latest_version, '—');
+    const detail = text(current.error || current.last_error);
+    const message = text(current.message, messages[current.state] || messages.idle);
+    $('#updateStatus').textContent = detail && detail !== message ? `${message} ${detail}` : message;
+    $('#updateStatus').classList.toggle('is-error', current.state === 'error');
+    const showProgress = ['downloading', 'ready', 'installing'].includes(current.state);
+    $('#updateProgressWrap').hidden = !showProgress;
+    const progress = Math.min(100, Math.max(0, toNumber(current.progress)));
+    $('#updateProgress').value = progress;
+    $('#updateProgressText').textContent = `${Math.round(progress)}%`;
+    const action = $('#updateActionButton');
+    action.disabled = busy || current.state === 'unsupported';
+    action.textContent = current.state === 'available' ? '立即更新' : current.state === 'error' ? '重试检查' : busy ? (current.state === 'checking' ? '检查中…' : '更新中…') : '检查更新';
+    $('#updateButton').textContent = current.state === 'available' ? '有更新' : current.state === 'error' ? '更新失败' : showProgress ? '更新中…' : '检查更新';
+    $('#updateButton').title = current.state === 'error' ? $('#updateStatus').textContent : '检查应用更新';
+  }
+
+  function scheduleUpdatePoll() {
+    window.clearTimeout(updater.timer);
+    updater.timer = null;
+    if (!updateBusyStates.has(updater.status.state)) return;
+    updater.timer = window.setTimeout(async () => {
+      const bridge = updateBridge();
+      if (!bridge) return;
+      try {
+        renderUpdateStatus(await bridge.get_update_status());
+      } catch (error) {
+        renderUpdateStatus({ ...updater.status, state: 'error', message: '无法读取更新状态，请重试。', error: text(error && error.message) });
+      }
+      scheduleUpdatePoll();
+    }, 750);
+  }
+
+  async function requestUpdate(method) {
+    const bridge = updateBridge();
+    if (!bridge || updater.pending || updateBusyStates.has(updater.status.state)) return;
+    window.clearTimeout(updater.timer);
+    updater.pending = true;
+    renderUpdateStatus({ ...updater.status, state: method === 'start_update' ? 'downloading' : 'checking', message: '', error: '', last_error: '', progress: 0 });
+    try {
+      renderUpdateStatus(await bridge[method]());
+    } catch (error) {
+      renderUpdateStatus({ ...updater.status, state: 'error', message: '更新操作失败，请检查网络后重试。', error: text(error && error.message) });
+    } finally {
+      updater.pending = false;
+      renderUpdateStatus(updater.status);
+      scheduleUpdatePoll();
+    }
+  }
+
+  async function initializeUpdater() {
+    const bridge = updateBridge();
+    if (!bridge || updater.initialized) return;
+    updater.initialized = true;
+    updater.pending = true;
+    $('#updateButton').hidden = false;
+    renderUpdateStatus(updater.status);
+    try {
+      renderUpdateStatus(await bridge.get_update_status());
+    } catch (error) {
+      renderUpdateStatus({ state: 'error', message: '无法连接更新服务，请重试。', error: text(error && error.message) });
+      return;
+    } finally {
+      updater.pending = false;
+      renderUpdateStatus(updater.status);
+    }
+    if (updater.status.state === 'unsupported' || (updater.status.state === 'error' && updater.status.last_error)) return;
+    if (updateBusyStates.has(updater.status.state)) scheduleUpdatePoll();
+    else await requestUpdate('check_for_update');
+  }
+
   function setTheme(theme, { persist = false } = {}) {
     state.theme = theme === 'dark' ? 'dark' : 'light';
     document.body.dataset.theme = state.theme;
@@ -879,6 +969,14 @@
   }
 
   function bindEvents() {
+    $('#updateButton').addEventListener('click', () => {
+      const dialog = $('#updateDialog');
+      if (!dialog.open) dialog.showModal();
+      if (!['available', 'unsupported'].includes(updater.status.state)) requestUpdate('check_for_update');
+    });
+    $('#updateActionButton').addEventListener('click', () => requestUpdate(updater.status.state === 'available' ? 'start_update' : 'check_for_update'));
+    $('#updateCloseIcon').addEventListener('click', () => $('#updateDialog').close());
+    $('#updateCloseButton').addEventListener('click', () => $('#updateDialog').close());
     $$('#rangeControls button').forEach(button => button.addEventListener('click', () => setRange(button.dataset.range)));
     $('#providerFilter').addEventListener('change', event => { state.provider = event.target.value; state.tablePage = 1; fetchDashboard(); });
     $('#workspaceFilter').addEventListener('change', event => { state.workspace = event.target.value; state.tablePage = 1; fetchDashboard(); });
@@ -995,10 +1093,13 @@
   }
 
   window.addEventListener('pywebviewready', loadDesktopPreferences);
+  window.addEventListener('pywebviewready', initializeUpdater);
+  document.addEventListener('DOMContentLoaded', initializeUpdater, { once: true });
   loadDesktopPreferences();
   startHealthPolling();
   setTheme(state.theme);
   bindEvents();
+  initializeUpdater();
   renderEmptyDashboard();
   fetchDashboard();
   connectEvents();

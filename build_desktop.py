@@ -16,7 +16,7 @@ import zipfile
 
 SOURCE_DIR = Path(__file__).resolve().parent
 ROOT_FILES = {
-    "backend.py", "desktop.py", "pricing.py", "build_desktop.py",
+    "backend.py", "desktop.py", "pricing.py", "build_desktop.py", "updater.py", "update_helpers.py", "publish_update.py",
     "CodexTokenDesktop.spec", "build-portable.ps1", "build-macos.sh",
     "requirements-desktop.txt", "requirements-build.txt", "VERSION", "LICENSE",
     "README.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md", "providers.json.example",
@@ -26,7 +26,7 @@ ROOT_FILES = {
 }
 SOURCE_TREES = ("tests", "web", "assets", ".github/workflows")
 EXCLUDED_DIRS = {".git", ".venv", "__pycache__", ".pytest_cache", "release", "dist", "build", "work", "outputs"}
-RUNTIME_FILES = ("backend.py", "desktop.py", "pricing.py", "VERSION", "requirements-desktop.txt")
+RUNTIME_FILES = ("backend.py", "desktop.py", "pricing.py", "VERSION", "requirements-desktop.txt", "updater.py", "update_helpers.py")
 PORTABLE_FILES = (
     "LICENSE", "THIRD_PARTY_NOTICES.md", "providers.json.example", "VERSION",
     "便携版使用说明.txt", "启动 Codex Token 看板.cmd",
@@ -132,6 +132,12 @@ def build(output_dir: Path, *, skip_tests: bool = False) -> tuple[Path, Path]:
     stage = build_root / "source"
     stage_source(SOURCE_DIR, stage)
     runtime_digest = source_digest(stage)
+    build_info = {
+        "version": version, "source_digest": runtime_digest,
+        "source_commit": os.environ.get("GITHUB_SHA") or None,
+        "build_number": int(os.environ.get("GITHUB_RUN_NUMBER", "0")),
+    }
+    (stage / "build-info.json").write_text(json.dumps(build_info), encoding="utf-8")
     # Tests can invoke launcher doctor or DesktopRuntime; isolate all state.
     test_env = os.environ.copy()
     test_env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -161,6 +167,8 @@ def build(output_dir: Path, *, skip_tests: bool = False) -> tuple[Path, Path]:
     package = build_root / "dist" / ("CodexTokenDesktop" if sys.platform == "win32" else "CodexTokenDesktop.app")
     if not package.is_dir():
         raise RuntimeError(f"PyInstaller did not produce the expected package: {package}")
+    if sys.platform == "darwin":
+        run(["codesign", "--verify", "--deep", "--strict", str(package)], stage)
     if sys.platform == "win32":
         for name in PORTABLE_FILES:
             shutil.copy2(stage / name, package / name)

@@ -8,13 +8,14 @@ from pathlib import Path, PurePosixPath
 import platform
 import re
 import shutil
+import ssl
 import stat
 import subprocess
 import sys
 import threading
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 import uuid
 import zipfile
 from contextlib import contextmanager
@@ -75,7 +76,12 @@ def fetch_bytes(url: str, limit: int, *, progress=None, target: Path | None = No
     request = Request(url, headers={'User-Agent': 'CodexTokenDashboard-Updater', 'Accept': 'application/vnd.github+json' if url == API else 'application/octet-stream'})
     received = 0
     chunks = []
-    with build_opener(GitHubRedirects).open(request, timeout=30) as response:
+    # Frozen Python carries build-machine OpenSSL paths. Load macOS's system
+    # CA bundle when present, retaining hostname and certificate verification.
+    context = ssl.create_default_context()
+    if sys.platform == 'darwin' and Path('/etc/ssl/cert.pem').is_file():
+        context.load_verify_locations(cafile='/etc/ssl/cert.pem')
+    with build_opener(GitHubRedirects, HTTPSHandler(context=context)).open(request, timeout=30) as response:
         size = int(response.headers.get('Content-Length') or 0)
         if size > limit:
             raise ValueError('更新文件超过大小限制')

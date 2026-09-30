@@ -29,14 +29,14 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: '14.0'
     steps:
       - name: Check out shared source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.14'
           architecture: ${{ matrix.architecture }}
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
       - name: Install build dependencies
@@ -44,7 +44,7 @@ jobs:
       - name: Validate and build from clean staging
         run: python build_desktop.py --output-dir release
       - name: Retain packages and source manifests
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: |

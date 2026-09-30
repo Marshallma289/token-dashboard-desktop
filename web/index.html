@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Codex Token 实时看板</title>
+  <link rel="icon" type="image/png" href="app-icon.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body data-theme="light">
+  <a class="skip-link" href="#main">跳到主要内容</a>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-block">
+        <div class="brand-mark" aria-hidden="true">⌁</div>
+        <div>
+          <h1>Codex Token <span>实时看板</span></h1>
+          <p>每一次调用，都清晰可见。</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <div class="status-cluster" aria-label="服务状态">
+          <div id="scanBadge" class="connection-badge is-connecting" role="status" aria-live="polite" title="正在检查扫描服务状态">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="scanText">扫描检查中</span>
+          </div>
+          <div id="connectionBadge" class="connection-badge is-connecting" role="status" aria-live="polite" title="正在连接实时事件流">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="connectionText">实时连接中</span>
+          </div>
+        </div>
+        <span id="lastUpdated" class="updated-text">等待数据</span>
+        <button id="exportButton" class="export-button" type="button" title="导出当前筛选的每日模型用量">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 17v3h14v-3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span>导出 CSV</span>
+        </button>
+        <button id="refreshButton" class="icon-button" type="button" title="立即刷新" aria-label="立即刷新数据">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-14.8-3.8L3 10m0 0V5m0 5h5M4 13a8.1 8.1 0 0 0 14.8 3.8L21 14m0 0v5m0-5h-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button id="themeButton" class="icon-button" type="button" title="切换深浅色主题" aria-label="切换深浅色主题">
+          <svg class="theme-icon sun-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 2v2.2M12 19.8V22M4.9 4.9l1.55 1.55m11.1 11.1 1.55 1.55M2 12h2.2m15.6 0H22M4.9 19.1l1.55-1.55m11.1-11.1 1.55-1.55" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          <svg class="theme-icon moon-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.3 15.4A8.6 8.6 0 0 1 8.6 3.7 8.7 8.7 0 1 0 20.3 15.4Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <main id="main" tabindex="-1">
+      <div class="overview-heading"><div><p class="eyebrow">YOUR LOCAL USAGE, AT A GLANCE</p><h2>用量总览<span class="version-tag" id="appVersion">v1.2.0</span></h2><p>了解消耗、发现趋势，让每一份 Token 都有迹可循。</p></div><a class="detail-link" href="#detailTitle">查看用量明细 <span aria-hidden="true">↗</span></a></div>
+      <section class="control-panel" aria-label="看板筛选">
+        <div class="control-group range-group">
+          <span class="control-label">时间范围</span>
+          <div id="rangeControls" class="segmented-control" role="group" aria-label="时间范围">
+            <button type="button" data-range="1">1 天</button>
+            <button type="button" data-range="7">7 天</button>
+            <button type="button" data-range="30" class="is-active">30 天</button>
+            <button type="button" data-range="90">90 天</button>
+            <button type="button" data-range="all">全部</button>
+          </div>
+        </div>
+        <p id="rangeDescription" class="control-note" aria-live="polite">过去 30 天，截止今日</p>
+        <label class="control-group select-group" for="providerFilter">
+          <span class="control-label">供应商</span>
+          <select id="providerFilter" aria-label="按供应商筛选"><option value="all">全部供应商</option></select>
+        </label>
+        <label class="control-group select-group" for="workspaceFilter">
+          <span class="control-label">工作空间</span>
+          <select id="workspaceFilter" aria-label="按工作空间筛选"><option value="all">全部工作空间</option></select>
+        </label>
+        <label class="control-group select-group" for="modelFilter"><span class="control-label">模型</span><select id="modelFilter" aria-label="按模型筛选"><option value="all">全部模型</option></select></label>
+        <button id="resetFilters" class="reset-button" type="button">重置筛选</button>
+      </section>
+
+      <div id="errorBanner" class="error-banner" role="alert" hidden>
+        <span class="error-icon" aria-hidden="true">!</span>
+        <span id="errorText">暂时无法读取数据。</span>
+        <button id="retryButton" type="button">重试</button>
+      </div>
+
+      <section id="kpiGrid" class="kpi-grid" aria-label="关键指标"></section>
+
+      <div class="dashboard-grid">
+        <section class="panel model-totals-panel" aria-labelledby="modelTotalsTitle">
+          <div class="panel-heading"><div><p class="eyebrow">MODEL INSIGHTS</p><h2 id="modelTotalsTitle">模型 Token 统计</h2></div><span class="panel-meta">当前筛选范围 · 按用量排序</span></div>
+          <p class="panel-description">逐个模型查看用量、占比、请求数与官方参考价估算；同名模型按供应商分别统计。</p>
+          <div id="modelTotals" class="model-totals"></div>
+        </section>
+        <section class="panel workspace-panel" aria-labelledby="workspaceTitle">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">WHERE WORK HAPPENS</p>
+              <h2 id="workspaceTitle">工作空间活跃分布</h2>
+            </div>
+            <span id="workspaceMeta" class="panel-meta">—</span>
+          </div>
+          <p class="panel-description">按活跃请求量观察不同工作空间的使用集中度。</p>
+          <div id="workspaceChart" class="chart-host chart-host-tall" role="img" aria-label="工作空间活跃分布图"></div>
+        </section>
+
+        <section class="panel activity-panel" aria-labelledby="activityTitle">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">WHEN IT HAPPENS</p>
+              <h2 id="activityTitle">日活分布</h2>
+            </div>
+            <span id="activityMeta" class="panel-meta">—</span>
+          </div>
+          <p class="panel-description">每日趋势与 24 小时活跃时段，帮助识别使用节奏。</p>
+          <div id="dailyTrendChart" class="chart-host chart-host-trend" role="img" aria-label="每日活跃趋势图"></div>
+          <div class="subchart-heading"><span>24 小时分布</span><span id="hourlyLegend" class="legend-note">颜色越深表示请求越集中</span></div>
+          <div id="hourlyHeatmap" class="hourly-heatmap" role="img" aria-label="24小时活跃热力图"></div>
+        </section>
+
+        <section class="panel request-panel" aria-labelledby="requestTitle">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">REQUEST GRAIN</p>
+              <h2 id="requestTitle">单次请求 Token 大小分布</h2>
+            </div>
+            <span id="requestMeta" class="panel-meta">—</span>
+          </div>
+          <p class="panel-description">观察单次请求的规模，竖线分别代表 p50、p90 与 p99。</p>
+          <div id="requestStats" class="percentile-grid" aria-label="请求大小分位数"></div>
+          <div id="requestChart" class="chart-host chart-host-medium" role="img" aria-label="单次请求Token大小直方图"></div>
+        </section>
+
+        <section class="panel model-panel" aria-labelledby="modelTitle">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">MODEL MIX</p>
+              <h2 id="modelTitle">模型日使用分布汇总</h2>
+            </div>
+            <span id="modelMeta" class="panel-meta">—</span>
+          </div>
+          <p class="panel-description">按日期堆叠展示模型与供应商的 Token 用量。</p>
+          <div id="modelLegend" class="model-legend" aria-label="模型与供应商图例"></div>
+          <div id="modelUsageChart" class="chart-host chart-host-large" role="img" aria-label="模型每日Token用量堆叠图"></div>
+          <div id="modelSummary" class="model-summary" aria-label="模型用量汇总"></div>
+        </section>
+
+        <section class="panel detail-panel" aria-labelledby="detailTitle">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">DAILY DETAIL</p>
+              <h2 id="detailTitle">每日模型用量明细</h2>
+            </div>
+            <span id="detailMeta" class="panel-meta">—</span>
+          </div>
+          <p id="detailDescription" class="panel-description">精确查看 input、output、cache、reasoning、total、参考费用与请求数；未公开独立价格的模型单独标记。</p>
+          <div class="table-wrap">
+            <table id="dailyUsageTable">
+              <caption class="sr-only">每日模型用量明细表</caption>
+              <thead><tr><th scope="col">日期</th><th scope="col">模型</th><th scope="col">供应商</th><th scope="col" class="num">Input</th><th scope="col" class="num">Output</th><th scope="col" class="num">Cache</th><th scope="col" class="num">Reasoning</th><th scope="col" class="num">Total</th><th scope="col" class="num">费用 USD</th><th scope="col" class="num">请求数</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div id="tableEmpty" class="empty-state" hidden>当前筛选范围内暂无模型用量。</div>
+          <div id="tablePagination" class="table-footer" aria-describedby="detailDescription">
+            <p id="tablePaginationSummary" class="table-pagination-summary">等待数据</p>
+            <div class="table-pagination-actions">
+              <button id="prevTablePage" class="pagination-button" type="button" aria-controls="dailyUsageTable" disabled>上一页</button>
+              <button id="nextTablePage" class="pagination-button" type="button" aria-controls="dailyUsageTable" disabled>下一页</button>
+            </div>
+            <p class="table-export-note">导出 CSV 包含当前筛选下的全部记录，不受分页限制。</p>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <footer class="footer"><span>本地处理 · 隐私优先</span><span id="apiHint">公开参考价估算 · 未计价模型不计入费用 · 缓存与推理 Token 为子集</span></footer>
+  </div>
+  <div id="chartTooltip" class="chart-tooltip" role="tooltip" hidden></div>
+  <script src="app.js" defer></script>
+</body>
+</html>

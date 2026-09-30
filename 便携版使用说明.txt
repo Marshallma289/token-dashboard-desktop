@@ -1,0 +1,70 @@
+Codex Token 实时看板 · Windows 便携版
+=====================================
+
+版本：1.1.0
+
+本版更新：修复旧日志计量与重复日志缓存一致性；最近 N 天截止到今天；
+更新供应商名称显示；新增扫描状态、明细分页和桌面主题保存；统一深浅色界面。
+首次升级可能需要重新索引历史日志，期间请留意页面扫描状态。
+程序仅重建统计缓存，不修改 Codex 原始日志。
+
+一、使用方法
+
+1. 请先完整解压整个压缩包，不要直接在压缩软件中运行。
+2. 双击“启动 Codex Token 看板.cmd”或“CodexTokenDesktop.exe”。
+3. 第一次启动会扫描本机 Codex 日志，已有缓存会立即显示，随后自动更新。
+4. 关闭客户端窗口即可完全退出。
+
+二、系统要求
+
+- 64 位 Windows 10 或 Windows 11。
+- Microsoft Edge WebView2 Runtime。Windows 11 和大多数仍在更新的 Windows 10
+  电脑已自带；若目标电脑精简过系统，请先从微软官方安装 WebView2 Runtime。
+- 不需要安装 Python，也不需要联网才能统计本机日志。
+
+三、便携包内容
+
+- CodexTokenDesktop.exe：客户端主程序。
+- _internal：客户端完整运行环境和界面资源，不能删除或改名。
+- providers.json.example：供应商显示名配置示例。
+- LICENSE / THIRD_PARTY_NOTICES.md：许可证与第三方说明。
+
+四、供应商显示名
+
+默认会根据 Codex 日志中的 model_provider 分开统计官方和不同 API 供应商。
+如需自定义名称：
+
+1. 将 providers.json.example 复制为 providers.json；
+2. 使用记事本编辑 providers.json；
+3. 左侧填写 Codex config.toml 使用的 provider ID，右侧填写希望显示的名称；
+4. 重新打开客户端。
+
+五、数据与隐私
+
+- 默认读取：%USERPROFILE%\.codex\sessions 和 archived_sessions。
+- 本地数据库：%LOCALAPPDATA%\CodexTokenDashboard\usage.sqlite3。
+- 软件不会读取 API Key，不保存提示词或回复正文，也不会上传统计数据。
+- 客户端内部服务只监听 127.0.0.1，不向局域网开放。
+
+六、费用统计
+
+- 费用按每条请求的模型、Input、缓存命中、缓存写入、Output 和时间单独估算，
+  再汇总到日期、模型和筛选结果。
+- OpenAI、DeepSeek 与 Qwen 使用软件内标注的官方公开参考价。OpenAI 长上下文
+  以 272,000 Input Token 为界；DeepSeek 按 UTC 工作日高峰/低谷时段计价。
+- `codex-auto-review` 暂无公开独立单价，因此标记为“未计价”，不计入费用，
+  但会单独显示 Token 和计价覆盖率。
+- 价格按模型名匹配，不限制供应商 ID；第三方供应商折扣、区域价、订阅额度、
+  重试和未写入本机日志的请求都可能造成差异，结果不等同于最终账单。
+
+七、数据库恢复
+
+- 启动时会执行轻量完整性检查；若缓存数据库损坏，会先保留带 UTC 时间戳的
+  `.corrupt-*.bak` 备份，再重建数据库并从 Codex 日志重新扫描。
+- 备份位于 `%LOCALAPPDATA%\CodexTokenDashboard`，不会静默覆盖损坏文件。
+
+八、注意事项
+
+- 发送给其他电脑时，请发送整个 ZIP 压缩包。
+- 解压后必须保留 CodexTokenDesktop.exe 与 _internal 文件夹的相对位置。
+- 本软件统计的是本机 Codex 日志，不等同于供应商最终账单。

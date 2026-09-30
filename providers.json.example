@@ -1,0 +1,7 @@
+{
+  "providers": {
+    "moonshot": "Moonshot",
+    "deepseek": "DeepSeek",
+    "siliconflow": "SiliconFlow"
+  }
+}

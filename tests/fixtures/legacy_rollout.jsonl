@@ -1,0 +1,3 @@
+{"timestamp":"2026-09-18T22:10:00+08:00","type":"session_meta","payload":{"session_id":"legacy-1","cwd":"/workspace/legacy","model_provider":"custom"}}
+{"timestamp":"2026-09-18T22:10:01+08:00","type":"turn_context","payload":{"turn_id":"legacy-turn","cwd":"/workspace/legacy","model":"legacy-model"}}
+{"timestamp":"2026-09-18T22:10:02+08:00","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":50,"cached_input_tokens":5,"cache_write_input_tokens":2,"output_tokens":25,"reasoning_output_tokens":4,"total_tokens":75},"total_token_usage":{"input_tokens":500,"output_tokens":250,"total_tokens":750}}}}

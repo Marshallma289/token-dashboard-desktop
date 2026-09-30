@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.coverage
+.pytest_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+.DS_Store
+Thumbs.db
+
+*.sqlite3*
+release/
+providers.json

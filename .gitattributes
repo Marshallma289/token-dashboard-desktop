@@ -1,0 +1,18 @@
+* text=auto
+*.py text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.spec text eol=lf
+*.sh text eol=lf
+*.command text eol=lf
+*.ps1 text eol=lf
+*.cmd text eol=crlf
+VERSION text eol=lf
+requirements-*.txt text eol=lf
+*.png binary
+*.ico binary
+*.icns binary

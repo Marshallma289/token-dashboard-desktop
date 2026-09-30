@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 from urllib.error import HTTPError, URLError
 import warnings
 import zipfile
@@ -179,6 +179,8 @@ class UpdaterTests(unittest.TestCase):
         for error, state in [(HTTPError(updater.API, 404, 'missing', {}, None), 'current'),
                              (HTTPError(updater.API, 503, 'offline', {}, None), 'error'),
                              (URLError('offline'), 'error')]:
+            if isinstance(error, HTTPError):
+                self.addCleanup(error.close)
             instance = self.instance()
             with patch.object(updater, 'fetch_bytes', side_effect=error):
                 instance._check()
@@ -216,6 +218,102 @@ class UpdaterTests(unittest.TestCase):
         self.assertIsNone(instance._job_path)
         self.assertIsNone(instance._lock_file)
         self.assertFalse(unsafe.parent.exists())
+
+    def test_external_environment_cleans_bundle_paths_and_restores_dll_search(self):
+        import ctypes
+        bundle = self.root / 'bundle'
+        system = str(self.root / 'system tools')
+        environment = {'PATH': os.pathsep.join((str(bundle), str(bundle / 'lib'), system)),
+                       'DYLD_LIBRARY_PATH': os.pathsep.join((str(bundle / 'libraries'), system)),
+                       'DYLD_FRAMEWORK_PATH': str(bundle / 'frameworks'),
+                       '_PYI_APPLICATION_HOME_DIR': str(bundle), '_PYI_PARENT_PROCESS_LEVEL': '1',
+                       'KEEP_SETTING': 'retained'}
+        for raises in (False, True):
+            with self.subTest(raises=raises), patch.dict(os.environ, environment, clear=True), \
+                    patch.object(updater.sys, 'platform', 'win32'), \
+                    patch.object(updater.sys, 'frozen', True, create=True), \
+                    patch.object(updater, 'resource_dir', return_value=bundle), \
+                    patch.object(ctypes, 'windll', Mock(), create=True) as dll:
+                try:
+                    with updater.external_environment() as cleaned:
+                        self.assertEqual(cleaned['PATH'], system)
+                        self.assertEqual(cleaned['DYLD_LIBRARY_PATH'], system)
+                        self.assertEqual(cleaned['DYLD_FRAMEWORK_PATH'], '')
+                        self.assertEqual(cleaned['KEEP_SETTING'], 'retained')
+                        self.assertEqual(cleaned['PYINSTALLER_RESET_ENVIRONMENT'], '1')
+                        self.assertFalse(any(key.startswith('_PYI_') for key in cleaned))
+                        dll.kernel32.SetDllDirectoryW.assert_called_once_with(None)
+                        self.assertEqual(dict(os.environ), environment)
+                        if raises:
+                            raise RuntimeError('simulated subprocess launch failure')
+                except RuntimeError:
+                    self.assertTrue(raises)
+                self.assertEqual(dll.kernel32.SetDllDirectoryW.call_args_list, [call(None), call(str(bundle))])
+
+    def test_external_environment_source_run_preserves_path(self):
+        with patch.dict(os.environ, {'PATH': 'original path', '_PYI_TEST': 'remove'}, clear=True), \
+                patch.object(updater.sys, 'frozen', False, create=True):
+            with updater.external_environment() as cleaned:
+                self.assertEqual(cleaned['PATH'], 'original path')
+                self.assertNotIn('_PYI_TEST', cleaned)
+                self.assertEqual(cleaned['PYINSTALLER_RESET_ENVIRONMENT'], '1')
+
+    def test_installer_handoff_and_early_exit_restarts_old_application(self):
+        for platform in ('win32', 'darwin'):
+            for early_exit in (False, True):
+                with self.subTest(platform=platform, early_exit=early_exit):
+                    instance = self.instance()
+                    identifier = ('d' if early_exit else 'e') * 32
+                    case = self.root / (platform + str(early_exit))
+                    case.mkdir()
+                    target = case / ('application.app' if platform == 'darwin' else 'application')
+                    target.mkdir()
+                    (target / 'original').write_text('old program')
+                    stage = case / ('.codex-token-update-' + identifier)
+                    stage.mkdir()
+                    candidate = stage / 'candidate' / ('CodexTokenDesktop.app' if platform == 'darwin' else 'CodexTokenDesktop')
+                    job = {'id': identifier, 'platform': platform, 'target': str(target), 'candidate': str(candidate),
+                           'backup': str(target) + '.rollback-' + identifier, 'parent_pid': os.getpid()}
+                    path = stage / 'job.json'
+                    updater.write_json(path, job)
+                    instance._job_path = path
+                    instance._lock_file = case / '.application.update.lock'
+                    updater.write_json(instance._lock_file, {'pid': os.getpid()})
+                    helper = Mock(pid=123456)
+                    helper.wait.side_effect = None if early_exit else subprocess.TimeoutExpired('helper', 1)
+                    helper.wait.return_value = 1 if early_exit else None
+                    with patch.object(updater.sys, 'platform', platform), \
+                            patch.object(updater.sys, 'frozen', False, create=True), \
+                            patch.object(updater, 'installation_dir', return_value=target), \
+                            patch.dict(os.environ, {'SystemRoot': str(self.root), '_PYI_TEST': 'remove'}), \
+                            patch.object(subprocess, 'CREATE_NO_WINDOW', 0x08000000, create=True), \
+                            patch.object(updater.subprocess, 'Popen', side_effect=[helper, Mock(pid=654321)]) as launch:
+                        instance.launch_installer()
+                    helper.wait.assert_called_once_with(timeout=1)
+                    self.assertTrue((stage / 'installer.log').is_file())
+                    first = launch.call_args_list[0]
+                    self.assertEqual(first.kwargs['cwd'], stage)
+                    self.assertNotIn('_PYI_TEST', first.kwargs['env'])
+                    self.assertEqual(first.kwargs['env']['PYINSTALLER_RESET_ENVIRONMENT'], '1')
+                    self.assertIs(first.kwargs['stdout'], first.kwargs['stderr'])
+                    if platform == 'win32':
+                        self.assertEqual(first.kwargs['creationflags'], 0x08000000)
+                    else:
+                        self.assertTrue(first.kwargs['start_new_session'])
+                    self.assertEqual((target / 'original').read_text(), 'old program')
+                    if early_exit:
+                        self.assertEqual(launch.call_count, 2)
+                        result = updater.read_json(stage / 'result.json')
+                        self.assertEqual(result['state'], 'error')
+                        self.assertIn('等待程序退出前终止', result['message'])
+                        self.assertFalse(instance._lock_file.exists())
+                        expected = target / ('CodexTokenDesktop.exe' if platform == 'win32' else 'Contents/MacOS/CodexTokenDesktop')
+                        self.assertEqual(launch.call_args_list[1].args[0], [str(expected)])
+                        self.assertNotIn('_PYI_TEST', launch.call_args_list[1].kwargs['env'])
+                    else:
+                        self.assertEqual(launch.call_count, 1)
+                        self.assertFalse((stage / 'result.json').exists())
+                        self.assertEqual(updater.read_json(instance._lock_file), {'pid': helper.pid, 'job': str(path)})
 
     def test_unsupported_platform_cannot_start(self):
         with patch.object(updater, 'resource_dir', return_value=ROOT), patch.object(updater.sys, 'platform', 'linux'), \

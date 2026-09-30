@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 import uuid
 import zipfile
+from contextlib import contextmanager
 
 from update_helpers import WINDOWS_HELPER, MACOS_HELPER
 
@@ -94,6 +95,27 @@ def fetch_bytes(url: str, limit: int, *, progress=None, target: Path | None = No
             if output:
                 output.close()
     return b''.join(chunks)
+
+
+@contextmanager
+def external_environment():
+    """Keep system tools independent of the frozen app's DLL search path."""
+    environment = {key: value for key, value in os.environ.items() if not key.startswith('_PYI_')}
+    environment['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+    if getattr(sys, 'frozen', False):
+        bundle = str(resource_dir())
+        for key in ('PATH', 'DYLD_LIBRARY_PATH', 'DYLD_FRAMEWORK_PATH'):
+            if key in environment:
+                environment[key] = os.pathsep.join(part for part in environment[key].split(os.pathsep) if not part.startswith(bundle))
+    windows_frozen = sys.platform == 'win32' and getattr(sys, 'frozen', False)
+    if windows_frozen:
+        import ctypes
+        ctypes.windll.kernel32.SetDllDirectoryW(None)
+    try:
+        yield environment
+    finally:
+        if windows_frozen:
+            ctypes.windll.kernel32.SetDllDirectoryW(str(resource_dir()))
 
 
 def validate_archive(archive: Path, manifest: dict, platform_key: str) -> None:
@@ -373,9 +395,10 @@ class Updater:
             candidate_root = stage / 'candidate'
             candidate_root.mkdir()
             if sys.platform == 'darwin':
-                subprocess.run(['/usr/bin/ditto', '-x', '-k', str(archive), str(candidate_root)], check=True, capture_output=True)
-                candidate = candidate_root / 'CodexTokenDesktop.app'
-                subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(candidate)], check=True, capture_output=True)
+                with external_environment() as environment:
+                    subprocess.run(['/usr/bin/ditto', '-x', '-k', str(archive), str(candidate_root)], check=True, capture_output=True, env=environment)
+                    candidate = candidate_root / 'CodexTokenDesktop.app'
+                    subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(candidate)], check=True, capture_output=True, env=environment)
             else:
                 with zipfile.ZipFile(archive) as package:
                     package.extractall(candidate_root)
@@ -411,18 +434,28 @@ class Updater:
         job_path = self._job_path
         validate_job(job_path, installation_dir())
         try:
-            if sys.platform == 'win32':
-                command = [str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'), '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(job_path.parent / 'install.ps1'), '-JobPath', str(job_path)]
-                helper = subprocess.Popen(command, cwd=job_path.parent, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
+            with external_environment() as environment, (job_path.parent / 'installer.log').open('wb') as log:
+                if sys.platform == 'win32':
+                    command = [str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'), '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(job_path.parent / 'install.ps1'), '-JobPath', str(job_path)]
+                    helper = subprocess.Popen(command, cwd=job_path.parent, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=environment, creationflags=subprocess.CREATE_NO_WINDOW)
+                else:
+                    helper = subprocess.Popen(['/bin/sh', str(job_path.parent / 'install.sh'), str(job_path)], cwd=job_path.parent, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=environment, start_new_session=True)
+            # A valid helper waits for this process to exit before changing any
+            # directory. Catch a failed launch while the old tree is intact.
+            try:
+                helper.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
             else:
-                helper = subprocess.Popen(['/bin/sh', str(job_path.parent / 'install.sh'), str(job_path)], cwd=job_path.parent, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                raise OSError('安装器在等待程序退出前终止，请查看安装日志')
         except OSError as error:
             write_json(job_path.parent / 'result.json', {'state': 'error', 'message': '无法启动安装器：' + str(error)[:160]})
             if self._lock_file:
                 self._lock_file.unlink(missing_ok=True)
             command = [str(installation_dir() / ('CodexTokenDesktop.exe' if sys.platform == 'win32' else 'Contents/MacOS/CodexTokenDesktop'))]
-            options = {'creationflags': subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS} if sys.platform == 'win32' else {'start_new_session': True}
-            subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **options)
+            options = {'creationflags': subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {'start_new_session': True}
+            with external_environment() as environment:
+                subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=environment, **options)
             return
         if self._lock_file:
             write_json(self._lock_file, {'pid': helper.pid, 'job': str(job_path)})

@@ -149,7 +149,7 @@ new_alive() {
 write_result() {
     [ -n "$stage" ] || return 1
     tmp="$stage/result.tmp"
-    /usr/bin/plutil -create xml "$tmp" &&
+    /usr/bin/plutil -create xml1 "$tmp" &&
     /usr/bin/plutil -insert state -string "$1" "$tmp" &&
     /usr/bin/plutil -insert message -string "$2" "$tmp" || return 1
     if [ "$1" = success ]; then

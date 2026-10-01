@@ -227,6 +227,16 @@ function Remove-OwnedStage {
     }
     Remove-Item -LiteralPath $full -Recurse -Force
 }
+function Remove-OwnedBackup {
+    if (!$backup -or !(Test-Path -LiteralPath $backup -PathType Container)) { return }
+    $full = [IO.Path]::GetFullPath($backup)
+    if ([IO.Path]::GetDirectoryName($full) -cne $parent -or [IO.Path]::GetFileName($full) -cne ([IO.Path]::GetFileName($target) + '.oldbackup-' + $id)) { throw 'Refusing to clean an unrecognized backup directory.' }
+    Assert-NoLinks $full
+    foreach ($item in Get-ChildItem -LiteralPath $full -Force -Recurse) {
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Refusing to clean backup containing links.' }
+    }
+    Remove-Item -LiteralPath $full -Recurse -Force
+}
 
 try {
     if (![Environment]::Is64BitOperatingSystem -or ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64' -and $env:PROCESSOR_ARCHITEW6432 -ne 'AMD64')) { throw 'This installer requires Windows x64.' }
@@ -322,10 +332,13 @@ try {
         } catch { Write-Warning ('Installed successfully; could not create shortcuts: ' + $_.Exception.Message) }
     }
     Write-Host ('Installed: ' + $target)
-    if (Test-Path -LiteralPath $backup) { Write-Host ('Previous installation retained: ' + $backup) }
+    $launched = [bool]$NoLaunch
     if (!$NoLaunch) {
-        try { Start-Process -FilePath $exe -WorkingDirectory $target }
+        try { Start-Process -FilePath $exe -WorkingDirectory $target; $launched = $true }
         catch { Write-Warning ('Installed successfully; could not launch: ' + $_.Exception.Message) }
+    }
+    if ($launched) {
+        try { Remove-OwnedBackup } catch { Write-Warning ('Previous installation cleanup failed: ' + $_.Exception.Message) }
     }
 } catch {
     Write-Error ('Installation failed: ' + $_.Exception.Message)

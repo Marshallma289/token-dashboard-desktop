@@ -46,6 +46,8 @@ jobs:
           '{"providers":{"install-check":"preserved"}}' | Set-Content -LiteralPath $config -Encoding UTF8
           & .\install.ps1 -InstallDir $installPath -NoLaunch -NoShortcut
           if ((Get-Content -LiteralPath $config -Raw | ConvertFrom-Json).providers.'install-check' -ne 'preserved') { throw 'Portable settings were not preserved' }
+          $parent = Split-Path -Parent $installPath
+          if (Get-ChildItem -LiteralPath $parent -Force | Where-Object { $_.Name -match '^(CodexTokenDesktop\.oldbackup-|\.codex-token-install-)' }) { throw 'Installer left backup or staging files' }
       - name: Check macOS terminal installation and reinstall
         if: runner.os == 'macOS'
         run: |
@@ -55,6 +57,10 @@ jobs:
           /usr/bin/codesign --verify --deep --strict "$install_path"
           /bin/bash ./install.sh --install-dir "$install_path" --no-launch
           /usr/bin/codesign --verify --deep --strict "$install_path"
+          if /usr/bin/find "${install_path%/*}" -maxdepth 1 \( -name 'CodexTokenDesktop.app.rollback-*' -o -name '.codex-token-install.*' \) | /usr/bin/grep -q .; then
+            echo 'Installer left backup or staging files' >&2
+            exit 1
+          fi
       - name: Set up Python
         uses: actions/setup-python@v7
         with:

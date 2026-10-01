@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
@@ -281,6 +282,67 @@ def confirm_startup(job_path: Path) -> None:
     job_path = job_path.absolute()
     job = validate_job(job_path, installation_dir())
     write_json(job_path.parent / 'ack.json', {'id': job['id'], 'pid': os.getpid()})
+
+
+def cleanup_completed_updates(target: Path, data_dir: Path, active_job: Path | None = None) -> None:
+    """Remove only completed update jobs for this exact installation.
+
+    The helper retains its rollback until the replacement has acknowledged
+    startup. Its result is written before it exits, so wait for the helper's
+    PID to disappear before touching either directory.
+    """
+    try:
+        validate_installation(target)
+        executable = target / ('Contents/MacOS/CodexTokenDesktop' if sys.platform == 'darwin' else 'CodexTokenDesktop.exe')
+        if not executable.is_file():
+            return
+        parent = target.parent
+        pending_path = data_dir / 'updater-pending.json'
+        lock_path = target.with_name('.' + target.name + '.update.lock')
+        deadline = time.monotonic() + (120 if active_job else 0)
+        while True:
+            for stage in parent.glob('.codex-token-update-*'):
+                if not re.fullmatch(r'\.codex-token-update-[0-9a-f]{32}', stage.name) or not stage.is_dir() or _is_link(stage):
+                    continue
+                job_path = stage / 'job.json'
+                try:
+                    job = validate_job(job_path, target)
+                    result = read_json(stage / 'result.json')
+                    ack = read_json(stage / 'ack.json')
+                    if result.get('state') != 'success' or ack.get('id') != job['id'] or not isinstance(ack.get('pid'), int):
+                        continue
+                    backup = Path(job['backup'])
+                    if _is_link(backup) or _is_link(job_path) or _is_link(stage / 'result.json') or _is_link(stage / 'ack.json'):
+                        continue
+                    lock = read_json(lock_path) if lock_path.is_file() and not _is_link(lock_path) else None
+                    if lock and lock.get('job') == str(job_path) and process_alive(int(lock['pid'])):
+                        continue
+                    if backup.exists():
+                        shutil.rmtree(backup)
+                    # The ZIP, extracted candidate, scripts, and logs all live here.
+                    shutil.rmtree(stage)
+                    if lock and lock.get('job') == str(job_path):
+                        lock_path.unlink(missing_ok=True)
+                    try:
+                        if read_json(pending_path).get('job') == str(job_path):
+                            pending_path.unlink(missing_ok=True)
+                    except (OSError, ValueError):
+                        pass
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue
+            if active_job is None or not active_job.parent.exists() or time.monotonic() >= deadline:
+                return
+            time.sleep(0.5)
+    except (OSError, ValueError):
+        return
+
+
+def _is_link(path: Path) -> bool:
+    try:
+        attributes = path.lstat().st_file_attributes if sys.platform == 'win32' else 0
+        return path.is_symlink() or bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    except FileNotFoundError:
+        return False
 
 
 class Updater:

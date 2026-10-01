@@ -1,7 +1,8 @@
 """External update helpers. Both accept only the absolute path of job.json.
 
 The application must acknowledge its own PID only after its window and HTTP
-server are ready. Helpers preserve the previous installation as a rollback.
+server are ready. Helpers keep the previous installation until startup succeeds;
+the new application then removes the rollback and download staging area.
 """
 
 WINDOWS_HELPER = r'''param([Parameter(Mandatory=$true)][string]$JobPath)
@@ -75,7 +76,7 @@ try {
     $newMoved = $true
     # Start-Process joins ArgumentList: quote the data argument explicitly.
     if ($JobPath.Contains('"')) { throw '任务路径包含无效引号' }
-    $newProcess = Start-Process -FilePath (Join-Path $target 'CodexTokenDesktop.exe') -ArgumentList @('--update-job', ('"' + $JobPath + '"')) -WindowStyle Hidden -PassThru
+    $newProcess = Start-Process -FilePath (Join-Path $target 'CodexTokenDesktop.exe') -WorkingDirectory $target -ArgumentList @('--update-job', ('"' + $JobPath + '"')) -WindowStyle Hidden -PassThru
     $deadline = [DateTime]::UtcNow.AddSeconds(60)
     $confirmed = $false
     while ([DateTime]::UtcNow -lt $deadline) {
@@ -207,7 +208,7 @@ run_update() {
     old_moved=1
     [ ! -e "$target" ] && [ ! -L "$target" ] && /bin/mv "$candidate" "$target" || { fail '无法安装候选目录'; return 1; }
     new_moved=1
-    "$target/Contents/MacOS/CodexTokenDesktop" --update-job "$job" >"$stage/new-process.log" 2>&1 &
+    (cd "$target" && exec "$target/Contents/MacOS/CodexTokenDesktop" --update-job "$job") >"$stage/new-process.log" 2>&1 &
     new_pid=$!
     count=0
     while [ "$count" -lt 60 ]; do

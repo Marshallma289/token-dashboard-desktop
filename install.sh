@@ -131,6 +131,12 @@ cleanup() {
             /bin/mv "$BACKUP" "$TARGET" || { printf '恢复失败，旧应用保留在：%s\n' "$BACKUP" >&2; result=1; }
         fi
     fi
+    if [ "$COMMITTED" -eq 1 ] && [ "$result" -eq 0 ] && [ -n "$BACKUP" ] &&
+        [ "$BACKUP" = "$TARGET.rollback-${STAGE##*.}" ] &&
+        [ -d "$BACKUP" ] && [ ! -L "$BACKUP" ] && identity "$BACKUP" &&
+        [ "$(cd "$BACKUP" && /bin/pwd -P)" = "$BACKUP" ]; then
+        /bin/rm -rf -- "$BACKUP" || { printf '旧应用备份清理失败：%s\n' "$BACKUP" >&2; result=1; }
+    fi
     # Recursive deletion is limited to our mktemp directory, never backups.
     if [ -n "$STAGE" ] && [ -d "$STAGE" ] && [ ! -L "$STAGE" ] &&
         [ "${STAGE%/*}" = "$PARENT" ] && [ "$(cd "$STAGE" && /bin/pwd -P)" = "$STAGE" ]; then
@@ -397,7 +403,6 @@ MOVED=1
 /usr/bin/codesign --verify --deep --strict "$TARGET"
 COMMITTED=1
 printf '已安装 %s：%s\n' "$VERSION" "$TARGET"
-[ -z "$BACKUP" ] || printf '旧应用备份保留：%s\n' "$BACKUP"
 if [ "$LAUNCH" -eq 1 ]; then
     /usr/bin/open "$TARGET" || { printf '应用已安装，但系统未允许启动。请从 Finder 打开：%s\n' "$TARGET" >&2; exit 1; }
 fi

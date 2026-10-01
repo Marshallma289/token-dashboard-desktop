@@ -50,6 +50,50 @@ class UpdaterTests(unittest.TestCase):
         instance._info = {'version': '1.2.0', 'build_number': 4, 'source_commit': 'a' * 40}
         return instance
 
+    def test_cleanup_only_after_success_and_helper_exit(self):
+        identifier = 'd' * 32
+        name = 'CodexTokenDesktop.app' if sys.platform == 'darwin' else 'CodexTokenDesktop'
+        target = self.root / name
+        executable = target / ('Contents/MacOS/CodexTokenDesktop' if sys.platform == 'darwin' else 'CodexTokenDesktop.exe')
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b'new')
+        stage = self.root / ('.codex-token-update-' + identifier)
+        stage.mkdir()
+        (stage / 'update.zip').write_bytes(b'archive')
+        backup = self.root / (name + '.rollback-' + identifier)
+        backup.mkdir()
+        (backup / 'old').write_bytes(b'old')
+        job_path = stage / 'job.json'
+        updater.write_json(job_path, {'id': identifier, 'platform': sys.platform, 'target': str(target),
+                                      'candidate': str(stage / 'candidate' / name), 'backup': str(backup), 'parent_pid': 1})
+        updater.write_json(stage / 'ack.json', {'id': identifier, 'pid': os.getpid()})
+        data_dir = self.root / 'data'
+        data_dir.mkdir()
+        pending = data_dir / 'updater-pending.json'
+        updater.write_json(pending, {'job': str(job_path)})
+        lock = self.root / ('.' + name + '.update.lock')
+        updater.write_json(lock, {'job': str(job_path), 'pid': os.getpid()})
+
+        updater.write_json(stage / 'result.json', {'state': 'error', 'message': 'failed'})
+        updater.cleanup_completed_updates(target, data_dir)
+        self.assertTrue(stage.exists())
+        self.assertTrue(backup.exists())
+
+        updater.write_json(stage / 'result.json', {'state': 'success'})
+        updater.cleanup_completed_updates(target, data_dir)
+        self.assertTrue(stage.exists())
+        self.assertTrue(backup.exists())
+
+        expired = subprocess.Popen([sys.executable, '-c', 'pass'])
+        expired.wait(timeout=10)
+        updater.write_json(lock, {'job': str(job_path), 'pid': expired.pid})
+        updater.cleanup_completed_updates(target, data_dir)
+        self.assertFalse(stage.exists())
+        self.assertFalse(backup.exists())
+        self.assertFalse(lock.exists())
+        self.assertFalse(pending.exists())
+        self.assertEqual(executable.read_bytes(), b'new')
+
     def publication(self, **changes):
         package = {'archive': 'windows.zip', 'manifest': 'manifest.json', 'sha256': 'a' * 64,
                    'manifest_sha256': 'b' * 64, 'size': 12}

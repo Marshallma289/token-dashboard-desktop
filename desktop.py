@@ -15,7 +15,7 @@ import time
 from typing import Any, Iterable, Mapping, Optional
 
 from backend import DashboardDB, DashboardService, create_server, safe_csv_row, local_data_dir
-from updater import Updater, confirm_startup
+from updater import Updater, cleanup_completed_updates, confirm_startup, installation_dir
 
 
 CSV_FIELDS = [
@@ -376,9 +376,11 @@ def main() -> int:
         if window is None:
             raise RuntimeError("无法创建客户端窗口")
         bridge.attach_window(window)
-        if '--update-job' in sys.argv:
-            job_path = Path(sys.argv[sys.argv.index('--update-job') + 1])
+        job_path = Path(sys.argv[sys.argv.index('--update-job') + 1]) if '--update-job' in sys.argv else None
+        if job_path is not None:
             window.events.loaded += lambda: confirm_startup(job_path)
+        if getattr(sys, 'frozen', False):
+            threading.Thread(target=cleanup_completed_updates, args=(installation_dir(), local_data_dir(), job_path), daemon=True, name='desktop-update-cleanup').start()
         webview.start(
             gui="edgechromium" if sys.platform == "win32" else None,
             debug=False,

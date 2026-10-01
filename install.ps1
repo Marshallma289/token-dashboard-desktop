@@ -8,8 +8,9 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $repo = 'Marshallma289/token-dashboard-desktop'
-$api = "https://api.github.com/repos/$repo/releases/latest"
+$bootstrap = "https://github.com/$repo/releases/latest/download/update.json"
 $assetBase = "https://github.com/$repo/releases/download/"
+$script:releaseBase = $null
 $maxArchive = 250MB
 $maxExpanded = 512MB
 $stage = $null
@@ -99,15 +100,27 @@ function Assert-UpdateIdle([string]$LockPath) {
     Remove-Item -LiteralPath $LockPath -Force
 }
 function Get-Download([string]$Url, [string]$Destination, [long]$Limit) {
-    if ($Url -ne $api -and !$Url.StartsWith($assetBase, [StringComparison]::Ordinal)) { throw 'Download source is not the configured GitHub repository.' }
+    if ($Url -cne $bootstrap -and (!$script:releaseBase -or !$Url.StartsWith($script:releaseBase, [StringComparison]::Ordinal))) { throw 'Download source is not the configured GitHub release.' }
     $current = [Uri]$Url
     for ($redirect = 0; $redirect -le 10; $redirect++) {
-        if ($current.Scheme -ne 'https' -or $current.UserInfo -or !($current.Host -eq 'api.github.com' -or $current.Host -eq 'github.com' -or $current.Host.EndsWith('.githubusercontent.com'))) { throw 'Unsafe download redirect.' }
+        if ($current.Scheme -ne 'https' -or $current.UserInfo -or !$current.IsDefaultPort -or !($current.Host -eq 'github.com' -or $current.Host.EndsWith('.githubusercontent.com'))) { throw 'Unsafe download redirect.' }
+        if ($current.Host -eq 'github.com') {
+            $githubUrl = $current.AbsoluteUri
+            if ($githubUrl -cne $bootstrap) {
+                if ($Url -ceq $bootstrap) {
+                    $tagPattern = '^' + [Regex]::Escape($assetBase) + '([^/?#]+)/update\.json$'
+                    $tagMatch = [Regex]::Match($githubUrl, $tagPattern)
+                    if (!$tagMatch.Success) { throw 'Latest release redirected outside the configured release asset.' }
+                    $resolvedBase = $assetBase + $tagMatch.Groups[1].Value + '/'
+                    if ($script:releaseBase -and $script:releaseBase -cne $resolvedBase) { throw 'Latest release changed during the download.' }
+                    $script:releaseBase = $resolvedBase
+                } elseif ($githubUrl -cne $Url) { throw 'Release asset redirected to a different GitHub asset.' }
+            } elseif ($Url -cne $bootstrap) { throw 'A fixed release asset redirected to latest.' }
+        } elseif ($Url -ceq $bootstrap -and !$script:releaseBase) { throw 'Latest release tag was not resolved before downloading.' }
         $request = [Net.HttpWebRequest]::Create($current)
         $request.AllowAutoRedirect = $false
         $request.UserAgent = 'CodexTokenDashboard-Installer'
         $request.Accept = 'application/octet-stream'
-        if ($Url -eq $api) { $request.Accept = 'application/vnd.github+json' }
         $request.Timeout = 30000
         $request.ReadWriteTimeout = 30000
         $response = $request.GetResponse()
@@ -252,30 +265,19 @@ try {
     $stageCreated = $true
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     Write-Host 'Finding the latest GitHub release...'
-    $releasePath = Join-Path $stage 'release.json'
-    Get-Download $api $releasePath 2MB
-    $release = Read-Json $releasePath
-    if ($release.tag_name -isnot [string] -or !$release.tag_name -or $release.assets -isnot [array] -or $release.draft -or $release.prerelease) { throw 'Invalid GitHub release metadata.' }
-    $assets = @{}
-    foreach ($asset in $release.assets) {
-        if ($asset.name -isnot [string] -or $assets.ContainsKey($asset.name)) { throw 'Invalid or duplicate release asset.' }
-        $expected = $assetBase + [Uri]::EscapeDataString($release.tag_name) + '/' + [Uri]::EscapeDataString($asset.name)
-        if ($asset.browser_download_url -cne $expected) { throw 'Release asset URL does not match the configured release.' }
-        $assets[$asset.name] = $expected
-    }
-    if (!$assets.ContainsKey('update.json')) { throw 'The latest release has no update.json.' }
     $updatePath = Join-Path $stage 'update.json'
-    Get-Download $assets['update.json'] $updatePath 2MB
+    Get-Download $bootstrap $updatePath 2MB
+    if (!$script:releaseBase) { throw 'Could not resolve a fixed GitHub release tag.' }
     $update = Read-Json $updatePath
     if ($update.schema -ne 1 -or $update.version -cnotmatch '^\d+\.\d+\.\d+$' -or $update.source_commit -cnotmatch '^[0-9a-f]{40}$' -or $update.source_digest -cnotmatch '^[0-9a-f]{64}$' -or $update.build_number -notmatch '^\d+$') { throw 'Invalid release update metadata.' }
     $package = $update.packages.'windows-x64'
-    if ($null -eq $package -or $package.sha256 -cnotmatch '^[0-9a-f]{64}$' -or $package.manifest_sha256 -cnotmatch '^[0-9a-f]{64}$' -or $package.size -notmatch '^\d+$' -or [long]$package.size -le 0 -or [long]$package.size -gt $maxArchive -or !$assets.ContainsKey($package.archive) -or !$assets.ContainsKey($package.manifest)) { throw 'Invalid Windows package metadata.' }
+    if ($null -eq $package -or $package.sha256 -cnotmatch '^[0-9a-f]{64}$' -or $package.manifest_sha256 -cnotmatch '^[0-9a-f]{64}$' -or $package.size -notmatch '^\d+$' -or [long]$package.size -le 0 -or [long]$package.size -gt $maxArchive -or $package.archive -isnot [string] -or $package.manifest -isnot [string] -or $package.archive -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$' -or $package.manifest -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { throw 'Invalid Windows package metadata.' }
     Write-Host ('Downloading version ' + $update.version + '...')
     $archivePath = Join-Path $stage 'package.zip'
-    Get-Download $assets[$package.archive] $archivePath $maxArchive
+    Get-Download ($script:releaseBase + [Uri]::EscapeDataString($package.archive)) $archivePath $maxArchive
     if ((Get-Item -LiteralPath $archivePath).Length -ne [long]$package.size -or (Get-Hash $archivePath) -cne $package.sha256) { throw 'Package size or SHA256 mismatch.' }
     $manifestPath = Join-Path $stage 'manifest.json'
-    Get-Download $assets[$package.manifest] $manifestPath 2MB
+    Get-Download ($script:releaseBase + [Uri]::EscapeDataString($package.manifest)) $manifestPath 2MB
     if ((Get-Hash $manifestPath) -cne $package.manifest_sha256) { throw 'Manifest SHA256 mismatch.' }
     $manifest = Read-Json $manifestPath
     if ($manifest.platform -ne 'win32' -or $manifest.architecture -ne 'x64' -or $manifest.version -cne $update.version -or $manifest.source_commit -cne $update.source_commit -or $manifest.source_digest -cne $update.source_digest) { throw 'Manifest does not match the release.' }

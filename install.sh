@@ -6,13 +6,16 @@ export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export LC_ALL=C
 umask 077
 REPO=Marshallma289/token-dashboard-desktop
-API="https://api.github.com/repos/$REPO/releases/latest"
+LATEST_UPDATE="https://github.com/$REPO/releases/latest/download/update.json"
+RELEASE_BASE=
 TARGET="$HOME/Applications/CodexTokenDesktop.app"
 LAUNCH=1
 CHECK=0
 STAGE=
 BACKUP=
 COMMITTED=0
+MOVED=0
+CANDIDATE_ID=
 LOCK=
 LOCK_ID=
 fail() { printf '安装失败：%s\n' "$*" >&2; exit 1; }
@@ -92,6 +95,15 @@ cleanup() {
     local result=$?
     set +e
     trap - EXIT HUP INT TERM
+    if [ "$COMMITTED" -eq 0 ] && [ "$MOVED" -eq 1 ] && [ -z "$BACKUP" ]; then
+        if [ -d "$TARGET" ] && [ ! -L "$TARGET" ] && identity "$TARGET" &&
+            [ "$(/usr/bin/stat -f '%d:%i' "$TARGET")" = "$CANDIDATE_ID" ] &&
+            [ "$(cd "$TARGET" && /bin/pwd -P)" = "$TARGET" ] && [ ! -e "$STAGE/failed.app" ]; then
+            /bin/mv "$TARGET" "$STAGE/failed.app" || { printf '候选应用无法移回暂存目录：%s\n' "$TARGET" >&2; result=1; }
+        else
+            printf '首次安装失败，目标发生变化，已保留：%s\n' "$TARGET" >&2; result=1
+        fi
+    fi
     if [ "$COMMITTED" -eq 0 ] && [ -n "$BACKUP" ] && [ -d "$BACKUP" ] && [ ! -L "$BACKUP" ]; then
         if [ -e "$TARGET" ]; then
             if identity "$TARGET" && [ ! -e "$STAGE/failed.app" ]; then /bin/mv "$TARGET" "$STAGE/failed.app" || result=1;
@@ -155,20 +167,11 @@ function task(exe,args) {
 function validPath(p) {
     return typeof p==='string' && p.length>0 && !/[\\:\x00-\x1f\x7f]/.test(p) && p[0]!=='/' && p.split('/').every(function(x){return x!=='' && x!=='.' && x!=='..';});
 }
-function safeURL(u) {
-    if (typeof u!=='string' || !/^https:\/\/github\.com\/Marshallma289\/token-dashboard-desktop\/releases\/download\/[A-Za-z0-9._~-]+\/[A-Za-z0-9._-]+$/.test(u) || /\/\.\.?\//.test(u)) bad('Release URL outside repository');
-    return u;
-}
 function checkInfo(u,m) {
     if(typeof u.build_number!=='number' || u.build_number<0 || Math.floor(u.build_number)!==u.build_number || u.schema!==1 || !/^\d+\.\d+\.\d+$/.test(u.version) || !/^[0-9a-f]{40}$/.test(u.source_commit) || !/^[0-9a-f]{64}$/.test(u.source_digest)) bad('Invalid update metadata');
     if(m.version!==u.version || m.source_commit!==u.source_commit || m.source_digest!==u.source_digest || m.architecture!=='arm64' || m.platform!=='darwin') bad('Manifest platform/version/source mismatch');
 }
 function run(args) {
-    if (args[0]==='asset') {
-        var assets=json(args[1]), found=assets.filter(function(a){return a.name===args[2];});
-        if(found.length!==1) bad('Missing or duplicate release asset: '+args[2]);
-        return safeURL(found[0].browser_download_url);
-    }
     var u=json(args[3]), m=json(args[2]); checkInfo(u,m);
     if(!Array.isArray(m.files) || m.files.length===0 || m.files.length>20000) bad('Invalid manifest file count');
     var declared=Object.create(null);
@@ -289,7 +292,10 @@ JXA
 fetch() {
     local current=$1 status location attempt
     local cdn_pattern='^https://([A-Za-z0-9-]+\.)*githubusercontent\.com/[^[:space:]\\]*$'
-    case "$current" in "$API"|"https://github.com/$REPO/releases/download/"*) ;; *) fail '下载地址不属于指定仓库' ;; esac
+    local release_pattern="^https://github[.]com/$REPO/releases/download/[A-Za-z0-9._~-]+/[A-Za-z0-9._-]+$"
+    if [ "$current" != "$LATEST_UPDATE" ]; then
+        [[ "$current" =~ $release_pattern ]] && [ -n "$RELEASE_BASE" ] && [ "${current%/*}" = "$RELEASE_BASE" ] || fail '下载地址不属于已固定的 Release'
+    fi
     for attempt in 1 2 3 4 5 6; do
         status=$(/usr/bin/curl --fail --silent --show-error --proto '=https' \
             --connect-timeout 30 --max-time 300 --max-filesize "$3" --retry 2 \
@@ -299,7 +305,18 @@ fetch() {
             200) [ "$(/usr/bin/stat -f %z "$2")" -le "$3" ] || fail '下载超过大小限制'; return 0 ;;
             301|302|303|307|308)
                 location=$(/usr/bin/awk 'tolower($1)=="location:" {sub(/^[^:]*:[ \t]*/, ""); sub(/\r$/, ""); value=$0} END {print value}' "$STAGE/http.headers")
-                [[ "$location" =~ $cdn_pattern ]] || fail 'GitHub 下载重定向到不受支持的地址'
+                if [[ "$location" =~ $release_pattern ]]; then
+                    case "$location" in */./*|*/../*) fail 'Release 重定向路径无效' ;; esac
+                    if [ "$current" = "$LATEST_UPDATE" ]; then
+                        [ "${location##*/}" = update.json ] || fail 'latest 重定向不是 update.json'
+                        RELEASE_BASE=${location%/*}
+                    fi
+                    [ -n "$RELEASE_BASE" ] && [ "${location%/*}" = "$RELEASE_BASE" ] || fail 'Release 重定向改变了已固定版本'
+                elif [[ "$location" =~ $cdn_pattern ]]; then
+                    [ -n "$RELEASE_BASE" ] || fail 'latest 未提供可固定的 Release 地址'
+                else
+                    fail 'GitHub 下载重定向到不受支持的地址'
+                fi
                 current=$location ;;
             *) fail "GitHub 下载 HTTP 状态异常：$status" ;;
         esac
@@ -307,15 +324,10 @@ fetch() {
     fail 'GitHub 下载重定向次数过多'
 }
 sha() { /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'; }
-asset_url() { /usr/bin/osascript -l JavaScript "$STAGE/verify.js" asset "$STAGE/assets.json" "$1"; }
 printf '%s\n' '正在读取最新 GitHub Release…'
-fetch "$API" "$STAGE/latest.json" 2097152
-# Read JSON directly: GitHub null values cannot be represented by XML plists.
-/usr/bin/plutil -lint "$STAGE/latest.json" >/dev/null
-[ "$(get "$STAGE/latest.json" draft)" = false ] || fail 'Release 尚未发布'
-[ "$(get "$STAGE/latest.json" prerelease)" = false ] || fail 'Release 是预发布版本'
-/usr/bin/plutil -extract assets json -o "$STAGE/assets.json" "$STAGE/latest.json"
-fetch "$(asset_url update.json)" "$STAGE/update.json" 2097152
+# Call fetch directly so its pinned RELEASE_BASE survives in this shell.
+fetch "$LATEST_UPDATE" "$STAGE/update.json" 2097152
+[ -n "$RELEASE_BASE" ] || fail '无法确定最新 Release 的固定下载目录'
 /usr/bin/plutil -lint "$STAGE/update.json" >/dev/null
 [ "$(get "$STAGE/update.json" schema)" = 1 ] || fail '不支持的更新协议'
 VERSION=$(get "$STAGE/update.json" version)
@@ -331,10 +343,10 @@ ARCHIVE_SIZE=$(get "$STAGE/update.json" packages.macos-arm64.size)
 [[ "$ARCHIVE_SHA" =~ ^[0-9a-f]{64}$ ]] && [[ "$MANIFEST_SHA" =~ ^[0-9a-f]{64}$ ]] || fail '校验摘要无效'
 [[ "$ARCHIVE_SIZE" =~ ^[1-9][0-9]{0,8}$ ]] && [ "$ARCHIVE_SIZE" -le 262144000 ] || fail '压缩包大小无效'
 [[ "$ARCHIVE" =~ ^[A-Za-z0-9._-]+\.zip$ ]] && [[ "$MANIFEST" =~ ^[A-Za-z0-9._-]+\.json$ ]] || fail '发布附件名称无效'
-fetch "$(asset_url "$MANIFEST")" "$STAGE/manifest.json" 2097152
+fetch "$RELEASE_BASE/$MANIFEST" "$STAGE/manifest.json" 2097152
 [ "$(sha "$STAGE/manifest.json")" = "$MANIFEST_SHA" ] || fail 'Manifest SHA-256 不一致'
 printf '正在下载并验证 %s…\n' "$VERSION"
-fetch "$(asset_url "$ARCHIVE")" "$STAGE/archive.zip" 262144000
+fetch "$RELEASE_BASE/$ARCHIVE" "$STAGE/archive.zip" 262144000
 [ "$(/usr/bin/stat -f %z "$STAGE/archive.zip")" = "$ARCHIVE_SIZE" ] || fail 'ZIP 大小不一致'
 [ "$(sha "$STAGE/archive.zip")" = "$ARCHIVE_SHA" ] || fail 'ZIP SHA-256 不一致'
 /usr/bin/osascript -l JavaScript "$STAGE/verify.js" before "$STAGE/archive.zip" "$STAGE/manifest.json" "$STAGE/update.json" >/dev/null
@@ -357,7 +369,9 @@ if [ -e "$TARGET" ]; then
     [ ! -e "$BACKUP" ] && [ ! -L "$BACKUP" ] || fail '备份路径已存在'
     /bin/mv "$TARGET" "$BACKUP"
 fi
+CANDIDATE_ID=$(/usr/bin/stat -f '%d:%i' "$CANDIDATE")
 /bin/mv "$CANDIDATE" "$TARGET"
+MOVED=1
 /usr/bin/codesign --verify --deep --strict "$TARGET"
 COMMITTED=1
 printf '已安装 %s：%s\n' "$VERSION" "$TARGET"

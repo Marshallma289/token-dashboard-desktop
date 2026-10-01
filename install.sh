@@ -202,8 +202,9 @@ function run(args) {
     });
     if(args[0]==='after') {
         var root=args[1], fm=$.NSFileManager.defaultManager, en=fm.enumeratorAtPath(root), x, seen=Object.create(null), sums=[];
-        while((x=en.nextObject)) {
-            var rel=str(x), full=root+'/'+rel, attrs=ObjC.deepUnwrap(fm.attributesOfItemAtPathError(full,null));
+        while((x=str(en.nextObject)) !== undefined && x !== null) {
+            if(typeof x!=='string') bad('Invalid extracted filename type');
+            var rel=x, full=root+'/'+rel, attrs=ObjC.deepUnwrap(fm.attributesOfItemAtPathError(full,null));
             if(!attrs || typeof attrs!=='object' || typeof attrs.NSFileType!=='string') bad('Cannot read extracted file attributes: '+rel);
             var type=attrs.NSFileType;
             if(type==='NSFileTypeDirectory') continue;

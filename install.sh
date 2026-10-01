@@ -203,13 +203,17 @@ function run(args) {
     if(args[0]==='after') {
         var root=args[1], fm=$.NSFileManager.defaultManager, en=fm.enumeratorAtPath(root), x, seen=Object.create(null), sums=[];
         while((x=en.nextObject)) {
-            var rel=str(x), full=root+'/'+rel, attrs=fm.attributesOfItemAtPathError(full,null), type=str(attrs.objectForKey($.NSFileType));
-            if(type===str($.NSFileTypeDirectory)) continue;
+            var rel=str(x), full=root+'/'+rel, attrs=ObjC.deepUnwrap(fm.attributesOfItemAtPathError(full,null));
+            if(!attrs || typeof attrs!=='object' || typeof attrs.NSFileType!=='string') bad('Cannot read extracted file attributes: '+rel);
+            var type=attrs.NSFileType;
+            if(type==='NSFileTypeDirectory') continue;
             var r=declared[rel]; if(!r || seen[rel]) bad('Undeclared extracted file: '+rel); seen[rel]=true;
             if(r.type==='symlink') {
-                if(type!==str($.NSFileTypeSymbolicLink) || str(fm.destinationOfSymbolicLinkAtPathError(full,null))!==r.target) bad('Extracted symlink mismatch: '+rel);
+                var target=fm.destinationOfSymbolicLinkAtPathError(full,null);
+                var targetText=typeof target==='string' ? target : (target ? ObjC.unwrap(target) : null);
+                if(type!=='NSFileTypeSymbolicLink' || typeof targetText!=='string' || targetText!==r.target) bad('Extracted symlink mismatch: '+rel);
             } else {
-                if(type!==str($.NSFileTypeRegular)) bad('Extracted type mismatch: '+rel);
+                if(type!=='NSFileTypeRegular') bad('Extracted type mismatch: '+rel);
                 sums.push(r.sha256+'  '+full);
             }
         }

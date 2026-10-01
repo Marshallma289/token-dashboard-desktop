@@ -1,7 +1,8 @@
 #!/bin/bash
 # Apple Silicon macOS 14+, native system tools only. Install through /bin/bash.
 # curl -fsSL https://github.com/Marshallma289/token-dashboard-desktop/releases/latest/download/install.sh | /bin/bash
-set -euo pipefail
+set -Eeuo pipefail
+trap 'printf "安装失败：第 %s 行。\n" "$LINENO" >&2' ERR
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export LC_ALL=C
 umask 077
@@ -59,11 +60,28 @@ validate_path "$TARGET"
 /bin/mkdir -p "$PARENT"
 [ "$(cd "$PARENT" && /bin/pwd -P)" = "$PARENT" ] || fail '安装目录的实际路径不一致'
 [ -w "$PARENT" ] || fail '安装目录不可写'
-get() { /usr/bin/plutil -extract "$2" raw -o - "$1"; }
+plist_get() { /usr/bin/plutil -extract "$2" raw -o - "$1"; }
+get() {
+    /usr/bin/osascript -l JavaScript -e '
+ObjC.import("Foundation");
+function run(args) {
+    var bytes = $.NSData.dataWithContentsOfFile(args[0]);
+    var text = $.NSString.alloc.initWithDataEncoding(bytes, $.NSUTF8StringEncoding);
+    var value = JSON.parse(ObjC.unwrap(text));
+    args[1].split(".").forEach(function(key) {
+        if (value === null || typeof value !== "object" || !Object.prototype.hasOwnProperty.call(value, key))
+            throw new Error("Missing JSON field: " + args[1]);
+        value = value[key];
+    });
+    if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean")
+        throw new Error("JSON field must be a scalar: " + args[1]);
+    return String(value);
+}' "$1" "$2"
+}
 identity() {
     [ -d "$1" ] && [ ! -L "$1" ] && [ ! -L "$1/Contents" ] && [ ! -L "$1/Contents/Resources" ] && [ ! -L "$1/Contents/MacOS" ] && [ -f "$1/Contents/Info.plist" ] && [ ! -L "$1/Contents/Info.plist" ] &&
-    [ "$(get "$1/Contents/Info.plist" CFBundleIdentifier)" = local.codextokendashboard ] &&
-    [ "$(get "$1/Contents/Info.plist" CFBundleExecutable)" = CodexTokenDesktop ] &&
+    [ "$(plist_get "$1/Contents/Info.plist" CFBundleIdentifier)" = local.codextokendashboard ] &&
+    [ "$(plist_get "$1/Contents/Info.plist" CFBundleExecutable)" = CodexTokenDesktop ] &&
     [ -f "$1/Contents/Resources/build-info.json" ] &&
     [ -x "$1/Contents/MacOS/CodexTokenDesktop" ]
 }
@@ -94,7 +112,7 @@ check_update_lock
 cleanup() {
     local result=$?
     set +e
-    trap - EXIT HUP INT TERM
+    trap - EXIT ERR HUP INT TERM
     if [ "$COMMITTED" -eq 0 ] && [ "$MOVED" -eq 1 ] && [ -z "$BACKUP" ]; then
         if [ -d "$TARGET" ] && [ ! -L "$TARGET" ] && identity "$TARGET" &&
             [ "$(/usr/bin/stat -f '%d:%i' "$TARGET")" = "$CANDIDATE_ID" ] &&
@@ -328,7 +346,6 @@ printf '%s\n' '正在读取最新 GitHub Release…'
 # Call fetch directly so its pinned RELEASE_BASE survives in this shell.
 fetch "$LATEST_UPDATE" "$STAGE/update.json" 2097152
 [ -n "$RELEASE_BASE" ] || fail '无法确定最新 Release 的固定下载目录'
-/usr/bin/plutil -lint "$STAGE/update.json" >/dev/null
 [ "$(get "$STAGE/update.json" schema)" = 1 ] || fail '不支持的更新协议'
 VERSION=$(get "$STAGE/update.json" version)
 COMMIT=$(get "$STAGE/update.json" source_commit)

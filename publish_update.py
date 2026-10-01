@@ -48,10 +48,15 @@ def main():
     metadata = root / 'update.json'
     metadata.write_text(json.dumps(update, indent=2) + '\n', encoding='utf-8')
     upload_files.append(metadata)
-    release = request('/releases', method='POST', data={'tag_name': tag, 'target_commitish': commit, 'name': f'Codex Token {version} · Build {number}', 'draft': True, 'prerelease': False, 'body': 'Windows x64 与 Apple Silicon macOS arm64 共用源码。\n支持在软件页面检查更新、一键下载更新并自动重启。\n统计数据库与个人设置保留；更新失败可恢复旧程序。\nmacOS 要求 14 或更新版本，当前采用临时签名，未公证。'})
+    for name in ('install.ps1', 'install.sh'):
+        installer = Path(__file__).resolve().parent / name
+        assert installer.is_file(), 'Both terminal installers are required'
+        upload_files.append(installer)
+    release = request('/releases', method='POST', data={'tag_name': tag, 'target_commitish': commit, 'name': f'Codex Token {version} · Build {number}', 'draft': True, 'prerelease': False, 'body': 'Windows x64 与 Apple Silicon macOS arm64 共用源码。\n支持终端一键安装，无需 Python、手动解压或管理员权限。\n安装命令见仓库 README；可指定安装目录，已安装的软件也可在页面内更新。\n统计数据库与个人设置保留；更新失败可恢复旧程序。\nmacOS 要求 14 或更新版本，当前采用临时签名，未公证。'})
     upload_url = release['upload_url'].split('{', 1)[0]
     for file in upload_files:
-        request(upload_url + '?name=' + quote(file.name), method='POST', data=file.read_bytes(), content_type='application/zip' if file.suffix == '.zip' else 'application/json')
+        content_type = 'application/zip' if file.suffix == '.zip' else 'application/json' if file.suffix == '.json' else 'text/plain; charset=utf-8'
+        request(upload_url + '?name=' + quote(file.name), method='POST', data=file.read_bytes(), content_type=content_type)
     # Only make a release visible after every package and checksum is uploaded.
     latest = request('/branches/main')['commit']['sha'] == commit
     request('/releases/' + str(release['id']), method='PATCH', data={'draft': False, 'make_latest': 'true' if latest else 'false'})

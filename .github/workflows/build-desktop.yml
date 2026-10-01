@@ -48,6 +48,26 @@ jobs:
         run: python -m pip install -r requirements-build.txt
       - name: Validate and build from clean staging
         run: python build_desktop.py --output-dir release
+      - name: Check Windows terminal installation and reinstall
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $installPath = Join-Path $env:RUNNER_TEMP 'Codex Token install check\CodexTokenDesktop'
+          & .\install.ps1 -InstallDir $installPath -NoLaunch -NoShortcut
+          if (-not (Test-Path -LiteralPath (Join-Path $installPath 'CodexTokenDesktop.exe'))) { throw 'Installation missing' }
+          $config = Join-Path $installPath 'providers.json'
+          '{"providers":{"install-check":"preserved"}}' | Set-Content -LiteralPath $config -Encoding UTF8
+          & .\install.ps1 -InstallDir $installPath -NoLaunch -NoShortcut
+          if ((Get-Content -LiteralPath $config -Raw | ConvertFrom-Json).providers.'install-check' -ne 'preserved') { throw 'Portable settings were not preserved' }
+      - name: Check macOS terminal installation and reinstall
+        if: runner.os == 'macOS'
+        run: |
+          install_path="$RUNNER_TEMP/Codex Token install check/CodexTokenDesktop.app"
+          /bin/bash ./install.sh --install-dir "$install_path" --no-launch
+          test -x "$install_path/Contents/MacOS/CodexTokenDesktop"
+          /usr/bin/codesign --verify --deep --strict "$install_path"
+          /bin/bash ./install.sh --install-dir "$install_path" --no-launch
+          /usr/bin/codesign --verify --deep --strict "$install_path"
       - name: Retain packages and source manifests
         uses: actions/upload-artifact@v7
         with:

@@ -17,6 +17,7 @@ import zipfile
 SOURCE_DIR = Path(__file__).resolve().parent
 ROOT_FILES = {
     "backend.py", "desktop.py", "pricing.py", "build_desktop.py", "updater.py", "update_helpers.py", "publish_update.py",
+    "install.ps1", "install.sh",
     "CodexTokenDesktop.spec", "build-portable.ps1", "build-macos.sh",
     "requirements-desktop.txt", "requirements-build.txt", "VERSION", "LICENSE",
     "README.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md", "providers.json.example",

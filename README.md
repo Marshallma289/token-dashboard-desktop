@@ -6,7 +6,45 @@
 
 > 看板统计的是本机日志，费用是参考估算，不等同于 OpenAI 或第三方供应商账单，也不代表订阅额度消耗。
 
-## 下载安装
+## 终端一键安装（推荐）
+
+复制一条命令到终端即可安装最新版。脚本自动下载、校验 SHA-256 和文件清单并完成安装，无需另装 Python、手动解压或管理员权限。只连接本仓库的 GitHub 发布，不上传本地日志或统计数据。
+
+### Windows：PowerShell
+
+```powershell
+irm https://github.com/Marshallma289/token-dashboard-desktop/releases/latest/download/install.ps1 | iex
+```
+
+默认安装到 `%LOCALAPPDATA%\Programs\CodexTokenDesktop`，创建当前用户的桌面和开始菜单快捷方式，并启动软件。
+
+指定 F 盘安装目录：
+
+```powershell
+& ([scriptblock]::Create((irm https://github.com/Marshallma289/token-dashboard-desktop/releases/latest/download/install.ps1))) -InstallDir 'F:\Token统计面板\CodexTokenDesktop'
+```
+
+脚本支持 `-NoLaunch`（安装后不启动）和 `-NoShortcut`（不创建快捷方式）。Windows 仍需 WebView2 Runtime；通常 Windows 10 / 11 已包含，缺少时按下文的 Microsoft 官方链接安装。
+
+### Apple Silicon Mac：终端
+
+```sh
+curl -fsSL https://github.com/Marshallma289/token-dashboard-desktop/releases/latest/download/install.sh | /bin/bash
+```
+
+默认安装到 `~/Applications/CodexTokenDesktop.app` 并打开软件。自定义目录或安装后不启动：
+
+```sh
+curl -fsSL https://github.com/Marshallma289/token-dashboard-desktop/releases/latest/download/install.sh | /bin/bash -s -- --install-dir "$HOME/Applications/CodexTokenDesktop.app" --no-launch
+```
+
+只支持 Apple 芯片及 macOS 14 或更新版本。Mac 包仍采用临时签名、未经 Apple 公证；安装脚本不会关闭系统安全保护，首次打开仍遵循系统提示。
+
+### 再次安装或升级
+
+关闭正在运行的软件，再对同一安装目录运行命令即可安装最新版。脚本先校验新包，再替换已识别的程序并保留旧程序备份；不会覆盖无关目录。历史数据库、主题和供应商配置保留。已安装的桌面版也可继续使用页面右上角的“检查更新”。
+
+## 手动下载安装
 
 桌面发行包已包含 Python 运行环境，无需另行安装 Python。
 
@@ -240,6 +278,7 @@ web/                    共用前端
 tests/                  单元与回归测试
 build_desktop.py        干净暂存、验证与跨平台打包入口
 publish_update.py       Release 发布与更新清单
+install.ps1 / install.sh 终端一键安装与再次安装升级
 VERSION                 共用版本号
 ```
 
@@ -278,7 +317,7 @@ sh build-macos.sh
 
 [构建工作流](.github/workflows/build-desktop.yml) 在推送到 `main`、Pull Request 或手动运行时，同时构建 Windows x64 和 macOS arm64。产物可在 **Actions → Build desktop packages → 对应运行 → Artifacts** 下载。
 
-两端构建使用同一个提交，`source_digest` 应一致。`main` 分支两端构建都成功后，工作流发布完整 Release 和 `update.json`；因此直接修改 `main` 的 README 也会触发构建及发布。
+两端构建使用同一个提交，`source_digest` 应一致。工作流在各系统实际执行终端安装与再次安装检查；两端都成功后，`main` 分支发布完整 Release、`update.json` 和两个终端安装脚本。因此直接修改 `main` 的 README 也会触发构建及发布。
 
 ## 版本摘要
 

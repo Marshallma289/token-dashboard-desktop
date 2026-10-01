@@ -358,6 +358,10 @@ def main() -> int:
     runtime: Optional[DesktopRuntime] = None
     bridge: Optional[DesktopBridge] = None
     try:
+        # Older helpers launch the replacement from the update staging folder.
+        # Leave that folder before the cleanup worker removes it on Windows.
+        if getattr(sys, 'frozen', False) and '--update-job' in sys.argv:
+            os.chdir(installation_dir())
         _wait_for_webview_cleanup()
         runtime = DesktopRuntime()
         url = runtime.start()

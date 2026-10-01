@@ -1125,3 +1125,82 @@ body[data-theme="dark"] .update-notice {
     -webkit-backdrop-filter: none;
   }
 }
+
+/* Desktop data management uses the dashboard's existing surfaces and colors. */
+.data-settings-button { font-size: 12px; white-space: nowrap; }
+.data-settings-button[hidden] { display: none !important; }
+.data-settings-dialog {
+  width: min(920px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  padding: 23px;
+  overflow: auto;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+}
+.data-settings-dialog::backdrop { background: rgba(12, 20, 30, .42); backdrop-filter: blur(4px); }
+.data-settings-heading { margin-bottom: 8px; }
+.data-settings-heading h2 { font-size: 18px; }
+.data-settings-heading .icon-button { flex: 0 0 auto; font-size: 21px; line-height: 1; }
+.data-settings-intro { margin: 0 0 16px; color: var(--text-muted); font-size: 12px; }
+.data-settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 15px; align-items: start; }
+.data-settings-section { min-width: 0; padding: 17px; background: var(--surface-alt); border: 1px solid var(--border); border-radius: 12px; }
+.data-settings-section-heading { display: flex; align-items: start; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.data-settings-section-heading .eyebrow { margin: 0 0 3px; font-size: 9px; }
+.data-settings-section-heading h3 { margin: 0; font-size: 15px; letter-spacing: -.02em; }
+.data-settings-help { min-height: 36px; margin: 0 0 13px; color: var(--text-muted); font-size: 12px; }
+.data-settings-label { display: block; margin: 0 0 5px; color: var(--text-soft); font-size: 12px; font-weight: 700; }
+.data-current-location { margin-bottom: 11px; }
+.data-current-location .data-settings-label { margin-bottom: 4px; }
+.data-path { min-height: 36px; margin: 0; color: var(--text); font-size: 12px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.data-settings-facts, .data-preview-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; padding: 10px 11px; margin: 0 0 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 9px; }
+.data-settings-facts > div:first-child,
+.data-settings-facts > div:last-child { grid-column: 1 / -1; }
+.data-settings-facts dt, .data-preview-facts dt { color: var(--text-muted); font-size: 12px; }
+.data-settings-facts dd, .data-preview-facts dd { margin: 2px 0 0; color: var(--text); font-size: 12px; font-weight: 700; overflow-wrap: anywhere; }
+#dataSettingsDialog input { min-width: 0; font: inherit; }
+.data-directory-input, .data-days-input { height: 36px; padding: 0 10px; color: var(--text); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 8px; font-size: 13px !important; }
+.data-directory-input { width: 100%; }
+.data-directory-input[aria-invalid="true"], .data-days-input[aria-invalid="true"] { border-color: var(--red); box-shadow: 0 0 0 2px color-mix(in srgb, var(--red) 15%, transparent); }
+.data-settings-dialog input:focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 45%, transparent); outline-offset: 2px; }
+.data-location-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 9px; }
+.data-location-actions button, .data-cleanup-controls > .export-button { min-height: 34px; font-size: 12px; }
+.data-settings-note { margin: 10px 0 0; color: var(--text-muted); font-size: 12px; line-height: 1.5; }
+.data-cleanup-controls { display: flex; flex-direction: column; align-items: start; }
+.data-days-row { display: flex; align-items: center; gap: 8px; }
+.data-days-row span { color: var(--text-soft); font-size: 12px; }
+.data-days-input { width: 138px; }
+.data-cleanup-controls .data-settings-note { margin: 7px 0 11px; }
+.data-cleanup-preview { padding: 12px; margin-top: 13px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
+#dataCleanupPreview[hidden], #dataCleanupConfirm[hidden], #cleanupPreviewEmpty[hidden] { display: none !important; }
+.cleanup-preview-summary { margin: 0 0 9px; color: var(--text); font-size: 12px; font-weight: 700; overflow-wrap: anywhere; }
+.data-preview-facts { margin: 0; padding: 9px 10px; }
+.cleanup-preview-empty { margin: 10px 0 0; color: var(--green); font-size: 12px; }
+.data-cleanup-confirm { padding-top: 9px; margin-top: 10px; border-top: 1px solid var(--border); }
+.data-cleanup-confirm > p { margin: 0; color: var(--text-muted); font-size: 12px; }
+.data-settings-dialog button:disabled, .data-settings-dialog input:disabled { cursor: default; opacity: .56; }
+.data-settings-dialog button:disabled:hover { transform: none; box-shadow: none; filter: none; }
+.data-settings-status { margin: 13px 0 0; color: var(--text-soft); font-size: 12px; line-height: 1.55; overflow-wrap: anywhere; white-space: pre-line; }
+.data-settings-status:empty { display: none; }
+.data-settings-status.is-error { color: var(--red); }
+.data-settings-footer { display: flex; justify-content: flex-end; margin-top: 12px; }
+.data-settings-footer button { min-width: 72px; }
+body[data-theme="dark"] .data-settings-dialog { color: var(--text); background: var(--surface); border-color: var(--border-strong); }
+body[data-theme="dark"] .data-settings-dialog::backdrop { background: rgba(0, 0, 0, .62); }
+body[data-theme="dark"] .data-settings-section,
+body[data-theme="dark"] .data-settings-facts,
+body[data-theme="dark"] .data-preview-facts,
+body[data-theme="dark"] .data-cleanup-preview { background: var(--surface-alt); border-color: var(--border); }
+body[data-theme="dark"] .data-directory-input,
+body[data-theme="dark"] .data-days-input { color: var(--text); background: var(--surface); border-color: var(--border-strong); }
+@media (max-width: 700px) {
+  .data-settings-dialog { padding: 18px; }
+  .data-settings-grid { grid-template-columns: minmax(0, 1fr); }
+  .data-settings-help { min-height: 0; }
+}
+@media (max-width: 420px) {
+  .data-settings-dialog { width: calc(100vw - 24px); max-height: calc(100dvh - 24px); padding: 15px; }
+  .data-settings-section { padding: 14px; }
+}

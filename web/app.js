@@ -1101,6 +1101,7 @@
   window.addEventListener('pywebviewready', loadDesktopPreferences);
   window.addEventListener('pywebviewready', initializeUpdater);
   document.addEventListener('DOMContentLoaded', initializeUpdater, { once: true });
+  document.addEventListener('data-settings:refresh', () => { fetchDashboard(); fetchHealth(); });
   loadDesktopPreferences();
   startHealthPolling();
   setTheme(state.theme);

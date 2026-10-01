@@ -32,6 +32,7 @@
         </div>
         <span id="lastUpdated" class="updated-text">等待数据</span>
         <button id="updateButton" class="reset-button update-button" type="button" aria-haspopup="dialog" aria-controls="updateDialog" hidden>检查更新</button>
+        <button id="dataSettingsButton" class="reset-button data-settings-button" type="button" aria-haspopup="dialog" aria-controls="dataSettingsDialog" hidden>数据管理</button>
         <button id="exportButton" class="export-button" type="button" title="导出当前筛选的每日模型用量">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 17v3h14v-3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
           <span>导出 CSV</span>
@@ -179,6 +180,49 @@
     <p id="updateNotice" class="update-notice">安装后自动重启，统计数据和设置会保留。</p>
     <div class="update-actions"><button id="updateCloseButton" class="reset-button" type="button">关闭</button><button id="updateActionButton" class="export-button" type="button">检查更新</button></div>
   </dialog>
+  <dialog id="dataSettingsDialog" class="data-settings-dialog" aria-labelledby="dataSettingsTitle" aria-describedby="dataSettingsIntro">
+    <div class="panel-heading data-settings-heading"><div><p class="eyebrow">LOCAL DATA</p><h2 id="dataSettingsTitle">数据管理</h2></div><button id="dataSettingsCloseIcon" class="icon-button" type="button" aria-label="关闭数据管理面板" autofocus>×</button></div>
+    <p id="dataSettingsIntro" class="data-settings-intro">管理本机历史数据的保存位置，或按需清理较早记录。</p>
+    <div class="data-settings-grid">
+      <section class="data-settings-section" aria-labelledby="dataLocationTitle">
+        <div class="data-settings-section-heading"><div><p class="eyebrow">STORAGE</p><h3 id="dataLocationTitle">保存位置</h3></div></div>
+        <p class="data-settings-help">更改后，现有历史会迁移到新目录，旧目录保留备份。</p>
+        <div class="data-current-location"><span class="data-settings-label">当前数据目录</span><p id="dataCurrentDirectory" class="data-path">等待读取保存位置</p></div>
+        <dl class="data-settings-facts">
+          <div><dt>数据库文件</dt><dd id="dataDatabasePath">—</dd></div>
+          <div><dt>数据库大小</dt><dd id="dataDatabaseSize">—</dd></div>
+          <div><dt>历史请求</dt><dd id="dataRequestCount">—</dd></div>
+          <div><dt>记录日期</dt><dd id="dataHistoryRange">—</dd></div>
+        </dl>
+        <label class="data-settings-label" for="dataDirectoryInput">新数据目录（完整路径）</label>
+        <input id="dataDirectoryInput" class="data-directory-input" type="text" autocomplete="off" spellcheck="false" placeholder="选择文件夹，或输入完整的目录路径">
+        <div class="data-location-actions"><button id="chooseDataDirectoryButton" class="reset-button" type="button">选择文件夹</button><button id="saveDataDirectoryButton" class="export-button" type="button">保存并迁移</button></div>
+        <p class="data-settings-note">迁移和清理产生的备份会占用额外磁盘空间；确认不再需要时可手动删除。</p>
+      </section>
+      <section class="data-settings-section" aria-labelledby="dataCleanupTitle">
+        <div class="data-settings-section-heading"><div><p class="eyebrow">MANUAL CLEANUP</p><h3 id="dataCleanupTitle">手动清理历史</h3></div></div>
+        <p class="data-settings-help">只会删除早于截止日期的记录；截止日期当天的数据会保留。</p>
+        <div class="data-cleanup-controls">
+          <label class="data-settings-label" for="cleanupDaysInput">删除多少天前的数据</label>
+          <div class="data-days-row"><input id="cleanupDaysInput" class="data-days-input" type="number" min="1" max="36500" step="1" list="cleanupDaysOptions" value="30" inputmode="numeric"><datalist id="cleanupDaysOptions"><option value="30"><option value="90"><option value="180"><option value="365"></datalist><span>天</span></div>
+          <p class="data-settings-note">可输入 1–36500 天。预览会显示确切截止日期和受影响记录数。</p>
+          <button id="previewCleanupButton" class="export-button" type="button">预览清理</button>
+        </div>
+        <div id="dataCleanupPreview" class="data-cleanup-preview" hidden aria-label="清理预览">
+          <p id="cleanupPreviewSummary" class="cleanup-preview-summary"></p>
+          <dl class="data-preview-facts"><div><dt>历史请求</dt><dd id="cleanupRequestCount">0</dd></div><div><dt>相关历史记录</dt><dd id="cleanupSnapshotCount">0</dd></div></dl>
+          <p id="cleanupPreviewEmpty" class="cleanup-preview-empty" hidden>截止日期前没有待清理记录，无需清理。</p>
+          <div id="dataCleanupConfirm" class="data-cleanup-confirm" hidden>
+            <p>确认后会创建可恢复备份，然后删除以上记录。</p>
+            <div class="data-location-actions"><button id="cancelCleanupButton" class="reset-button" type="button">取消</button><button id="confirmCleanupButton" class="export-button" type="button">确认清理</button></div>
+          </div>
+        </div>
+      </section>
+    </div>
+    <p id="dataSettingsStatus" class="data-settings-status" role="status" aria-live="polite"></p>
+    <div class="data-settings-footer"><button id="dataSettingsCloseButton" class="reset-button" type="button">关闭</button></div>
+  </dialog>
   <script src="app.js" defer></script>
+  <script src="data-settings.js" defer></script>
 </body>
 </html>

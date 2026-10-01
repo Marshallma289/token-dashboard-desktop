@@ -153,7 +153,8 @@ def build(output_dir: Path, *, skip_tests: bool = False) -> tuple[Path, Path]:
         (Path(test_env["CODEX_HOME"]) / name).mkdir(parents=True, exist_ok=True)
     if not skip_tests:
         run([sys.executable, "-m", "unittest", "discover", "-s", "tests"], stage, test_env)
-        run(["node", "--check", "web/app.js"], stage, test_env)
+        for script in sorted((stage / "web").glob("*.js")):
+            run(["node", "--check", str(script.relative_to(stage))], stage, test_env)
     if sys.platform == "darwin":
         make_macos_icon(stage, build_root)
     build_env = os.environ.copy()

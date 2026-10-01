@@ -21,6 +21,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 import webbrowser
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -694,6 +695,343 @@ class DashboardDB:
             self._maintain_storage(force=True)
             self._connection.close()
 
+    @staticmethod
+    def _validate_cleanup_days(days: Any) -> int:
+        if type(days) is not int or not 1 <= days <= 36500:
+            raise ValueError("清理天数必须是 1 到 36500 之间的整数")
+        return days
+
+    def _cleanup_meta_locked(self) -> Tuple[int, Optional[_dt.date]]:
+        values = {row["key"]: row["value"] for row in self._connection.execute(
+            "SELECT key, value FROM history_meta WHERE key IN ('cleanup_days','cleanup_before')")}
+        cleanup_days = 30
+        try:
+            stored_days = int(values.get("cleanup_days", "30"))
+            if 1 <= stored_days <= 36500:
+                cleanup_days = stored_days
+        except (TypeError, ValueError):
+            pass
+        raw_before = values.get("cleanup_before")
+        if not raw_before:
+            return cleanup_days, None
+        try:
+            cleanup_before = _dt.date.fromisoformat(raw_before)
+        except (TypeError, ValueError) as error:
+            raise sqlite3.DatabaseError("数据库中的清理边界日期无效") from error
+        if cleanup_before.isoformat() != raw_before:
+            raise sqlite3.DatabaseError("数据库中的清理边界日期无效")
+        return cleanup_days, cleanup_before
+
+    def _effective_cleanup_cutoff_locked(self, days: int) -> _dt.date:
+        _stored_days, previous = self._cleanup_meta_locked()
+        requested = self._local_now().date() - _dt.timedelta(days=days)
+        return max(requested, previous) if previous else requested
+
+    @staticmethod
+    def _database_size(db_path: Path) -> int:
+        size = 0
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                size += Path(str(db_path) + suffix).stat().st_size
+            except FileNotFoundError:
+                pass
+        return size
+
+    def _data_settings_locked(self) -> Dict[str, Any]:
+        cleanup_days, cleanup_before = self._cleanup_meta_locked()
+        row = self._connection.execute("""SELECT COUNT(*) AS request_count,
+                MIN(s.day) AS earliest_day, MAX(s.day) AS latest_day
+            FROM history_requests r JOIN history_snapshots s ON s.id=r.snapshot_id""").fetchone()
+        return {
+            "database_path": str(self.db_path),
+            "directory": str(self.db_path.parent),
+            "database_bytes": self._database_size(self.db_path),
+            "request_count": int(row["request_count"]),
+            "earliest_day": row["earliest_day"],
+            "latest_day": row["latest_day"],
+            "cleanup_days": cleanup_days,
+            "cleanup_before": cleanup_before.isoformat() if cleanup_before else None,
+        }
+
+    def data_settings(self) -> Dict[str, Any]:
+        with self._lock:
+            return self._data_settings_locked()
+
+    def _cleanup_preview_locked(self, days: int, cutoff: _dt.date) -> Dict[str, Any]:
+        cutoff_day = cutoff.isoformat()
+        snapshots = self._connection.execute(
+            "SELECT COUNT(*) FROM history_snapshots WHERE day < ?", (cutoff_day,)
+        ).fetchone()[0]
+        requests = self._connection.execute("""WITH candidates(logical_key, snapshot_id) AS (
+                SELECT logical_key, snapshot_id FROM history_requests
+                UNION SELECT logical_key, retained_snapshot_id FROM history_requests
+                    WHERE retained_snapshot_id IS NOT NULL
+                UNION SELECT logical_key, snapshot_id FROM history_sources
+            )
+            SELECT COUNT(*) FROM history_requests r
+            WHERE EXISTS (
+                SELECT 1 FROM candidates c JOIN history_snapshots s ON s.id=c.snapshot_id
+                WHERE c.logical_key=r.logical_key AND s.day < ?
+            ) AND NOT EXISTS (
+                SELECT 1 FROM candidates c JOIN history_snapshots s ON s.id=c.snapshot_id
+                WHERE c.logical_key=r.logical_key AND s.day >= ?
+            )""", (cutoff_day, cutoff_day)).fetchone()[0]
+        return {
+            "days": days,
+            "cutoff_day": cutoff_day,
+            "request_count": int(requests),
+            "snapshot_count": int(snapshots),
+        }
+
+    def preview_cleanup(self, days: int) -> Dict[str, Any]:
+        days = self._validate_cleanup_days(days)
+        with self._lock:
+            cutoff = self._effective_cleanup_cutoff_locked(days)
+            return self._cleanup_preview_locked(days, cutoff)
+
+    def _cleanup_backup_locked(self) -> Path:
+        backup_directory = self.db_path.parent / "backups"
+        backup_directory.mkdir(parents=True, exist_ok=True)
+        stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+        backup_path = backup_directory / ("usage-cleanup-%s-%s.sqlite3" % (stamp, uuid.uuid4().hex))
+        target = None
+        try:
+            target = sqlite3.connect(str(backup_path), timeout=5.0)
+            self._connection.backup(target)
+            check = target.execute("PRAGMA quick_check(1)").fetchone()
+            if not check or str(check[0]).casefold() != "ok":
+                raise sqlite3.DatabaseError("SQLite 备份未通过完整性检查")
+            target.close()
+            target = None
+            return backup_path
+        except Exception:
+            if target is not None:
+                try:
+                    target.close()
+                except sqlite3.Error:
+                    pass
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    Path(str(backup_path) + suffix).unlink()
+                except OSError:
+                    pass
+            raise
+
+    def cleanup_history(self, days: int, expected_cutoff: Optional[str] = None) -> Dict[str, Any]:
+        days = self._validate_cleanup_days(days)
+        if expected_cutoff is not None:
+            if not isinstance(expected_cutoff, str):
+                raise ValueError("预览截止日期必须是 ISO 日期")
+            try:
+                parsed_expected = _dt.date.fromisoformat(expected_cutoff)
+            except ValueError as error:
+                raise ValueError("预览截止日期必须是 ISO 日期") from error
+            if parsed_expected.isoformat() != expected_cutoff:
+                raise ValueError("预览截止日期必须是 ISO 日期")
+
+        # Dashboard reads take _query_lock before they open a reader; scanner
+        # writes take only _lock.  This order blocks cache fills during a
+        # destructive change without introducing a lock inversion.
+        with self._query_lock:
+            with self._lock:
+                cutoff = self._effective_cleanup_cutoff_locked(days)
+                cutoff_day = cutoff.isoformat()
+                if expected_cutoff is not None and expected_cutoff != cutoff_day:
+                    raise ValueError("清理截止日期已变化，请重新预览")
+
+                # A verified online copy exists before any deletion or marker
+                # change.  If copying/checking fails, the live DB is untouched.
+                backup_path = self._cleanup_backup_locked()
+                before_requests = int(self._connection.execute(
+                    "SELECT COUNT(*) FROM history_requests").fetchone()[0])
+                before_snapshots = int(self._connection.execute(
+                    "SELECT COUNT(*) FROM history_snapshots WHERE day < ?", (cutoff_day,)
+                ).fetchone()[0])
+                try:
+                    self._connection.execute("BEGIN")
+                    affected = {row[0] for row in self._connection.execute("""SELECT logical_key
+                        FROM history_sources src JOIN history_snapshots s ON s.id=src.snapshot_id
+                        WHERE s.day < ?
+                        UNION SELECT logical_key FROM history_requests r
+                            JOIN history_snapshots s ON s.id=r.snapshot_id WHERE s.day < ?
+                        UNION SELECT logical_key FROM history_requests r
+                            JOIN history_snapshots s ON s.id=r.retained_snapshot_id WHERE s.day < ?""",
+                        (cutoff_day, cutoff_day, cutoff_day)).fetchall()}
+                    self._connection.execute("""DELETE FROM history_sources WHERE snapshot_id IN (
+                        SELECT id FROM history_snapshots WHERE day < ?)""", (cutoff_day,))
+                    self._connection.execute("""UPDATE history_requests SET retained_snapshot_id=NULL
+                        WHERE retained_snapshot_id IN (
+                            SELECT id FROM history_snapshots WHERE day < ?)""", (cutoff_day,))
+                    # Preserve a surviving current winner if a damaged or old
+                    # ledger has no source/retained reference for that row.
+                    self._connection.execute("""UPDATE history_requests SET retained_snapshot_id=snapshot_id
+                        WHERE retained_snapshot_id IS NULL
+                        AND logical_key IN (SELECT logical_key FROM history_requests
+                            WHERE snapshot_id IN (SELECT id FROM history_snapshots WHERE day < ?))
+                        AND snapshot_id IN (SELECT id FROM history_snapshots WHERE day >= ?)
+                        AND NOT EXISTS (SELECT 1 FROM history_sources src
+                            WHERE src.logical_key=history_requests.logical_key
+                            AND src.snapshot_id=history_requests.snapshot_id)""", (cutoff_day, cutoff_day))
+                    self._rebuild_logical_records(affected)
+                    self._connection.execute("DELETE FROM history_snapshots WHERE day < ?", (cutoff_day,))
+                    self._collect_unused_snapshots()
+                    self._connection.execute("""UPDATE source_files SET record_count=(
+                        SELECT COUNT(*) FROM history_sources WHERE history_sources.file_id=source_files.id)""")
+                    self._connection.execute("INSERT OR REPLACE INTO history_meta(key,value) VALUES (?,?)",
+                                             ("cleanup_before", cutoff_day))
+                    self._connection.execute("INSERT OR REPLACE INTO history_meta(key,value) VALUES (?,?)",
+                                             ("cleanup_days", str(days)))
+                    self._connection.commit()
+                except Exception:
+                    self._connection.rollback()
+                    raise
+
+                # Cleanup is committed and recoverable from backup_path even
+                # if physical compaction fails; report that limitation without
+                # pretending the logical cleanup failed.
+                space_reclaimed = True
+                try:
+                    self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    self._connection.execute("VACUUM")
+                    checkpoint = self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                    if checkpoint and checkpoint[0]:
+                        space_reclaimed = False
+                    self._last_maintenance = time.monotonic()
+                except sqlite3.DatabaseError:
+                    space_reclaimed = False
+                after_requests = int(self._connection.execute(
+                    "SELECT COUNT(*) FROM history_requests").fetchone()[0])
+                after_old_snapshots = int(self._connection.execute(
+                    "SELECT COUNT(*) FROM history_snapshots WHERE day < ?", (cutoff_day,)
+                ).fetchone()[0])
+                self._data_version += 1
+                self._dashboard_cache.clear()
+                settings = self._data_settings_locked()
+                result = {
+                    "ok": True,
+                    "cutoff_day": cutoff_day,
+                    "deleted_requests": max(0, before_requests - after_requests),
+                    "deleted_snapshots": max(0, before_snapshots - after_old_snapshots),
+                    "backup_path": str(backup_path),
+                    "settings": settings,
+                }
+                if not space_reclaimed:
+                    result["space_reclaimed"] = False
+                return result
+
+    def relocate_database(
+        self,
+        directory: Path | str,
+        persist: Optional[Callable[[str], Any]] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(directory, (Path, str)):
+            raise ValueError("保存目录必须是绝对路径")
+        requested_directory = Path(directory).expanduser()
+        if not requested_directory.is_absolute():
+            raise ValueError("保存目录必须是绝对路径")
+        try:
+            destination_directory = requested_directory.resolve(strict=True)
+        except OSError as error:
+            raise ValueError("保存目录不存在或无法访问") from error
+        if not destination_directory.is_dir():
+            raise ValueError("保存路径必须是已存在的文件夹")
+        destination = destination_directory / "usage.sqlite3"
+
+        # Check the selected folder is writable before locking the live store.
+        probe = destination_directory / (".codex-token-dashboard-write-test-%s.tmp" % uuid.uuid4().hex)
+        try:
+            descriptor = os.open(str(probe), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(descriptor)
+            probe.unlink()
+        except OSError as error:
+            try:
+                probe.unlink()
+            except OSError:
+                pass
+            raise ValueError("保存目录不可写") from error
+
+        with self._query_lock:
+            with self._lock:
+                previous_path = self.db_path
+                current_settings = self._data_settings_locked()
+                current_path = previous_path.resolve()
+                try:
+                    requested_target = destination.resolve(strict=False)
+                except OSError as error:
+                    raise ValueError("数据库目标路径无效") from error
+                if requested_target == current_path:
+                    return {"ok": True, "settings": current_settings,
+                            "previous_path": str(previous_path)}
+                if destination.exists() or destination.is_symlink():
+                    raise FileExistsError("目标文件夹中已存在 usage.sqlite3，拒绝覆盖")
+
+                token = uuid.uuid4().hex
+                temporary = destination_directory / (".usage.sqlite3-relocate-%s.tmp" % token)
+                new_connection: Optional[sqlite3.Connection] = None
+                final_created = False
+                try:
+                    target = sqlite3.connect(str(temporary), timeout=5.0)
+                    try:
+                        self._connection.backup(target)
+                        check = target.execute("PRAGMA quick_check(1)").fetchone()
+                        if not check or str(check[0]).casefold() != "ok":
+                            raise sqlite3.DatabaseError("迁移后的数据库未通过完整性检查")
+                    finally:
+                        target.close()
+
+                    # Reserve the destination without overwriting a database
+                    # that appeared after the initial check, then atomically
+                    # replace the empty reservation with the verified copy.
+                    descriptor = os.open(str(destination), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                    final_created = True
+                    os.close(descriptor)
+                    os.replace(str(temporary), str(destination))
+                    new_connection = sqlite3.connect(str(destination), timeout=5.0, check_same_thread=False)
+                    new_connection.row_factory = sqlite3.Row
+                    new_connection.execute("PRAGMA foreign_keys=ON")
+                    check = new_connection.execute("PRAGMA quick_check(1)").fetchone()
+                    if not check or str(check[0]).casefold() != "ok":
+                        raise sqlite3.DatabaseError("迁移后的数据库未通过完整性检查")
+                    new_connection.execute("PRAGMA journal_mode=WAL")
+                    new_connection.execute("PRAGMA synchronous=FULL")
+                    new_settings = dict(current_settings)
+                    new_settings["database_path"] = str(destination)
+                    new_settings["directory"] = str(destination_directory)
+                    new_settings["database_bytes"] = self._database_size(destination)
+                    if persist is not None:
+                        persisted = persist(str(destination))
+                        if persisted is False:
+                            raise RuntimeError("未能保存数据库位置设置")
+
+                    old_connection = self._connection
+                    self.db_path = destination
+                    self._connection = new_connection
+                    new_connection = None
+                    self._data_version += 1
+                    self._dashboard_cache.clear()
+                    try:
+                        old_connection.close()
+                    except sqlite3.Error:
+                        pass
+                    return {"ok": True, "settings": new_settings,
+                            "previous_path": str(previous_path)}
+                except Exception:
+                    if new_connection is not None:
+                        try:
+                            new_connection.close()
+                        except sqlite3.Error:
+                            pass
+                    cleanup_paths = [temporary]
+                    if final_created:
+                        cleanup_paths.append(destination)
+                    for path in cleanup_paths:
+                        for suffix in ("", "-wal", "-shm"):
+                            try:
+                                Path(str(path) + suffix).unlink()
+                            except OSError:
+                                pass
+                    raise
+
     def _create_schema(self) -> None:
         # The history is authoritative, not a disposable copy of source files.
         # A request points at one coherent snapshot; source references share it.
@@ -998,6 +1336,7 @@ class DashboardDB:
             existing = {row["path"]: row for row in self._connection.execute("SELECT * FROM source_files")}
             try:
                 self._connection.execute("BEGIN")
+                _cleanup_days, cleanup_before = self._cleanup_meta_locked()
                 affected = set()
                 for path in files:
                     key = str(path)
@@ -1029,10 +1368,15 @@ class DashboardDB:
                         result.records_skipped += previous["record_count"]
                         continue
                     parsed = []
+                    purged_records = 0
                     for record in records:
+                        if cleanup_before and _dt.date.fromisoformat(record.day) < cleanup_before:
+                            purged_records += 1
+                            continue
                         row = dict(vars(record))
                         row.update(vars(record.usage))
                         parsed.append((self._history_key(row), row))
+                    result.records_skipped += purged_records
                     new_keys = {logical for logical, _ in parsed}
                     usage_format = "modern" if self.parser._has_modern else "legacy"
                     if previous:
@@ -1422,17 +1766,18 @@ class DashboardDB:
     def storage_status(self) -> Dict[str, Any]:
         with self._lock:
             snapshots = self._connection.execute("SELECT COUNT(*) FROM history_snapshots").fetchone()[0]
-        size = 0
-        for suffix in ("", "-wal", "-shm"):
-            try:
-                size += Path(str(self.db_path) + suffix).stat().st_size
-            except FileNotFoundError:
-                pass
-        return {"mode": "durable", "database_path": str(self.db_path),
+            db_path = self.db_path
+            size = self._database_size(db_path)
+        return {"mode": "durable", "database_path": str(db_path),
                 "database_bytes": size, "snapshots": snapshots}
 
     def counts(self) -> Dict[str, int]:
-        reader = sqlite3.connect(str(self.db_path), timeout=5.0)
+        # Capture one database generation before opening the read connection.
+        # Old DB files are retained after relocation, so this reader stays valid
+        # even if a cutover completes immediately afterwards.
+        with self._lock:
+            db_path = self.db_path
+        reader = sqlite3.connect(str(db_path), timeout=5.0)
         try:
             files = reader.execute("SELECT COUNT(*) FROM source_files").fetchone()[0]
             records = reader.execute("SELECT COUNT(*) FROM usage_records").fetchone()[0]
@@ -1475,6 +1820,12 @@ class DashboardService:
     def version(self) -> int:
         with self._changed:
             return self._version
+
+    def notify_change(self) -> None:
+        """Publish a data change made outside the scanner to SSE clients."""
+        with self._changed:
+            self._version += 1
+            self._changed.notify_all()
 
     def refresh(self) -> ScanResult:
         started = time.perf_counter()
@@ -1624,7 +1975,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 (stdlib handler API)
         service, _host = self.app
         route = urlparse(self.path).path
-        static_routes = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/styles.css": "styles.css"}
+        static_routes = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js",
+                         "/data-settings.js": "data-settings.js", "/styles.css": "styles.css"}
         if route in static_routes:
             self._write_static(static_routes[route])
             return

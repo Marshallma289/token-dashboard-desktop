@@ -1,5 +1,21 @@
 # Codex Token Dashboard
 
+## 1.5.0：轮次平均输出速度
+
+总览、模型卡片和每日明细新增 **token/s** 与有效轮次样本数，支持现有时间、供应商、工作空间和模型筛选，JSON / CSV 导出包含同口径指标。
+
+- 计算方式：有完整计时的轮次输出 Token 总和 ÷ 这些轮次的总耗时（秒），包含等待、推理和工具执行耗时，**不是纯流式生成速度**。Input 不计入分子，Reasoning 已属于 Output，不重复相加。多个轮次先汇总输出和耗时，再计算速度。
+- 按线程及 `turn_id` 匹配 `task_started` / `task_complete`，优先使用完成事件的 `duration_ms`；缺失时使用日志内有效的起止时间。相同 response / 轮次及复制日志不会重复计入。
+- 尚未完成、缺少开始或结束标记、耗时无效、请求缺少稳定标识，以及轮次内模型/供应商/工作空间变化的记录不计入速度样本，原有 Token 用量仍保留。无有效样本显示 `—`，导出速度为空。
+- 跨日轮次的速度按最后一条用量记录的日期归组；只统计可用日志中完整轮次，因此速度样本数可能小于请求数。缺少历史计时无法补算，已有速度随历史用量保存在本机。
+- 首次打开旧数据库会先创建 `.pre-speed.bak` 备份，再增加计时字段并重扫可用日志，不需清空历史。数据库只保存数值和经过哈希的轮次标识，不保存对话或工具正文。
+
+CSV 新增 `speed_output_tokens`、`speed_duration_ms`、`speed_sample_count`、`output_tokens_per_second`，便于复核计算。
+
+构建脚本会实际运行打包后的程序进行无窗口自检：用独立临时数据库和合成日志检查回环 HTTP、加权 token/s、重复日志、未完成轮次、模型筛选、随包网页资源、CSV 与历史保留；结果写入 `build-manifest.json` 的 `self_test`。自检不读取个人日志或设置，不启动更新器，也不验证 WebView 图形窗口渲染。
+
+手动自检：Windows 在终端运行 `CodexTokenDesktop.exe --self-test --self-test-report self-test-report.json`；Mac 使用 `.app/Contents/MacOS/CodexTokenDesktop` 加相同参数；源码使用 `python desktop.py --self-test`。通过时返回 0，失败时返回非 0。Windows 无控制台版本请查看指定的 JSON 报告。
+
 本地 Codex Token 用量看板：读取本机 rollout JSONL 日志，实时展示用量、请求分布和按公开参考价估算的美元费用。支持 Windows x64、Apple Silicon Mac 桌面版，以及浏览器模式。
 
 [下载桌面版](https://github.com/Marshallma289/token-dashboard-desktop/releases/latest) · [构建记录](https://github.com/Marshallma289/token-dashboard-desktop/actions/workflows/build-desktop.yml) · [问题反馈](https://github.com/Marshallma289/token-dashboard-desktop/issues)

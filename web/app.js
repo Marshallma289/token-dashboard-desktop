@@ -340,6 +340,7 @@
     const cacheWrite = metricFrom(item, ['cache_write', 'cache_write_input_tokens', 'cacheWriteInputTokens', 'cache_creation_input_tokens']);
     const reasoning = metricFrom(item, ['reasoning', 'reasoning_tokens', 'reasoningTokens']);
     const totalValue = metricFrom(item, ['total', 'total_tokens', 'totalTokens', 'tokens']);
+    const outputTokensPerSecond = pick(item, 'output_tokens_per_second');
     const providerId = text(pick(item, 'provider_id', 'providerId', 'provider', 'vendor_id'));
     const providerLabel = text(pick(item, 'provider_label', 'providerLabel', 'provider_name', 'providerName', 'vendor'), providerId || '未知供应商');
     return {
@@ -354,6 +355,10 @@
       reasoning,
       total: totalValue || input + output,
       requests: metricFrom(item, ['requests', 'request_count', 'requestCount', 'calls', 'count']),
+      speedOutputTokens: metricFrom(item, ['speed_output_tokens']),
+      speedDurationMs: metricFrom(item, ['speed_duration_ms']),
+      speedSampleCount: metricFrom(item, ['speed_sample_count']),
+      outputTokensPerSecond: outputTokensPerSecond == null ? null : toNumber(outputTokensPerSecond),
       cost: metricFrom(item, ['estimated_cost_usd', 'estimated_cost', 'cost_usd']),
       pricingStatus: text(pick(item, 'pricing_status', 'pricingStatus')),
       pricingModel: text(pick(item, 'pricing_model', 'pricingModel')),
@@ -373,7 +378,7 @@
         return;
       }
       if (value && typeof value === 'object') {
-        const looksLikeMetric = ['input', 'output', 'total', 'tokens', 'requests', 'input_tokens', 'total_tokens'].some(key => value[key] !== undefined);
+        const looksLikeMetric = ['input', 'output', 'total', 'tokens', 'requests', 'input_tokens', 'total_tokens', 'speed_output_tokens', 'speed_duration_ms', 'speed_sample_count', 'output_tokens_per_second'].some(key => value[key] !== undefined);
         if (looksLikeMetric) {
           rows.push(detailRow(value, normalizedDay));
           return;
@@ -391,15 +396,41 @@
     const grouped = new Map();
     rows.forEach(row => {
       const key = `${row.model}|||${row.provider}`;
-      if (!grouped.has(key)) grouped.set(key, { model: row.model, provider: row.provider, providerId: row.providerId || row.provider, input: 0, output: 0, cache: 0, reasoning: 0, total: 0, requests: 0, cost: 0, pricingStatuses: new Set() });
+      if (!grouped.has(key)) grouped.set(key, { model: row.model, provider: row.provider, providerId: row.providerId || row.provider, input: 0, output: 0, cache: 0, reasoning: 0, total: 0, requests: 0, cost: 0, speedOutputTokens: 0, speedDurationMs: 0, speedSampleCount: 0, pricingStatuses: new Set() });
       const result = grouped.get(key);
-      ['input', 'output', 'cache', 'reasoning', 'total', 'requests', 'cost'].forEach(metric => { result[metric] += toNumber(row[metric]); });
+      ['input', 'output', 'cache', 'reasoning', 'total', 'requests', 'cost', 'speedOutputTokens', 'speedDurationMs', 'speedSampleCount'].forEach(metric => { result[metric] += toNumber(row[metric]); });
       if (row.pricingStatus) result.pricingStatuses.add(row.pricingStatus);
     });
     return Array.from(grouped.values()).map(row => ({
       ...row,
       pricingStatus: row.pricingStatuses.size === 1 ? Array.from(row.pricingStatuses)[0] : row.pricingStatuses.size ? 'partial' : ''
     })).sort((a, b) => b.total - a.total);
+  }
+
+  function speedTotals(rows) {
+    const totals = rows.reduce((result, row) => {
+      result.speedOutputTokens += toNumber(row.speedOutputTokens);
+      result.speedDurationMs += toNumber(row.speedDurationMs);
+      result.speedSampleCount += toNumber(row.speedSampleCount);
+      return result;
+    }, { speedOutputTokens: 0, speedDurationMs: 0, speedSampleCount: 0 });
+    totals.outputTokensPerSecond = totals.speedSampleCount > 0 && totals.speedDurationMs > 0
+      ? totals.speedOutputTokens * 1000 / totals.speedDurationMs
+      : null;
+    return totals;
+  }
+
+  function speedRate(row) {
+    if (!row || row.speedSampleCount <= 0 || row.speedDurationMs <= 0) return null;
+    const rate = row.outputTokensPerSecond == null
+      ? row.speedOutputTokens * 1000 / row.speedDurationMs
+      : toNumber(row.outputTokensPerSecond);
+    return Number.isFinite(rate) ? rate : null;
+  }
+
+  function formatSpeed(row) {
+    const rate = speedRate(row);
+    return rate == null || !Number.isFinite(rate) ? '—' : `${rate.toFixed(1)} token/s`;
   }
 
   function normalizeFilters(rawFilters, source) {
@@ -474,6 +505,12 @@
   function viewMetrics(data) {
     const modelRows = rowsForView(data.dailyModelUsage);
     const workspaceRows = rowsForView(data.workspaceRows);
+    const dailySpeed = speedTotals(modelRows);
+    const speed = speedTotals([{
+      speedOutputTokens: pick(data.summary, 'speed_output_tokens') === undefined ? dailySpeed.speedOutputTokens : metricFrom(data.summary, ['speed_output_tokens']),
+      speedDurationMs: pick(data.summary, 'speed_duration_ms') === undefined ? dailySpeed.speedDurationMs : metricFrom(data.summary, ['speed_duration_ms']),
+      speedSampleCount: pick(data.summary, 'speed_sample_count') === undefined ? dailySpeed.speedSampleCount : metricFrom(data.summary, ['speed_sample_count'])
+    }]);
     const total = summaryMetric(data.summary, ['total', 'total_tokens', 'totalTokens', 'tokens'], modelRows.reduce((sum, row) => sum + row.total, 0));
     const input = summaryMetric(data.summary, ['input', 'input_tokens', 'inputTokens'], modelRows.reduce((sum, row) => sum + row.input, 0));
     const output = summaryMetric(data.summary, ['output', 'output_tokens', 'outputTokens'], modelRows.reduce((sum, row) => sum + row.output, 0));
@@ -486,7 +523,7 @@
     const unpricedTokens = summaryMetric(data.summary, ['unpriced_tokens', 'unpricedTokens'], modelRows.reduce((sum, row) => sum + (row.pricingStatus === 'unpriced' ? row.total : 0), 0));
     const coverageTokens = pricedTokens + unpricedTokens;
     const coverage = summaryMetric(data.summary, ['pricing_coverage', 'pricingCoverage'], coverageTokens ? pricedTokens / coverageTokens : 0);
-    return { total, input, output, requests, active, models, cache, cacheRate: input > 0 ? cache / input : 0, cost, pricedTokens, unpricedTokens, coverage };
+    return { total, input, output, requests, active, models, cache, cacheRate: input > 0 ? cache / input : 0, cost, pricedTokens, unpricedTokens, coverage, ...speed };
   }
 
   function setConnection(status, message) {
@@ -637,6 +674,7 @@
       ['活跃工作空间', formatNumber(m.active), '有请求记录的空间', '⌘', m.active],
       ['模型 / 供应商', formatNumber(m.models), '去重后的组合数', '✦', m.models],
       ['缓存占比', m.input ? formatPercent(m.cacheRate) : '—', m.input ? `${formatCompact(m.cache)} cache tokens` : '暂无缓存数据', '▣', m.cacheRate],
+      ['轮次平均输出速度', formatSpeed(m), m.speedSampleCount > 0 ? `${formatNumber(m.speedSampleCount)} 个完整轮次样本` : '暂无完整计时轮次', '⏱', formatSpeed(m)],
       ['计价覆盖率', formatPercent(m.coverage), m.unpricedTokens ? `${formatCompact(m.pricedTokens)} / ${formatCompact(m.total)} token` : '全部 Token 已覆盖', '✓', m.coverage]
     ];
     $('#kpiGrid').innerHTML = cards.map(card => {
@@ -852,7 +890,7 @@
       const pricingTitle = row.pricingStatus === 'unpriced'
         ? (row.pricingNote || '未计价')
         : `${row.pricingModel || row.model}${row.pricingRateBand ? ` · ${row.pricingRateBand}` : ''}`;
-      return `<tr><td>${htmlEscape(dateLabel(row.date, true))}</td><td><strong title="${htmlEscape(row.model)}">${htmlEscape(row.model)}</strong></td><td><span class="provider-pill" title="${htmlEscape(row.provider)}">${htmlEscape(row.provider)}</span></td><td class="num">${htmlEscape(formatCompact(row.input))}</td><td class="num">${htmlEscape(formatCompact(row.output))}</td><td class="num">${htmlEscape(formatCompact(row.cache))}</td><td class="num">${htmlEscape(formatCompact(row.reasoning))}</td><td class="num"><strong title="${htmlEscape(formatNumber(row.total))}">${htmlEscape(formatCompact(row.total))}</strong></td><td class="num" title="${htmlEscape(pricingTitle)}">${cost}</td><td class="num">${htmlEscape(formatCompact(row.requests))}</td></tr>`;
+      return `<tr><td>${htmlEscape(dateLabel(row.date, true))}</td><td><strong title="${htmlEscape(row.model)}">${htmlEscape(row.model)}</strong></td><td><span class="provider-pill" title="${htmlEscape(row.provider)}">${htmlEscape(row.provider)}</span></td><td class="num">${htmlEscape(formatCompact(row.input))}</td><td class="num">${htmlEscape(formatCompact(row.output))}</td><td class="num">${htmlEscape(formatCompact(row.cache))}</td><td class="num">${htmlEscape(formatCompact(row.reasoning))}</td><td class="num"><strong title="${htmlEscape(formatNumber(row.total))}">${htmlEscape(formatCompact(row.total))}</strong></td><td class="num" title="${htmlEscape(pricingTitle)}">${cost}</td><td class="num">${htmlEscape(formatSpeed(row))}</td><td class="num">${htmlEscape(formatNumber(row.speedSampleCount))}</td><td class="num">${htmlEscape(formatCompact(row.requests))}</td></tr>`;
     }).join('');
     $('#tablePaginationSummary').textContent = rows.length
       ? `共 ${formatNumber(rows.length)} 条，每页 ${state.tablePageSize} 条 · 第 ${state.tablePage} / ${totalPages} 页`
@@ -876,7 +914,7 @@
       const costLabel = row.pricingStatus === 'unpriced'
         ? '未计价'
         : `预估 ${formatCurrency(row.cost)}${row.pricingStatus === 'partial' ? ' *' : ''}`;
-      return `<article class="model-stat"><div class="model-stat-heading"><strong>${htmlEscape(row.model)}</strong><span class="provider-pill">${htmlEscape(row.provider)}</span></div><div class="model-stat-value" title="${formatNumber(row.total)} Token">${formatCompact(row.total)} <small>Token</small></div><div class="model-stat-bar"><i style="width:${total ? row.total / total * 100 : 0}%;background:${palette[index % palette.length]}"></i></div><div class="model-stat-meta">${formatPercent(total ? row.total / total : 0)} · ${formatNumber(row.requests)} 次请求 · ${htmlEscape(costLabel)}</div><div class="model-stat-meta">输入 ${formatNumber(row.input)} · 输出 ${formatNumber(row.output)}</div></article>`;
+      return `<article class="model-stat"><div class="model-stat-heading"><strong>${htmlEscape(row.model)}</strong><span class="provider-pill">${htmlEscape(row.provider)}</span></div><div class="model-stat-value" title="${formatNumber(row.total)} Token">${formatCompact(row.total)} <small>Token</small></div><div class="model-stat-bar"><i style="width:${total ? row.total / total * 100 : 0}%;background:${palette[index % palette.length]}"></i></div><div class="model-stat-meta">${formatPercent(total ? row.total / total : 0)} · ${formatNumber(row.requests)} 次请求 · ${htmlEscape(costLabel)}</div><div class="model-stat-meta">输入 ${formatNumber(row.input)} · 输出 ${formatNumber(row.output)}</div><div class="model-stat-meta">轮次平均输出速度 ${htmlEscape(formatSpeed(row))} · ${formatNumber(row.speedSampleCount)} 个完整轮次样本</div></article>`;
     }).join('') : '<div class="empty-state">当前组合暂无模型用量，可直接切换任一筛选项。</div>';
     enhanceChartTooltips();
   }
@@ -1015,7 +1053,7 @@
 
   async function exportCsv() {
     if (!state.data) return;
-    const fields = ['date', 'model', 'provider', 'provider_label', 'input_tokens', 'output_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'reasoning_output_tokens', 'total_tokens', 'estimated_cost_usd', 'pricing_status', 'pricing_model', 'pricing_rate_band', 'request_count'];
+    const fields = ['date', 'model', 'provider', 'provider_label', 'input_tokens', 'output_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'reasoning_output_tokens', 'total_tokens', 'estimated_cost_usd', 'pricing_status', 'pricing_model', 'pricing_rate_band', 'request_count', 'speed_output_tokens', 'speed_duration_ms', 'speed_sample_count', 'output_tokens_per_second'];
     const rows = rowsForView(state.data.dailyModelUsage)
       .filter(row => state.workspace === 'all' || !row.workspace || row.workspace === state.workspace)
       .sort((a, b) => b.date.localeCompare(a.date) || b.total - a.total)
@@ -1034,7 +1072,11 @@
         pricing_status: row.pricingStatus,
         pricing_model: row.pricingModel || row.model,
         pricing_rate_band: row.pricingRateBand,
-        request_count: row.requests
+        request_count: row.requests,
+        speed_output_tokens: row.speedOutputTokens,
+        speed_duration_ms: row.speedDurationMs,
+        speed_sample_count: row.speedSampleCount,
+        output_tokens_per_second: speedRate(row) == null ? '' : speedRate(row)
       }));
     const csv = '\ufeff' + [fields.join(','), ...rows.map(row => fields.map(field => csvCell(row[field])).join(','))].join('\r\n');
     const filename = `codex-token-${dateKey(new Date())}.csv`;

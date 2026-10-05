@@ -183,7 +183,7 @@ body[data-theme="light"] .sun-icon, body[data-theme="dark"] .moon-icon { display
 .summary-row strong { color: var(--text); font-size: 11px; white-space: nowrap; }
 
 .table-wrap { max-height: 560px; overflow: auto; border: 1px solid var(--border); border-radius: 10px; }
-table { width: 100%; min-width: 980px; border-collapse: separate; border-spacing: 0; font-size: 11px; }
+table { width: 100%; min-width: 1140px; border-collapse: separate; border-spacing: 0; font-size: 11px; }
 th { position: sticky; z-index: 1; top: 0; padding: 10px; color: var(--text-muted); background: var(--surface-alt); border-bottom: 1px solid var(--border); font-size: 10px; font-weight: 720; text-align: left; white-space: nowrap; }
 th:first-child { border-radius: 9px 0 0 0; }
 th:last-child { border-radius: 0 9px 0 0; }

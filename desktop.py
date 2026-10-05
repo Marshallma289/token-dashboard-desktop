@@ -12,7 +12,9 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 from typing import Any, Iterable, Mapping, Optional
+from urllib.request import urlopen
 
 from backend import DashboardDB, DashboardService, create_server, safe_csv_row, local_data_dir
 from updater import Updater, cleanup_completed_updates, confirm_startup, installation_dir
@@ -34,6 +36,10 @@ CSV_FIELDS = [
     "pricing_status",
     "pricing_model",
     "pricing_rate_band",
+    "speed_output_tokens",
+    "speed_duration_ms",
+    "speed_sample_count",
+    "output_tokens_per_second",
 ]
 
 _PREFERENCES_LOCK = threading.RLock()
@@ -347,7 +353,115 @@ def _show_startup_error(message: str) -> None:
         print(message, file=sys.stderr)
 
 
+def run_self_test() -> Mapping[str, Any]:
+    """Exercise the shipped backend and assets using only synthetic data.
+
+    This deliberately does not initialize preferences, the updater or a GUI.
+    The frozen executable can run this check on native build machines too.
+    """
+    checks = []
+    with tempfile.TemporaryDirectory(prefix="codex-token-self-test-") as folder:
+        root = Path(folder)
+        sessions = root / "sessions"
+        sessions.mkdir()
+        def event(minute, second, kind, payload):
+            return {"timestamp": f"2026-10-05T12:{minute:02d}:{second:02d}Z",
+                    "type": kind, "payload": payload}
+        rows = [event(0, 0, "session_meta", {"id": "self-test-thread", "cwd": "Self-test workspace",
+                                              "model_provider": "openai"})]
+        for index, duration in enumerate((20000, 40000, None), 1):
+            turn_id = f"self-test-turn-{index}"
+            rows.extend([
+                event(index, 0, "event_msg", {"type": "task_started", "turn_id": turn_id}),
+                event(index, 0, "turn_context", {"turn_id": turn_id,
+                     "model": "self-test-model" if duration else "self-test-pending"}),
+                event(index, 10, "token_usage_record", {
+                    "thread_id": "self-test-thread", "turn_id": turn_id, "response_id": f"self-test-response-{index}",
+                    "usage": {"input_tokens": 5000, "output_tokens": 1000 if duration else 250,
+                              "reasoning_output_tokens": 100, "total_tokens": 6000 if duration else 5250}}),
+            ])
+            if duration:
+                rows.append(event(index, 50, "event_msg", {"type": "task_complete", "turn_id": turn_id,
+                                                           "duration_ms": duration}))
+        log = sessions / "self-test.jsonl"
+        log.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+        shutil.copy2(log, sessions / "duplicate.jsonl")
+        database_path = root / "usage.sqlite3"
+        db = DashboardDB(database_path, roots=[sessions], providers_path=root / "providers.json", timezone_name="UTC")
+        server = None
+        thread = None
+        try:
+            service = DashboardService(db)
+            service.refresh()
+            server = create_server(service, "127.0.0.1", 0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            url = f"http://127.0.0.1:{server.server_port}"
+            def read(path):
+                with urlopen(url + path, timeout=5) as response:
+                    return response.read().decode("utf-8")
+            health = json.loads(read("/api/health"))
+            if health["status"] != "ok":
+                raise RuntimeError("Self-test scanner is unhealthy")
+            data = json.loads(read("/api/dashboard?days=0"))
+            summary = data["summary"]
+            if (summary["speed_sample_count"], summary["speed_output_tokens"], summary["speed_duration_ms"],
+                    summary["request_count"], summary["output_tokens_per_second"]) != (2, 2000, 60000, 3, 33.3333):
+                raise RuntimeError("Self-test speed aggregation or duplicate handling failed")
+            checks.extend(["backend_http", "weighted_output_speed", "duplicate_log_deduplication"])
+            pending = json.loads(read("/api/dashboard?days=0&model=self-test-pending"))["summary"]
+            if pending["output_tokens_per_second"] is not None or pending["speed_sample_count"] != 0:
+                raise RuntimeError("Incomplete turn was included in speed")
+            checks.append("model_filter_and_incomplete_turn")
+            html, script, styles = read("/"), read("/app.js"), read("/styles.css")
+            if "轮次平均输出速度" not in html or "speed_sample_count" not in script or not styles:
+                raise RuntimeError("Shipped dashboard assets are missing speed UI")
+            checks.append("shipped_web_assets")
+            exported = list(csv.DictReader(io.StringIO(dashboard_csv(data["daily_model_usage"]).lstrip("\ufeff"))))
+            if sorted(row["output_tokens_per_second"] for row in exported) != ["", "33.3333"]:
+                raise RuntimeError("Self-test CSV speed export failed")
+            checks.append("csv_speed_and_missing_value")
+        finally:
+            if server is not None:
+                if thread is not None:
+                    server.shutdown()
+                    thread.join(timeout=5)
+                server.server_close()
+            db.close()
+        for path in sessions.glob("*.jsonl"):
+            path.unlink()
+        db = DashboardDB(database_path, roots=[sessions], providers_path=root / "providers.json", timezone_name="UTC")
+        try:
+            db.scan()
+            retained = db.dashboard(0)["summary"]
+            if retained != summary:
+                raise RuntimeError("Self-test retained history changed after log deletion")
+            checks.append("retained_speed_history")
+        finally:
+            db.close()
+    return {"status": "passed", "app_version": health["app_version"], "frozen": bool(getattr(sys, "frozen", False)),
+            "gui_tested": False, "speed_sample_count": 2, "output_tokens_per_second": 33.3333, "checks": checks}
+
+
 def main() -> int:
+    if "--self-test" in sys.argv:
+        import argparse
+        parser = argparse.ArgumentParser(description="Validate shipped analytics with isolated synthetic data; no GUI.")
+        parser.add_argument("--self-test", action="store_true")
+        parser.add_argument("--self-test-report", type=Path)
+        args = parser.parse_args()
+        try:
+            report = run_self_test()
+            code = 0
+        except Exception as error:
+            report = {"status": "failed", "gui_tested": False, "error": str(error)}
+            code = 1
+        output = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+        if args.self_test_report:
+            args.self_test_report.write_text(output, encoding="utf-8")
+        elif sys.stdout is not None:
+            print(output, end="")
+        return code
     try:
         import webview
     except ImportError:

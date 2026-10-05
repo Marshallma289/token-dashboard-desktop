@@ -14,6 +14,7 @@ import csv
 import datetime as _dt
 import hashlib
 import json
+import math
 import mimetypes
 import os
 from pathlib import Path
@@ -23,7 +24,7 @@ import threading
 import time
 import uuid
 import webbrowser
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
@@ -42,7 +43,7 @@ def local_data_dir() -> Path:
 
 DEFAULT_DB = local_data_dir() / "usage.sqlite3"
 DEFAULT_PROVIDER_CONFIG = APP_DIR / "providers.json"
-PARSER_SCHEMA_VERSION = 3
+PARSER_SCHEMA_VERSION = 4
 APP_VERSION = (Path(__file__).resolve().parent / "VERSION").read_text(encoding="utf-8").strip()
 
 try:
@@ -279,6 +280,10 @@ class ParsedRecord:
     model: str
     workspace: str
     usage: Usage
+    turn_id: Optional[str] = None
+    speed_group_key: Optional[str] = None
+    speed_output_tokens: int = 0
+    speed_duration_ms: float = 0.0
 
 
 @dataclass
@@ -387,6 +392,9 @@ class RolloutParser:
         cumulative_snapshot_index: Dict[str, int] = {}
         legacy_request_index: Dict[str, int] = {}
         records: List[ParsedRecord] = []
+        turn_starts: Dict[Tuple[str, str], Mapping[str, Any]] = {}
+        turn_timings: Dict[Tuple[str, str], float] = {}
+        turn_output_totals: Dict[Tuple[str, str], int] = {}
         parse_errors = 0
         try:
             fallback_mtime = path.stat().st_mtime
@@ -411,6 +419,20 @@ class RolloutParser:
                     state = thread_states.setdefault(session_thread_id, {})
                     state["provider"] = session_provider
                     state["workspace"] = session_workspace
+                continue
+
+            if event_type == "event_msg" and payload_type in ("task_started", "task_complete"):
+                timing_thread = self._thread_id(event, payload) or session_thread_id
+                timing_turn = payload.get("turn_id")
+                if timing_thread and timing_turn:
+                    timing_key = (timing_thread, str(timing_turn))
+                    if payload_type == "task_started":
+                        turn_starts[timing_key] = event
+                        current_turn_id = str(timing_turn)
+                    else:
+                        duration = self._turn_duration(turn_starts.get(timing_key), event)
+                        if duration is not None:
+                            turn_timings[timing_key] = duration
                 continue
 
             if event_type == "turn_context":
@@ -493,6 +515,11 @@ class RolloutParser:
                 response_value = _first(payload, "response_id", "responseId") or _first(event, "response_id")
                 response_id = str(response_value).strip() if response_value is not None else None
                 response_id = response_id or None
+                record_turn = str(payload.get("turn_id") or state.get("turn_id") or current_turn_id or "") or None
+                turn_usage = _as_dict(payload.get("turn_token_usage"))
+                turn_output = _as_int(turn_usage.get("output_tokens"))
+                if thread_id and record_turn and turn_output is not None:
+                    turn_output_totals[(thread_id, record_turn)] = turn_output
                 timestamp, day, hour = _parse_timestamp(event.get("timestamp"), fallback_mtime, self.timezone)
                 records.append(
                     ParsedRecord(
@@ -508,6 +535,7 @@ class RolloutParser:
                         model,
                         workspace,
                         usage,
+                        record_turn,
                     )
                 )
                 continue
@@ -617,9 +645,88 @@ class RolloutParser:
                         model or "unknown",
                         workspace,
                         usage,
+                        str(payload.get("turn_id") or current_turn_id or "") or None,
                     )
                 )
+        # A whole turn includes waits and tools. Never invent API-request or
+        # streaming timings from adjacent usage timestamps. Carry the same
+        # sample on its requests; aggregation deduplicates the hashed turn id.
+        # Mixed-attribution turns cannot be split into reliable model speeds.
+        groups: Dict[Tuple[str, str], List[int]] = {}
+        for index, record in enumerate(records):
+            if record.thread_id and record.turn_id:
+                groups.setdefault((record.thread_id, record.turn_id), []).append(index)
+        for key, indices in groups.items():
+            duration = turn_timings.get(key)
+            if duration is None or len({(records[i].provider, records[i].model, records[i].workspace)
+                                        for i in indices}) != 1:
+                continue
+            unique: Dict[str, ParsedRecord] = {}
+            # Require stable request ids to avoid overcounting duplicate usage.
+            if any(not records[i].response_id for i in indices):
+                continue
+            for index in indices:
+                candidate = records[index]
+                prior = unique.get(candidate.response_id)
+                if prior is None or (candidate.usage.total_tokens, candidate.timestamp) > (
+                        prior.usage.total_tokens, prior.timestamp):
+                    unique[candidate.response_id] = candidate
+            output = sum(record.usage.output_tokens for record in unique.values())
+            # When a cumulative turn counter is present, prove we saw all
+            # output rather than silently computing from an incomplete copy.
+            if key in turn_output_totals and turn_output_totals[key] != output:
+                continue
+            sample_day = max(unique.values(), key=lambda record: record.timestamp).day
+            group_key = hashlib.sha256(json.dumps(key).encode("utf-8")).hexdigest()
+            for index in indices:
+                if records[index].day == sample_day:
+                    records[index] = replace(records[index], speed_group_key=group_key,
+                                             speed_output_tokens=output, speed_duration_ms=duration)
         return records, self._parse_errors
+
+    @staticmethod
+    def _turn_duration(start: Optional[Mapping[str, Any]], end: Mapping[str, Any]) -> Optional[float]:
+        # Require the start marker so a truncated tail cannot masquerade as
+        # all output for a completed turn. Never use filesystem timestamps.
+        if start is None:
+            return None
+        payload = _as_dict(end.get("payload"))
+        if "duration_ms" in payload:
+            value = payload["duration_ms"]
+            if isinstance(value, bool):
+                return None
+            try:
+                duration = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return duration if math.isfinite(duration) and duration > 0 else None
+        start_payload = _as_dict(start.get("payload")) if start else {}
+        first = _first(payload, "started_at", "started_at_ms")
+        first_ms = payload.get("started_at") is None and payload.get("started_at_ms") is not None
+        if first is None:
+            first = _first(start_payload, "started_at", "started_at_ms")
+            first_ms = start_payload.get("started_at") is None and start_payload.get("started_at_ms") is not None
+        if first is None and start:
+            first = start.get("timestamp")
+        last = _first(payload, "completed_at", "completed_at_ms")
+        last_ms = payload.get("completed_at") is None and payload.get("completed_at_ms") is not None
+        if last is None:
+            last = end.get("timestamp")
+        def instant(value, milliseconds=False):
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value) / (1000 if milliseconds else 1) if math.isfinite(value) else None
+            if isinstance(value, str):
+                try:
+                    dt = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    return dt.timestamp() if dt.tzinfo is not None else None
+                except (ValueError, OverflowError, OSError):
+                    pass
+            return None
+        first, last = instant(first, first_ms), instant(last, last_ms)
+        if first is None or last is None:
+            return None
+        duration = (last - first) * 1000
+        return duration if math.isfinite(duration) and duration > 0 else None
 
 
 class DashboardDB:
@@ -1038,6 +1145,16 @@ class DashboardDB:
         tables = {row[0] for row in self._connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         migrating = "usage_records" in tables
+        timing_upgrade = ("history_snapshots" in tables and "speed_group_key" not in
+                          {row[1] for row in self._connection.execute("PRAGMA table_info(history_snapshots)")})
+        if timing_upgrade:
+            timing_backup = Path(str(self.db_path) + ".pre-speed.bak")
+            if not timing_backup.exists():
+                target = sqlite3.connect(str(timing_backup))
+                try:
+                    self._connection.backup(target)
+                finally:
+                    target.close()
         backup = None
         if migrating:
             backup = Path(str(self.db_path) + ".pre-history.bak")
@@ -1071,7 +1188,9 @@ class DashboardDB:
                     day TEXT NOT NULL, hour INTEGER NOT NULL,
                     input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
                     cached_input_tokens INTEGER NOT NULL, cache_write_input_tokens INTEGER NOT NULL,
-                    reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL)""",
+                    reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL,
+                    speed_group_key TEXT, speed_output_tokens INTEGER NOT NULL DEFAULT 0,
+                    speed_duration_ms REAL NOT NULL DEFAULT 0)""",
                 """CREATE TABLE IF NOT EXISTS history_requests (
                     logical_key BLOB PRIMARY KEY, snapshot_id INTEGER NOT NULL REFERENCES history_snapshots(id),
                     retained_snapshot_id INTEGER REFERENCES history_snapshots(id)) WITHOUT ROWID""",
@@ -1090,6 +1209,17 @@ class DashboardDB:
                     FROM history_requests r JOIN history_snapshots s ON s.id=r.snapshot_id
                     JOIN history_contexts c ON c.id=s.context_id""",
             ]
+            # Existing ledgers are preserved. Changed parser version makes
+            # available logs rescan once, filling timing without clearing use.
+            if timing_upgrade:
+                self._connection.execute("ALTER TABLE history_snapshots ADD COLUMN speed_group_key TEXT")
+                self._connection.execute("ALTER TABLE history_snapshots ADD COLUMN speed_output_tokens INTEGER NOT NULL DEFAULT 0")
+                self._connection.execute("ALTER TABLE history_snapshots ADD COLUMN speed_duration_ms REAL NOT NULL DEFAULT 0")
+            if not migrating:
+                self._connection.execute("DROP VIEW IF EXISTS usage_records")
+            statements[-1] = statements[-1].replace(
+                "s.reasoning_output_tokens, s.total_tokens",
+                "s.reasoning_output_tokens, s.total_tokens, s.speed_group_key, s.speed_output_tokens, s.speed_duration_ms")
             for statement in statements:
                 self._connection.execute(statement)
             if migrating:
@@ -1195,7 +1325,9 @@ class DashboardDB:
         return (row["total_tokens"], sum(bool(row[key]) for key in
                 ("cached_input_tokens", "cache_write_input_tokens", "reasoning_output_tokens")),
                 sum(row[key] not in (None, "", "unknown", "Unknown") for key in
-                    ("model", "provider", "workspace")), row["timestamp"],
+                    ("model", "provider", "workspace")),
+                bool(row["speed_group_key"]) if "speed_group_key" in row.keys() else False,
+                row["timestamp"],
                 row["source_line"] if "source_line" in row.keys() else 0,
                 row["source_path"] if "source_path" in row.keys() else "")
 
@@ -1206,13 +1338,15 @@ class DashboardDB:
         context_id = self._connection.execute(
             "SELECT id FROM history_contexts WHERE provider=? AND model=? AND workspace=?", context).fetchone()[0]
         tokens = tuple(int(row[name]) for name in self._token_columns())
+        speed = (row["speed_group_key"], row["speed_output_tokens"], row["speed_duration_ms"]) if "speed_group_key" in row.keys() else (None, 0, 0.0)
         fingerprint = hashlib.sha256(key + json.dumps(
-            [*context, row["timestamp"], *tokens], ensure_ascii=False).encode("utf-8")).digest()
+            [*context, row["timestamp"], *tokens, *([*speed] if speed[0] else [])], ensure_ascii=False).encode("utf-8")).digest()
         _, day, hour = _parse_timestamp(row["timestamp"], timezone=self.timezone)
         self._connection.execute("""INSERT OR IGNORE INTO history_snapshots
             (fingerprint,context_id,timestamp,day,hour,input_tokens,output_tokens,cached_input_tokens,
-             cache_write_input_tokens,reasoning_output_tokens,total_tokens) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (fingerprint, context_id, row["timestamp"], day, hour, *tokens))
+             cache_write_input_tokens,reasoning_output_tokens,total_tokens,
+             speed_group_key,speed_output_tokens,speed_duration_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (fingerprint, context_id, row["timestamp"], day, hour, *tokens, *speed))
         return self._connection.execute(
             "SELECT id FROM history_snapshots WHERE fingerprint=?", (fingerprint,)).fetchone()[0]
 
@@ -1475,6 +1609,10 @@ class DashboardDB:
             "unpriced_tokens": 0,
             "priced_request_count": 0,
             "unpriced_request_count": 0,
+            "speed_output_tokens": 0,
+            "speed_duration_ms": 0.0,
+            "speed_sample_count": 0,
+            "_speed_keys": set(),
         }
 
     @staticmethod
@@ -1489,6 +1627,12 @@ class DashboardDB:
         ):
             target[key] += int(row[key] or 0)
         target["request_count"] += 1
+        speed_key = row["speed_group_key"]
+        if speed_key and speed_key not in target["_speed_keys"]:
+            target["_speed_keys"].add(speed_key)
+            target["speed_sample_count"] += 1
+            target["speed_output_tokens"] += int(row["speed_output_tokens"])
+            target["speed_duration_ms"] += float(row["speed_duration_ms"])
         if quote.is_priced:
             target["estimated_cost_usd"] += float(quote.estimated_cost_usd)
             target["priced_tokens"] += int(row["total_tokens"] or 0)
@@ -1502,7 +1646,11 @@ class DashboardDB:
         # Short names make the JSON convenient for small charts while the
         # *_tokens names remain canonical and unambiguous.
         aliases = {
-            **{key: int(value) for key, value in metrics.items() if key != "estimated_cost_usd"},
+            **{key: int(value) for key, value in metrics.items()
+               if key not in ("estimated_cost_usd", "speed_duration_ms", "_speed_keys")},
+            "speed_duration_ms": float(metrics["speed_duration_ms"]),
+            "output_tokens_per_second": (round(metrics["speed_output_tokens"] * 1000 / metrics["speed_duration_ms"], 4)
+                                        if metrics["speed_duration_ms"] > 0 else None),
             "estimated_cost_usd": round(float(metrics.get("estimated_cost_usd", 0.0)), 8),
             "input": int(metrics["input_tokens"]),
             "output": int(metrics["output_tokens"]),
@@ -2145,6 +2293,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "pricing_status",
                     "pricing_model",
                     "pricing_rate_band",
+                    "speed_output_tokens",
+                    "speed_duration_ms",
+                    "speed_sample_count",
+                    "output_tokens_per_second",
                 ]
                 import io
 

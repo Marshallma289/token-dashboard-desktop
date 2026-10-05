@@ -9,6 +9,14 @@ import zipfile
 import build_desktop as builder
 
 
+SELF_TEST_REPORT = {
+    "status": "passed",
+    "frozen": True,
+    "gui_tested": False,
+    "checks": [],
+}
+
+
 class BuildDesktopTests(unittest.TestCase):
     def make_source(self, root):
         root.mkdir()
@@ -72,17 +80,23 @@ class BuildDesktopTests(unittest.TestCase):
                     output = Path(command[command.index("--distpath") + 1]) / "CodexTokenDesktop"
                     output.mkdir(parents=True)
                     (output / "CodexTokenDesktop.exe").write_bytes(b"fake executable")
+                if "--self-test" in command:
+                    report_path = Path(command[command.index("--self-test-report") + 1])
+                    report_path.write_text(json.dumps(SELF_TEST_REPORT), encoding="utf-8")
 
             with patch.object(builder, "SOURCE_DIR", source), patch.object(builder.sys, "platform", "win32"), patch.object(builder, "run", side_effect=fake_run):
                 archive, manifest_path = builder.build(root / "release")
-            self.assertEqual(len(calls), 3)
+            self.assertEqual(len(calls), 4)
             self.assertTrue(all(cwd != source for _, cwd, _ in calls))
             self.assertIn("unittest", calls[0][0])
             self.assertEqual(calls[1][0][:2], ["node", "--check"])
+            self.assertIn("--self-test", calls[3][0])
+            self.assertIn("--self-test-report", calls[3][0])
             self.assertNotEqual(calls[0][2]["CODEX_HOME"], str(source))
             self.assertEqual(original_cache.read_bytes(), b"do not touch")
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["source_digest"], builder.source_digest(source))
+            self.assertEqual(manifest["self_test"], SELF_TEST_REPORT)
             exe = next(item for item in manifest["files"] if item["path"] == "CodexTokenDesktop.exe")
             self.assertEqual(exe["sha256"], hashlib.sha256(b"fake executable").hexdigest())
             with zipfile.ZipFile(archive) as package:
@@ -120,6 +134,9 @@ class BuildDesktopTests(unittest.TestCase):
                     package = Path(command[command.index("--distpath") + 1]) / "CodexTokenDesktop.app"
                     (package / "Contents").mkdir(parents=True)
                     (package / "Contents" / "Info.plist").write_bytes(b"bundle metadata")
+                elif "--self-test" in command:
+                    report_path = Path(command[command.index("--self-test-report") + 1])
+                    report_path.write_text(json.dumps(SELF_TEST_REPORT), encoding="utf-8")
                 elif command[0] == "ditto":
                     Path(command[-1]).write_bytes(b"fake archive")
 
@@ -129,13 +146,36 @@ class BuildDesktopTests(unittest.TestCase):
             self.assertEqual(sum(command[0] == "iconutil" for command, _, _ in calls), 1)
             command = calls[-1][0]
             self.assertEqual(command[:5], ["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent"])
+            self_test_calls = [command for command, _, _ in calls if "--self-test" in command]
+            self.assertEqual(len(self_test_calls), 1)
+            self.assertIn("--self-test-report", self_test_calls[0])
             package = Path(command[-2])
             self.assertFalse((package / "build-manifest.json").exists())
             self.assertTrue(archive.is_file())
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["self_test"], SELF_TEST_REPORT)
             self.assertEqual(manifest["architecture"], "arm64")
             self.assertEqual(manifest["validation"], "skipped")
             self.assertEqual(manifest["source_digest"], builder.source_digest(source))
+
+    def test_failed_packaged_self_test_rejects_build(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "source"
+            self.make_source(source)
+
+            def fake_run(command, cwd, env=None):
+                if "PyInstaller" in command:
+                    output = Path(command[command.index("--distpath") + 1]) / "CodexTokenDesktop"
+                    output.mkdir(parents=True)
+                    (output / "CodexTokenDesktop.exe").write_bytes(b"fake executable")
+                if "--self-test" in command:
+                    report_path = Path(command[command.index("--self-test-report") + 1])
+                    report_path.write_text(json.dumps({**SELF_TEST_REPORT, "status": "failed"}), encoding="utf-8")
+
+            with patch.object(builder, "SOURCE_DIR", source), patch.object(builder.sys, "platform", "win32"), patch.object(builder, "run", side_effect=fake_run):
+                with self.assertRaisesRegex(RuntimeError, "self-test did not pass"):
+                    builder.build(root / "release", skip_tests=True)
 
 
 if __name__ == "__main__":

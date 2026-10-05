@@ -174,7 +174,15 @@ def build(output_dir: Path, *, skip_tests: bool = False) -> tuple[Path, Path]:
     if sys.platform == "win32":
         for name in PORTABLE_FILES:
             shutil.copy2(stage / name, package / name)
+    executable = (package / "CodexTokenDesktop.exe" if sys.platform == "win32"
+                  else package / "Contents" / "MacOS" / "CodexTokenDesktop")
+    self_test_path = build_root / "self-test-report.json"
+    run([str(executable), "--self-test", "--self-test-report", str(self_test_path)], stage, test_env)
+    self_test = json.loads(self_test_path.read_text(encoding="utf-8"))
+    if self_test.get("status") != "passed" or self_test.get("frozen") is not True:
+        raise RuntimeError("Packaged executable self-test did not pass.")
     manifest = {
+        "self_test": self_test,
         "version": version,
         "built_at": datetime.now(timezone.utc).isoformat(),
         "platform": sys.platform,

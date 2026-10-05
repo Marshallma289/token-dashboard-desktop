@@ -84,7 +84,7 @@
       <div class="dashboard-grid">
         <section class="panel model-totals-panel" aria-labelledby="modelTotalsTitle">
           <div class="panel-heading"><div><p class="eyebrow">MODEL INSIGHTS</p><h2 id="modelTotalsTitle">模型 Token 统计</h2></div><span class="panel-meta">当前筛选范围 · 按用量排序</span></div>
-          <p class="panel-description">逐个模型查看用量、占比、请求数与官方参考价估算；同名模型按供应商分别统计。</p>
+          <p class="panel-description">逐个模型查看用量、占比、请求数与官方参考价估算；同名模型按供应商分别统计。完整轮次输出 Token ÷ 总耗时，包含等待与工具执行；非纯生成速度。</p>
           <div id="modelTotals" class="model-totals"></div>
         </section>
         <section class="panel workspace-panel" aria-labelledby="workspaceTitle">
@@ -151,8 +151,8 @@
           <p id="detailDescription" class="panel-description">精确查看 input、output、cache、reasoning、total、参考费用与请求数；未公开独立价格的模型单独标记。</p>
           <div class="table-wrap">
             <table id="dailyUsageTable">
-              <caption class="sr-only">每日模型用量明细表</caption>
-              <thead><tr><th scope="col">日期</th><th scope="col">模型</th><th scope="col">供应商</th><th scope="col" class="num">Input</th><th scope="col" class="num">Output</th><th scope="col" class="num">Cache</th><th scope="col" class="num">Reasoning</th><th scope="col" class="num">Total</th><th scope="col" class="num">费用 USD</th><th scope="col" class="num">请求数</th></tr></thead>
+              <caption class="sr-only">每日模型用量与轮次平均输出速度明细表</caption>
+              <thead><tr><th scope="col">日期</th><th scope="col">模型</th><th scope="col">供应商</th><th scope="col" class="num">Input</th><th scope="col" class="num">Output</th><th scope="col" class="num">Cache</th><th scope="col" class="num">Reasoning</th><th scope="col" class="num">Total</th><th scope="col" class="num">费用 USD</th><th scope="col" class="num">轮次平均输出速度</th><th scope="col" class="num">完整轮次样本数</th><th scope="col" class="num">请求数</th></tr></thead>
               <tbody></tbody>
             </table>
           </div>

@@ -663,23 +663,25 @@
       .map(item => text(pick(item, 'model')))
       .filter(Boolean)
       .filter((model, index, models) => models.indexOf(model) === index);
-    const costSub = m.unpricedTokens
+    const costDetails = m.unpricedTokens
       ? `${formatCompact(m.unpricedTokens)} token 未计价${unpriced.length ? ` · ${unpriced.slice(0, 2).join('、')}${unpriced.length > 2 ? '等' : ''}` : ''}`
       : '全部 Token 已按已配置官方价计价';
+    const costSub = m.total > 0
+      ? `计价覆盖率 ${formatPercent(m.coverage)} · ${m.unpricedTokens ? `${formatCompact(m.unpricedTokens)} Token 未计价` : '全部已计价'}`
+      : '计价覆盖率 — · 暂无用量';
     const cards = [
-      ['预估费用 USD', formatCurrency(m.cost), costSub, '$', m.cost],
+      ['预估费用 USD', formatCurrency(m.cost), costSub, '$', m.cost, costDetails],
       ['总 Token', formatCompact(m.total), 'Input + Output（Reasoning 为子集）', '◈', m.total],
       ['今日 Token', formatCompact(today), todayRows.length ? `${todayRows.length} 条模型记录` : '今日暂无记录', '◷', today],
       ['请求数', formatCompact(m.requests), '当前筛选范围', '↗', m.requests],
       ['活跃工作空间', formatNumber(m.active), '有请求记录的空间', '⌘', m.active],
       ['模型 / 供应商', formatNumber(m.models), '去重后的组合数', '✦', m.models],
       ['缓存占比', m.input ? formatPercent(m.cacheRate) : '—', m.input ? `${formatCompact(m.cache)} cache tokens` : '暂无缓存数据', '▣', m.cacheRate],
-      ['轮次平均输出速度', formatSpeed(m), m.speedSampleCount > 0 ? `${formatNumber(m.speedSampleCount)} 个完整轮次样本` : '暂无完整计时轮次', '⏱', formatSpeed(m)],
-      ['计价覆盖率', formatPercent(m.coverage), m.unpricedTokens ? `${formatCompact(m.pricedTokens)} / ${formatCompact(m.total)} token` : '全部 Token 已覆盖', '✓', m.coverage]
+      ['轮次平均输出速度', formatSpeed(m), m.speedSampleCount > 0 ? `${formatNumber(m.speedSampleCount)} 个完整轮次样本` : '暂无完整计时轮次', '⏱', formatSpeed(m)]
     ];
     $('#kpiGrid').innerHTML = cards.map(card => {
       const title = card[0].startsWith('预估费用') ? formatCurrencyDetailed(card[4]) : card[0].includes('率') || card[0].includes('占比') ? card[1] : typeof card[4] === 'number' ? formatNumber(card[4]) : card[1];
-      return `<article class="kpi-card"><div class="kpi-label"><span>${htmlEscape(card[0])}</span><span class="kpi-icon" aria-hidden="true">${card[3]}</span></div><div class="kpi-value" title="${htmlEscape(title)}">${htmlEscape(card[1])}</div><div class="kpi-sub">${htmlEscape(card[2])}</div></article>`;
+      return `<article class="kpi-card"><div class="kpi-label"><span>${htmlEscape(card[0])}</span><span class="kpi-icon" aria-hidden="true">${card[3]}</span></div><div class="kpi-value" title="${htmlEscape(title)}">${htmlEscape(card[1])}</div><div class="kpi-sub" title="${htmlEscape(card[5] || card[2])}">${htmlEscape(card[2])}</div></article>`;
     }).join('');
   }
 

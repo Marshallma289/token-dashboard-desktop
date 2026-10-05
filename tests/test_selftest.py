@@ -8,6 +8,8 @@ from unittest.mock import patch
 
 import desktop
 
+APP_VERSION = (Path(__file__).resolve().parents[1] / "VERSION").read_text(encoding="utf-8").strip()
+
 
 class SelfTestTests(unittest.TestCase):
     def _deny_webview_import(self):
@@ -23,7 +25,7 @@ class SelfTestTests(unittest.TestCase):
     def _passed_report(self):
         return {
             "status": "passed",
-            "app_version": "1.5.0",
+            "app_version": APP_VERSION,
             "frozen": False,
             "gui_tested": False,
             "speed_sample_count": 2,
@@ -40,7 +42,7 @@ class SelfTestTests(unittest.TestCase):
         self.assertEqual(report["status"], "passed")
         self.assertIsInstance(report["frozen"], bool)
         self.assertFalse(report["gui_tested"])
-        self.assertEqual(report["app_version"], "1.5.0")
+        self.assertEqual(report["app_version"], APP_VERSION)
         self.assertEqual(report["speed_sample_count"], 2)
         self.assertAlmostEqual(report["output_tokens_per_second"], 33.3333, places=4)
         self.assertTrue(report["checks"])

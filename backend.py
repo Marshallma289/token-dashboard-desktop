@@ -43,7 +43,7 @@ def local_data_dir() -> Path:
 
 DEFAULT_DB = local_data_dir() / "usage.sqlite3"
 DEFAULT_PROVIDER_CONFIG = APP_DIR / "providers.json"
-PARSER_SCHEMA_VERSION = 4
+PARSER_SCHEMA_VERSION = 5
 APP_VERSION = (Path(__file__).resolve().parent / "VERSION").read_text(encoding="utf-8").strip()
 
 try:
@@ -377,6 +377,7 @@ class RolloutParser:
         session_provider = "unknown"
         session_workspace = "Unknown"
         session_thread_id: Optional[str] = None
+        timing_thread_id: Optional[str] = None
         current_model = "unknown"
         current_workspace = session_workspace
         current_provider = session_provider
@@ -416,13 +417,14 @@ class RolloutParser:
                 thread_value = _first(payload, "id", "thread_id", "threadId", "session_id")
                 if thread_value is not None and str(thread_value).strip():
                     session_thread_id = str(thread_value).strip()
+                    timing_thread_id = session_thread_id
                     state = thread_states.setdefault(session_thread_id, {})
                     state["provider"] = session_provider
                     state["workspace"] = session_workspace
                 continue
 
             if event_type == "event_msg" and payload_type in ("task_started", "task_complete"):
-                timing_thread = self._thread_id(event, payload) or session_thread_id
+                timing_thread = self._thread_id(event, payload) or timing_thread_id or session_thread_id
                 timing_turn = payload.get("turn_id")
                 if timing_thread and timing_turn:
                     timing_key = (timing_thread, str(timing_turn))
@@ -467,6 +469,11 @@ class RolloutParser:
                 settings = payload.get("thread_settings")
                 settings = settings if isinstance(settings, dict) else payload
                 thread_id = self._thread_id(event, payload) or session_thread_id
+                # Forked logs replay the parent's session_meta, then apply
+                # the child's settings. Lifecycle events omit thread_id;
+                # their owner is the active stream thread, not that parent.
+                if thread_id:
+                    timing_thread_id = thread_id
                 state = thread_states.setdefault(thread_id, {}) if thread_id else None
                 model_value = _first(settings, "model", "model_id")
                 provider_value = _first(settings, "model_provider_id", "model_provider", "provider")

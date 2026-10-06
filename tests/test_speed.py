@@ -56,6 +56,36 @@ def usage(turn_id, response_id, output, timestamp, *, model=None, provider=None,
     return {"timestamp": timestamp, "type": "token_usage_record", "payload": payload}
 
 
+def subagent_history():
+    return [
+        {"timestamp": "2026-10-05T08:00:00Z", "type": "session_meta", "payload": {
+            "id": "child", "source": {"subagent": {"thread_spawn": {"parent_thread_id": "parent"}}},
+            "model_provider": "openai", "cwd": "/workspace/child",
+        }},
+        {"timestamp": "2026-10-05T08:00:01Z", "type": "session_meta", "payload": {
+            "id": "parent", "model_provider": "openai", "cwd": "/workspace/parent",
+        }},
+        task("task_started", "parentturn", "2026-10-05T08:00:02Z"),
+        {"timestamp": "2026-10-05T08:00:03Z", "type": "turn_context", "payload": {
+            "turn_id": "parentturn", "model": "parentmodel",
+        }},
+        {"timestamp": "2026-10-05T08:00:04Z", "type": "event_msg", "payload": {
+            "type": "thread_settings_applied", "thread_id": "child",
+            "thread_settings": {"model": "gpt-6-luna"},
+        }},
+    ]
+
+
+def subagent_usage(turn_id, response_id, output, timestamp):
+    return {"timestamp": timestamp, "type": "token_usage_record", "payload": {
+        "thread_id": "child", "session_id": "parent", "root_turn_id": "parentturn",
+        "turn_id": turn_id, "response_id": response_id,
+        "usage": {"input_tokens": 9000000, "output_tokens": output, "total_tokens": 9000000 + output},
+        "turn_token_usage": {"input_tokens": 9000000, "output_tokens": output,
+                             "total_tokens": 9000000 + output},
+    }}
+
+
 def write_lines(path, rows):
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
@@ -104,6 +134,42 @@ class SpeedStatisticsTests(unittest.TestCase):
         self.assert_speed(data["summary"], 1000, 20000, 1, 50)
         self.assertEqual(len(data["daily_model_usage"]), 1)
         self.assert_speed(data["daily_model_usage"][0], 1000, 20000, 1, 50)
+
+    def test_subagent_speed_uses_child_thread_after_inherited_parent_session(self):
+        write_lines(self.log, subagent_history() + [
+            task("task_started", "childturn", "2026-10-05T08:00:06Z"),
+            {"timestamp": "2026-10-05T08:00:07Z", "type": "turn_context", "payload": {
+                "turn_id": "childturn", "model": "gpt-6-luna",
+            }},
+            subagent_usage("childturn", "child-r1", 1000, "2026-10-05T08:00:10Z"),
+            task("task_complete", "childturn", "2026-10-05T08:00:26Z", duration_ms=20000),
+        ])
+        data = self.dashboard()
+        self.assert_speed(data["summary"], 1000, 20000, 1, 50)
+        self.assertEqual([(row["model"], row["speed_sample_count"]) for row in data["daily_model_usage"]], [
+            ("gpt-6-luna", 1),
+        ])
+
+    def test_subagent_followup_turn_gets_an_independent_speed_sample(self):
+        write_lines(self.log, subagent_history() + [
+            task("task_started", "childturn1", "2026-10-05T08:00:06Z"),
+            {"timestamp": "2026-10-05T08:00:07Z", "type": "turn_context", "payload": {
+                "turn_id": "childturn1", "model": "gpt-6-luna",
+            }},
+            subagent_usage("childturn1", "child-r1", 1000, "2026-10-05T08:00:10Z"),
+            task("task_complete", "childturn1", "2026-10-05T08:00:26Z", duration_ms=20000),
+            task("task_started", "childturn2", "2026-10-05T08:00:28Z"),
+            {"timestamp": "2026-10-05T08:00:29Z", "type": "turn_context", "payload": {
+                "turn_id": "childturn2", "model": "gpt-6-luna",
+            }},
+            subagent_usage("childturn2", "child-r2", 500, "2026-10-05T08:00:32Z"),
+            task("task_complete", "childturn2", "2026-10-05T08:00:38Z", duration_ms=10000),
+        ])
+        data = self.dashboard()
+        self.assert_speed(data["summary"], 1500, 30000, 2, 50)
+        self.assertEqual([(row["model"], row["speed_sample_count"]) for row in data["daily_model_usage"]], [
+            ("gpt-6-luna", 2),
+        ])
 
     def test_multiple_requests_and_duplicate_response_make_one_turn_sample(self):
         first = usage("t1", "r1", 300, "2026-10-05T08:00:05Z")

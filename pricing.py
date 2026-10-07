@@ -1,4 +1,4 @@
-"""Official reference pricing for models observed in Codex rollout logs.
+"""Reference pricing and configured free models for Codex rollout logs.
 
 Rates are US dollars per million tokens.  The catalog intentionally returns
 an unpriced result for unknown models instead of guessing from a model family.
@@ -123,9 +123,10 @@ MODEL_ALIASES = {
 }
 
 
-UNPRICED_MODELS = {
-    "codex-auto-review": "No standalone official rate is published.",
-}
+# Explicit local estimation policy; this is not a published API price.
+FREE_RATES = {"codex-auto-review": TokenRates(0.0, 0.0, 0.0, 0.0)}
+FREE_PRICING_NOTE = "按免费计价，输入、输出及缓存费用均为 0。"
+UNPRICED_MODELS: Dict[str, str] = {}
 
 
 def _normalize_model(model: object) -> str:
@@ -208,6 +209,12 @@ class PricingCatalog:
         output_tokens: int = 0,
     ) -> Quote:
         pricing_model = canonical_model(model)
+
+        if pricing_model in FREE_RATES:
+            return Quote(
+                "priced", pricing_model=pricing_model, rate_band="free",
+                note=FREE_PRICING_NOTE,
+            )
 
         openai_prices = OPENAI_RATES.get(pricing_model)
         if openai_prices is not None:
@@ -312,6 +319,22 @@ class PricingCatalog:
             }
             for model, (short, long) in OPENAI_RATES.items()
         ]
+        models.extend(
+            {
+                "model": model,
+                "status": "priced",
+                "standard": {
+                    "input": rates.input,
+                    "cached_input": rates.cached_input,
+                    "cache_write": rates.cache_write,
+                    "output": rates.output,
+                },
+                "rate_band": "free",
+                "source": None,
+                "note": FREE_PRICING_NOTE,
+            }
+            for model, rates in FREE_RATES.items()
+        )
         models.extend(
             {
                 "model": model,

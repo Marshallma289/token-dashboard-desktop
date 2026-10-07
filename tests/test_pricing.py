@@ -129,7 +129,7 @@ class PricingCatalogTests(unittest.TestCase):
             output_tokens=200,
         )
         unknown = self.pricing.quote(
-            "codex-auto-review",
+            "unknown-model",
             timestamp="2026-09-18T05:00:00Z",
             input_tokens=1000,
         )
@@ -142,7 +142,23 @@ class PricingCatalogTests(unittest.TestCase):
         self.assertEqual(qwen.rate_band, "standard")
         self.assertAlmostEqual(qwen.estimated_cost_usd, 0.00307, places=10)
         self.assertFalse(unknown.is_priced)
-        self.assertIn("standalone", unknown.note)
+        self.assertIn("No official price", unknown.note)
+
+    def test_auto_review_is_free_for_all_token_classes(self):
+        quote = self.pricing.quote(
+            "models/Codex-Auto-Review", timestamp="2026-10-07T00:00:00Z",
+            input_tokens=9_000_000, cached_input_tokens=2_000_000,
+            cache_write_input_tokens=1_000_000, output_tokens=1_000_000,
+        )
+        self.assertTrue(quote.is_priced)
+        self.assertEqual(quote.estimated_cost_usd, 0)
+        self.assertEqual(quote.rate_band, "free")
+        self.assertIsNone(quote.source_url)
+        model = next(item for item in self.pricing.metadata()["models"]
+                     if item["model"] == "codex-auto-review")
+        self.assertEqual(model["status"], "priced")
+        self.assertEqual(model["standard"], dict.fromkeys(
+            ("input", "cached_input", "cache_write", "output"), 0.0))
 
     def test_relay_prefixed_deepseek_flash_uses_bare_model_rates(self):
         peak_timestamp = dt.datetime(2026, 9, 18, 2, 0, tzinfo=dt.timezone.utc)
@@ -356,16 +372,25 @@ class PricingDashboardTests(unittest.TestCase):
                 {
                     "timestamp": "2026-09-18T05:00:03Z",
                     "type": "turn_context",
-                    "payload": {"turn_id": "unpriced-turn", "model": "codex-auto-review"},
+                    "payload": {"turn_id": "free-turn", "model": "codex-auto-review"},
                 },
                 {
                     "timestamp": "2026-09-18T05:00:04Z",
                     "type": "token_usage_record",
                     "payload": {
                         "thread_id": "thread-pricing",
-                        "response_id": "unpriced-response",
+                        "response_id": "free-response",
                         "usage": {"input_tokens": 40, "output_tokens": 10, "total_tokens": 50},
                     },
+                },
+                {
+                    "timestamp": "2026-09-18T05:00:05Z", "type": "turn_context",
+                    "payload": {"turn_id": "unpriced-turn", "model": "unknown-model"},
+                },
+                {
+                    "timestamp": "2026-09-18T05:00:06Z", "type": "token_usage_record",
+                    "payload": {"thread_id": "thread-pricing", "response_id": "unpriced-response",
+                                "usage": {"input_tokens": 90, "output_tokens": 10, "total_tokens": 100}},
                 },
             ]
             (root / "pricing.jsonl").write_text(
@@ -382,15 +407,18 @@ class PricingDashboardTests(unittest.TestCase):
 
         summary = dashboard["summary"]
         self.assertAlmostEqual(summary["estimated_cost_usd"], 0.000529, places=10)
-        self.assertEqual(summary["priced_tokens"], 1300)
-        self.assertEqual(summary["unpriced_tokens"], 50)
-        self.assertAlmostEqual(summary["pricing_coverage"], 1300 / 1350, places=10)
+        self.assertEqual(summary["total_tokens"], 1450)
+        self.assertEqual(summary["priced_tokens"], 1350)
+        self.assertEqual(summary["unpriced_tokens"], 100)
+        self.assertAlmostEqual(summary["pricing_coverage"], 1350 / 1450, places=10)
 
         unpriced = dashboard["pricing"]["unpriced_model_usage"]
-        self.assertEqual(unpriced, [{"provider": "openai", "model": "codex-auto-review", "total_tokens": 50}])
+        self.assertEqual(unpriced, [{"provider": "openai", "model": "unknown-model", "total_tokens": 100}])
         daily = {row["model"]: row for row in dashboard["daily_model_usage"]}
         self.assertEqual(daily["gpt-5.6-luna"]["pricing_status"], "priced")
-        self.assertEqual(daily["codex-auto-review"]["pricing_status"], "unpriced")
+        self.assertEqual(daily["codex-auto-review"]["pricing_status"], "priced")
+        self.assertEqual(daily["codex-auto-review"]["estimated_cost_usd"], 0)
+        self.assertEqual(daily["codex-auto-review"]["total_tokens"], 50)
 
 
 if __name__ == "__main__":

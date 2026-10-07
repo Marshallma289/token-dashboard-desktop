@@ -665,7 +665,7 @@
       .filter((model, index, models) => models.indexOf(model) === index);
     const costDetails = m.unpricedTokens
       ? `${formatCompact(m.unpricedTokens)} token 未计价${unpriced.length ? ` · ${unpriced.slice(0, 2).join('、')}${unpriced.length > 2 ? '等' : ''}` : ''}`
-      : '全部 Token 已按已配置官方价计价';
+      : '全部 Token 已按配置的计价规则计算';
     const costSub = m.total > 0
       ? `计价覆盖率 ${formatPercent(m.coverage)} · ${m.unpricedTokens ? `${formatCompact(m.unpricedTokens)} Token 未计价` : '全部已计价'}`
       : '计价覆盖率 — · 暂无用量';

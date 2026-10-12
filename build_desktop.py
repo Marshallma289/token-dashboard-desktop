@@ -20,7 +20,7 @@ ROOT_FILES = {
     "install.ps1", "install.sh",
     "CodexTokenDesktop.spec", "build-portable.ps1", "build-macos.sh",
     "requirements-desktop.txt", "requirements-build.txt", "VERSION", "LICENSE",
-    "README.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md", "providers.json.example",
+    "README.md", "UPGRADE-1.6.0.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md", "providers.json.example",
     "便携版使用说明.txt", "启动 Codex Token 看板.cmd", "start-dashboard.cmd",
     "start-dashboard.ps1", "start-dashboard.sh", "start-desktop.command",
     ".gitignore", ".gitattributes",
@@ -31,6 +31,7 @@ RUNTIME_FILES = ("backend.py", "desktop.py", "pricing.py", "VERSION", "requireme
 PORTABLE_FILES = (
     "LICENSE", "THIRD_PARTY_NOTICES.md", "providers.json.example", "VERSION",
     "便携版使用说明.txt", "启动 Codex Token 看板.cmd",
+    "UPGRADE-1.6.0.md",
 )
 
 

@@ -13,6 +13,7 @@ import argparse
 import csv
 import datetime as _dt
 import hashlib
+import ipaddress
 import json
 import math
 import mimetypes
@@ -31,7 +32,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optio
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pricing import DEFAULT_PRICING, canonical_model
+from pricing import DEFAULT_PRICING, PricingCatalog, canonical_model, validate_pricing_rules
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -43,7 +44,7 @@ def local_data_dir() -> Path:
 
 DEFAULT_DB = local_data_dir() / "usage.sqlite3"
 DEFAULT_PROVIDER_CONFIG = APP_DIR / "providers.json"
-PARSER_SCHEMA_VERSION = 5
+PARSER_SCHEMA_VERSION = 6
 APP_VERSION = (Path(__file__).resolve().parent / "VERSION").read_text(encoding="utf-8").strip()
 
 try:
@@ -155,6 +156,26 @@ class Usage:
     cache_write_input_tokens: int
     reasoning_output_tokens: int
     total_tokens: int
+    cache_read_available: bool = False
+    cache_write_available: bool = False
+
+
+def _as_float(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def _fresh_input_tokens(input_tokens: Any, cached_input_tokens: Any, cache_write_input_tokens: Any) -> int:
+    """Estimate uncached input without letting counters subtract below zero."""
+    total = max(0, int(input_tokens or 0))
+    cached = min(total, max(0, int(cached_input_tokens or 0)))
+    cache_write = min(total - cached, max(0, int(cache_write_input_tokens or 0)))
+    return total - cached - cache_write
 
 
 def parse_usage(value: Any) -> Optional[Usage]:
@@ -170,23 +191,16 @@ def parse_usage(value: Any) -> Optional[Usage]:
         return None
     input_tokens = _as_int(_first(usage, "input_tokens", "prompt_tokens", "prompt_token_count"))
     output_tokens = _as_int(_first(usage, "output_tokens", "completion_tokens", "completion_token_count"))
-    cached = _as_int(
-        _first(
-            usage,
-            "cached_input_tokens",
-            "cache_read_input_tokens",
-            "cache_read_tokens",
-            "cached_tokens",
-        )
+    cache_read_names = (
+        "cached_input_tokens", "cache_read_input_tokens", "cache_read_tokens", "cached_tokens",
     )
-    cache_write = _as_int(
-        _first(
-            usage,
-            "cache_write_input_tokens",
-            "cache_creation_input_tokens",
-            "cache_write_tokens",
-        )
+    cache_write_names = (
+        "cache_write_input_tokens", "cache_creation_input_tokens", "cache_write_tokens",
     )
+    cached_value = _first(usage, *cache_read_names)
+    cache_write_value = _first(usage, *cache_write_names)
+    cached = _as_int(cached_value)
+    cache_write = _as_int(cache_write_value)
     reasoning = _as_int(_first(usage, "reasoning_output_tokens", "reasoning_tokens"))
     total = _as_int(_first(usage, "total_tokens", "total_token_count", "tokens"))
 
@@ -202,7 +216,8 @@ def parse_usage(value: Any) -> Optional[Usage]:
     # records occasionally omit it; input + output is the least surprising
     # fallback because cache/reasoning fields are subsets.
     total = total if total is not None else input_tokens + output_tokens
-    return Usage(input_tokens, output_tokens, cached, cache_write, reasoning, total)
+    return Usage(input_tokens, output_tokens, cached, cache_write, reasoning, total,
+                 cached_value is not None, cache_write_value is not None)
 
 
 class ProviderCatalog:
@@ -284,6 +299,9 @@ class ParsedRecord:
     speed_group_key: Optional[str] = None
     speed_output_tokens: int = 0
     speed_duration_ms: float = 0.0
+    ttft_ms: Optional[float] = None
+    parent_thread_id: Optional[str] = None
+    speed_exclusion_reason: Optional[str] = None
 
 
 @dataclass
@@ -396,6 +414,8 @@ class RolloutParser:
         turn_starts: Dict[Tuple[str, str], Mapping[str, Any]] = {}
         turn_timings: Dict[Tuple[str, str], float] = {}
         turn_output_totals: Dict[Tuple[str, str], int] = {}
+        turn_ttft: Dict[Tuple[str, str], float] = {}
+        parent_by_thread: Dict[str, str] = {}
         parse_errors = 0
         try:
             fallback_mtime = path.stat().st_mtime
@@ -421,6 +441,15 @@ class RolloutParser:
                     state = thread_states.setdefault(session_thread_id, {})
                     state["provider"] = session_provider
                     state["workspace"] = session_workspace
+                    source = _as_dict(payload.get("source"))
+                    subagent = _as_dict(source.get("subagent"))
+                    thread_spawn = _as_dict(subagent.get("thread_spawn"))
+                    parent_value = (
+                        _first(thread_spawn, "parent_thread_id", "parentThreadId")
+                        or _first(payload, "forked_from_id", "forkedFromId")
+                    )
+                    if parent_value is not None and str(parent_value).strip():
+                        parent_by_thread[session_thread_id] = str(parent_value).strip()
                 continue
 
             if event_type == "event_msg" and payload_type in ("task_started", "task_complete"):
@@ -428,6 +457,10 @@ class RolloutParser:
                 timing_turn = payload.get("turn_id")
                 if timing_thread and timing_turn:
                     timing_key = (timing_thread, str(timing_turn))
+                    reported_ttft = _as_float(_first(
+                        payload, "time_to_first_token_ms", "ttft_ms", "first_token_latency_ms"))
+                    if reported_ttft is not None and reported_ttft > 0:
+                        turn_ttft[timing_key] = reported_ttft
                     if payload_type == "task_started":
                         turn_starts[timing_key] = event
                         current_turn_id = str(timing_turn)
@@ -523,6 +556,21 @@ class RolloutParser:
                 response_id = str(response_value).strip() if response_value is not None else None
                 response_id = response_id or None
                 record_turn = str(payload.get("turn_id") or state.get("turn_id") or current_turn_id or "") or None
+                parent_value = (
+                    parent_by_thread.get(thread_id or "")
+                    or _first(payload, "parent_thread_id", "parentThreadId", "forked_from_id", "forkedFromId")
+                )
+                session_value = payload.get("session_id")
+                if parent_value is None and session_value is not None and str(session_value).strip() != str(thread_id or ""):
+                    parent_value = str(session_value).strip()
+                usage_ttft = _as_float(_first(
+                    payload, "time_to_first_token_ms", "ttft_ms", "first_token_latency_ms"))
+                if usage_ttft is None:
+                    usage_ttft = _as_float(_first(
+                        _as_dict(usage_container),
+                        "time_to_first_token_ms", "ttft_ms", "first_token_latency_ms"))
+                if usage_ttft is None and thread_id and record_turn:
+                    usage_ttft = turn_ttft.get((thread_id, record_turn))
                 turn_usage = _as_dict(payload.get("turn_token_usage"))
                 turn_output = _as_int(turn_usage.get("output_tokens"))
                 if thread_id and record_turn and turn_output is not None:
@@ -543,6 +591,8 @@ class RolloutParser:
                         workspace,
                         usage,
                         record_turn,
+                        ttft_ms=usage_ttft if usage_ttft and usage_ttft > 0 else None,
+                        parent_thread_id=str(parent_value) if parent_value is not None else None,
                     )
                 )
                 continue
@@ -566,6 +616,13 @@ class RolloutParser:
                     continue
                 thread_id = self._thread_id(event, payload) or session_thread_id
                 state = thread_states.get(thread_id or "", {})
+                parent_value = (
+                    parent_by_thread.get(thread_id or "")
+                    or _first(payload, "parent_thread_id", "parentThreadId", "forked_from_id", "forkedFromId")
+                )
+                session_value = _first(payload, "session_id", "sessionId")
+                if parent_value is None and session_value is not None and str(session_value).strip() != str(thread_id or ""):
+                    parent_value = str(session_value).strip()
                 provider = str(state.get("provider") or current_provider or session_provider or "unknown").strip()
                 model = str(state.get("model") or current_model or "unknown").strip()
                 workspace = _safe_workspace(state.get("workspace") or current_workspace)
@@ -584,6 +641,8 @@ class RolloutParser:
                             max(0, usage.cache_write_input_tokens - previous.cache_write_input_tokens),
                             max(0, usage.reasoning_output_tokens - previous.reasoning_output_tokens),
                             usage.total_tokens - previous.total_tokens,
+                            usage.cache_read_available,
+                            usage.cache_write_available,
                         )
                     # A lower cumulative value means Codex reset the counter.
                     # Count the new baseline once instead of emitting a
@@ -653,6 +712,7 @@ class RolloutParser:
                         workspace,
                         usage,
                         str(payload.get("turn_id") or current_turn_id or "") or None,
+                        parent_thread_id=str(parent_value) if parent_value is not None else None,
                     )
                 )
         # A whole turn includes waits and tools. Never invent API-request or
@@ -661,19 +721,30 @@ class RolloutParser:
         # Mixed-attribution turns cannot be split into reliable model speeds.
         groups: Dict[Tuple[str, str], List[int]] = {}
         for index, record in enumerate(records):
+            if not record.thread_id:
+                records[index] = replace(record, speed_exclusion_reason="missing_thread_id")
+            elif not record.turn_id:
+                records[index] = replace(record, speed_exclusion_reason="missing_turn_id")
+        for index, record in enumerate(records):
             if record.thread_id and record.turn_id:
                 groups.setdefault((record.thread_id, record.turn_id), []).append(index)
         for key, indices in groups.items():
             duration = turn_timings.get(key)
-            if duration is None or len({(records[i].provider, records[i].model, records[i].workspace)
-                                        for i in indices}) != 1:
-                continue
+            group_key = hashlib.sha256(json.dumps(key).encode("utf-8")).hexdigest()
+            reason = None
+            if len({(records[i].provider, records[i].model, records[i].workspace)
+                    for i in indices}) != 1:
+                reason = "mixed_attribution"
+            elif any(not records[i].response_id for i in indices):
+                reason = "missing_request_id"
+            elif duration is None:
+                reason = "missing_or_invalid_duration"
             unique: Dict[str, ParsedRecord] = {}
             # Require stable request ids to avoid overcounting duplicate usage.
-            if any(not records[i].response_id for i in indices):
-                continue
             for index in indices:
                 candidate = records[index]
+                if not candidate.response_id:
+                    continue
                 prior = unique.get(candidate.response_id)
                 if prior is None or (candidate.usage.total_tokens, candidate.timestamp) > (
                         prior.usage.total_tokens, prior.timestamp):
@@ -681,14 +752,33 @@ class RolloutParser:
             output = sum(record.usage.output_tokens for record in unique.values())
             # When a cumulative turn counter is present, prove we saw all
             # output rather than silently computing from an incomplete copy.
-            if key in turn_output_totals and turn_output_totals[key] != output:
+            if reason is None and key in turn_output_totals and turn_output_totals[key] != output:
+                reason = "inconsistent_turn_output"
+            if reason is not None:
+                for index in indices:
+                    records[index] = replace(records[index], speed_group_key=group_key,
+                                             speed_exclusion_reason=reason)
                 continue
             sample_day = max(unique.values(), key=lambda record: record.timestamp).day
-            group_key = hashlib.sha256(json.dumps(key).encode("utf-8")).hexdigest()
             for index in indices:
                 if records[index].day == sample_day:
                     records[index] = replace(records[index], speed_group_key=group_key,
-                                             speed_output_tokens=output, speed_duration_ms=duration)
+                                             speed_output_tokens=output, speed_duration_ms=duration,
+                                             speed_exclusion_reason=None)
+                else:
+                    records[index] = replace(records[index], speed_group_key=group_key,
+                                             speed_exclusion_reason="outside_sample_day")
+        # A TTFT attached to a turn completion is one turn-level sample. Carry
+        # it on one request only so aggregate counts remain stable.
+        for key, indices in groups.items():
+            reported = turn_ttft.get(key)
+            if reported is None:
+                candidates = [records[index].ttft_ms for index in indices if records[index].ttft_ms]
+                reported = candidates[0] if candidates else None
+            if reported is not None and reported > 0:
+                first_index = min(indices, key=lambda i: records[i].timestamp)
+                for index in indices:
+                    records[index] = replace(records[index], ttft_ms=reported if index == first_index else None)
         return records, self._parse_errors
 
     @staticmethod
@@ -755,7 +845,7 @@ class DashboardDB:
         self._clock = clock or (lambda: _dt.datetime.now(self.timezone))
         self.catalog = ProviderCatalog(Path(providers_path).expanduser() if providers_path else None)
         self.parser = RolloutParser(self.catalog, self.timezone)
-        self.pricing = DEFAULT_PRICING
+        self.pricing = PricingCatalog()
         self.database_recovery: Optional[Dict[str, Any]] = None
         self.database_migration: Optional[Dict[str, Any]] = None
         self._query_lock = threading.RLock()
@@ -773,6 +863,8 @@ class DashboardDB:
             except Exception:
                 self._connection.close()
                 raise
+        self._load_pricing_catalog()
+        self._backfill_pricing_snapshots()
 
     def _open_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(str(self.db_path), check_same_thread=False)
@@ -808,6 +900,142 @@ class DashboardDB:
         with self._lock:
             self._maintain_storage(force=True)
             self._connection.close()
+
+    @staticmethod
+    def _json_object(value: Any) -> Dict[str, Any]:
+        try:
+            result = json.loads(value) if isinstance(value, str) else value
+        except (ValueError, TypeError):
+            result = None
+        return result if isinstance(result, dict) else {}
+
+    def _pricing_snapshot_id(self, snapshot: Mapping[str, Any]) -> int:
+        encoded = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(encoded.encode("utf-8")).digest()
+        self._connection.execute(
+            "INSERT OR IGNORE INTO pricing_snapshots(snapshot_hash,snapshot_json) VALUES (?,?)",
+            (digest, encoded))
+        return int(self._connection.execute(
+            "SELECT id FROM pricing_snapshots WHERE snapshot_hash=?", (digest,)).fetchone()[0])
+
+    def _stored_pricing_rules(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            try:
+                row = self._connection.execute("SELECT rules_json FROM pricing_config WHERE id=1").fetchone()
+            except sqlite3.DatabaseError:
+                row = None
+        if not row:
+            return []
+        try:
+            value = json.loads(row[0])
+        except (ValueError, TypeError):
+            return []
+        return value if isinstance(value, list) else []
+
+    def _load_pricing_catalog(self) -> None:
+        self.pricing = PricingCatalog(rules=self._stored_pricing_rules())
+
+    def _quote_for_usage(
+        self, model: str, provider: str, timestamp: str,
+        input_tokens: int, cached_input_tokens: int,
+        cache_write_input_tokens: int, output_tokens: int,
+        rate_snapshot: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        usage = {
+            "timestamp": timestamp,
+            "input_tokens": int(input_tokens or 0),
+            "cached_input_tokens": int(cached_input_tokens or 0),
+            "cache_write_input_tokens": int(cache_write_input_tokens or 0),
+            "output_tokens": int(output_tokens or 0),
+            "provider": provider,
+        }
+        quote = None
+        if rate_snapshot:
+            frozen = getattr(self.pricing, "quote_from_snapshot", None)
+            if callable(frozen):
+                quote = frozen(dict(rate_snapshot), model=model, **usage)
+        if quote is None:
+            try:
+                quote = self.pricing.quote(model, **usage)
+            except TypeError:
+                usage.pop("provider", None)
+                quote = self.pricing.quote(model, **usage)
+        status = str(getattr(quote, "status", "unpriced"))
+        rate = getattr(quote, "rate_snapshot", None)
+        rate = dict(rate) if isinstance(rate, Mapping) else {}
+        snapshot_status = str(rate.get("status") or status)
+        is_priced = bool(getattr(quote, "is_priced", status in ("priced", "free")))
+        if status == "unpriced" or snapshot_status == "unpriced":
+            is_priced = False
+        elif snapshot_status == "free":
+            is_priced = True
+        if not rate:
+            rate = {
+                "status": status,
+                "pricing_model": getattr(quote, "pricing_model", None),
+                "rate_band": getattr(quote, "rate_band", None),
+                "source": getattr(quote, "source_url", None),
+                "note": getattr(quote, "note", None),
+            }
+        multiplier = _as_float(getattr(quote, "cost_multiplier", 1.0))
+        if multiplier is None:
+            multiplier = 1.0
+        before = getattr(quote, "cost_before_discount_usd", None)
+        after = getattr(quote, "cost_after_discount_usd", None)
+        if before is None and is_priced:
+            before = getattr(quote, "estimated_cost_usd", None)
+        if after is None and is_priced:
+            after = getattr(quote, "estimated_cost_usd", None)
+        before = _as_float(before) if is_priced else None
+        after = _as_float(after) if is_priced else None
+        breakdown = getattr(quote, "cost_breakdown_before_discount", None)
+        if not isinstance(breakdown, Mapping):
+            breakdown = {}
+        saving_before = getattr(quote, "cache_savings_before_discount_usd", None)
+        saving_after = getattr(quote, "cache_savings_after_discount_usd", None)
+        return {
+            "pricing_status": snapshot_status if is_priced else "unpriced",
+            "rate_snapshot": dict(rate),
+            "cost_multiplier": multiplier,
+            "cost_before_discount_usd": before,
+            "cost_after_discount_usd": after,
+            "cost_breakdown_before_discount": dict(breakdown),
+            "cache_savings_before_discount_usd": _as_float(saving_before),
+            "cache_savings_after_discount_usd": _as_float(saving_after),
+        }
+
+    def _backfill_pricing_snapshots(self) -> None:
+        with self._lock:
+            rows = self._connection.execute("""SELECT s.*, c.provider, c.model
+                FROM history_requests r JOIN history_snapshots s ON s.id=r.snapshot_id
+                JOIN history_contexts c ON c.id=s.context_id
+                WHERE s.rate_snapshot_id IS NULL AND (s.rate_snapshot='{}' OR s.rate_snapshot='')""").fetchall()
+            if not rows:
+                return
+            self._connection.execute("BEGIN")
+            try:
+                for row in rows:
+                    quote = self._quote_for_usage(
+                        row["model"], row["provider"], row["timestamp"], row["input_tokens"],
+                        row["cached_input_tokens"], row["cache_write_input_tokens"], row["output_tokens"])
+                    self._save_quote_on_snapshot(row["id"], quote)
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+
+    def _save_quote_on_snapshot(self, snapshot_id: int, quote: Mapping[str, Any]) -> None:
+        rate_snapshot_id = self._pricing_snapshot_id(quote["rate_snapshot"])
+        self._connection.execute("""UPDATE history_snapshots SET pricing_status=?, rate_snapshot=?,
+            rate_snapshot_id=?, cost_multiplier=?, cost_before_discount_usd=?, cost_after_discount_usd=?,
+            cost_breakdown_before_discount=?, cache_savings_before_discount_usd=?,
+            cache_savings_after_discount_usd=? WHERE id=?""", (
+            quote["pricing_status"], "{}", rate_snapshot_id,
+            quote["cost_multiplier"], quote["cost_before_discount_usd"],
+            quote["cost_after_discount_usd"], json.dumps(quote["cost_breakdown_before_discount"],
+                ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            quote["cache_savings_before_discount_usd"], quote["cache_savings_after_discount_usd"],
+            snapshot_id))
 
     @staticmethod
     def _validate_cleanup_days(days: Any) -> int:
@@ -1154,6 +1382,27 @@ class DashboardDB:
         migrating = "usage_records" in tables
         timing_upgrade = ("history_snapshots" in tables and "speed_group_key" not in
                           {row[1] for row in self._connection.execute("PRAGMA table_info(history_snapshots)")})
+        snapshot_columns = ({row[1] for row in self._connection.execute(
+            "PRAGMA table_info(history_snapshots)")} if "history_snapshots" in tables else set())
+        analytics_columns = {
+            "cache_read_available", "cache_write_available", "ttft_ms", "thread_key",
+            "parent_thread_key", "task_id", "agent_role", "speed_exclusion_reason",
+            "pricing_status", "rate_snapshot", "cost_multiplier", "cost_before_discount_usd",
+            "cost_after_discount_usd", "cost_breakdown_before_discount",
+            "cache_savings_before_discount_usd", "cache_savings_after_discount_usd",
+            "rate_snapshot_id",
+        }
+        analytics_upgrade = bool(tables.intersection({"history_snapshots", "usage_records", "source_files"})) \
+            and not analytics_columns.issubset(snapshot_columns)
+        analytics_backup = None
+        if analytics_upgrade:
+            analytics_backup = Path(str(self.db_path) + ".pre-analytics.bak")
+            if not analytics_backup.exists():
+                target = sqlite3.connect(str(analytics_backup))
+                try:
+                    self._connection.backup(target)
+                finally:
+                    target.close()
         if timing_upgrade:
             timing_backup = Path(str(self.db_path) + ".pre-speed.bak")
             if not timing_backup.exists():
@@ -1164,7 +1413,11 @@ class DashboardDB:
                     target.close()
         backup = None
         if migrating:
-            backup = Path(str(self.db_path) + ".pre-history.bak")
+            # The analytics backup already captures the exact pre-migration
+            # database. Avoid creating a second full copy for legacy-ledger
+            # migrations; keep the historical backup name for upgrades that
+            # do not need the analytics schema backup.
+            backup = analytics_backup or Path(str(self.db_path) + ".pre-history.bak")
             if not backup.exists():
                 target = sqlite3.connect(str(backup))
                 try:
@@ -1189,6 +1442,9 @@ class DashboardDB:
                 """CREATE TABLE IF NOT EXISTS history_contexts (
                     id INTEGER PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL,
                     workspace TEXT NOT NULL, UNIQUE(provider, model, workspace))""",
+                """CREATE TABLE IF NOT EXISTS pricing_snapshots (
+                    id INTEGER PRIMARY KEY, snapshot_hash BLOB NOT NULL UNIQUE,
+                    snapshot_json TEXT NOT NULL)""",
                 """CREATE TABLE IF NOT EXISTS history_snapshots (
                     id INTEGER PRIMARY KEY, fingerprint BLOB NOT NULL UNIQUE,
                     context_id INTEGER NOT NULL REFERENCES history_contexts(id), timestamp TEXT NOT NULL,
@@ -1197,7 +1453,18 @@ class DashboardDB:
                     cached_input_tokens INTEGER NOT NULL, cache_write_input_tokens INTEGER NOT NULL,
                     reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL,
                     speed_group_key TEXT, speed_output_tokens INTEGER NOT NULL DEFAULT 0,
-                    speed_duration_ms REAL NOT NULL DEFAULT 0)""",
+                    speed_duration_ms REAL NOT NULL DEFAULT 0,
+                    cache_read_available INTEGER NOT NULL DEFAULT 0,
+                    cache_write_available INTEGER NOT NULL DEFAULT 0,
+                    ttft_ms REAL, thread_key TEXT, parent_thread_key TEXT, task_id TEXT,
+                    agent_role TEXT NOT NULL DEFAULT 'unknown', speed_exclusion_reason TEXT,
+                    pricing_status TEXT NOT NULL DEFAULT 'unpriced',
+                    rate_snapshot TEXT NOT NULL DEFAULT '{}', rate_snapshot_id INTEGER,
+                    cost_multiplier REAL NOT NULL DEFAULT 1,
+                    cost_before_discount_usd REAL, cost_after_discount_usd REAL,
+                    cost_breakdown_before_discount TEXT NOT NULL DEFAULT '{}',
+                    cache_savings_before_discount_usd REAL,
+                    cache_savings_after_discount_usd REAL)""",
                 """CREATE TABLE IF NOT EXISTS history_requests (
                     logical_key BLOB PRIMARY KEY, snapshot_id INTEGER NOT NULL REFERENCES history_snapshots(id),
                     retained_snapshot_id INTEGER REFERENCES history_snapshots(id)) WITHOUT ROWID""",
@@ -1207,14 +1474,36 @@ class DashboardDB:
                     PRIMARY KEY(file_id, logical_key)) WITHOUT ROWID""",
                 "CREATE INDEX IF NOT EXISTS idx_history_logical ON history_sources(logical_key)",
                 "CREATE INDEX IF NOT EXISTS idx_history_day ON history_snapshots(day)",
+                "CREATE INDEX IF NOT EXISTS idx_history_task ON history_snapshots(task_id)",
+                "CREATE INDEX IF NOT EXISTS idx_history_thread ON history_snapshots(thread_key)",
+                """CREATE TABLE IF NOT EXISTS thread_relationships (
+                    thread_key TEXT PRIMARY KEY, parent_thread_key TEXT,
+                    agent_role TEXT NOT NULL DEFAULT 'main', updated_at TEXT NOT NULL) WITHOUT ROWID""",
+                """CREATE TABLE IF NOT EXISTS pricing_config (
+                    id INTEGER PRIMARY KEY CHECK (id=1), rules_json TEXT NOT NULL DEFAULT '[]',
+                    rules_hash TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL)""",
+                """CREATE TABLE IF NOT EXISTS reprice_previews (
+                    token TEXT PRIMARY KEY, filters_json TEXT NOT NULL, rules_hash TEXT NOT NULL,
+                    data_hash TEXT NOT NULL, request_count INTEGER NOT NULL,
+                    created_at TEXT NOT NULL, expires_at TEXT NOT NULL) WITHOUT ROWID""",
                 """CREATE VIEW IF NOT EXISTS usage_records AS
-                    SELECT r.logical_key AS record_key, '' AS source_path, 0 AS source_line,
-                        NULL AS response_id, NULL AS thread_id, s.timestamp, s.day, s.hour,
+                    SELECT r.logical_key AS record_key, lower(hex(r.logical_key)) AS request_id,
+                        '' AS source_path, 0 AS source_line, NULL AS response_id,
+                        s.thread_key AS thread_id, s.timestamp, s.day, s.hour,
                         c.provider, c.provider AS provider_label, c.model, c.workspace,
                         s.input_tokens, s.output_tokens, s.cached_input_tokens,
-                        s.cache_write_input_tokens, s.reasoning_output_tokens, s.total_tokens
+                        s.cache_write_input_tokens, s.reasoning_output_tokens, s.total_tokens,
+                        s.speed_group_key, s.speed_output_tokens, s.speed_duration_ms,
+                        s.cache_read_available, s.cache_write_available, s.ttft_ms,
+                        s.thread_key, s.parent_thread_key, s.task_id, s.agent_role,
+                        s.speed_exclusion_reason, s.pricing_status,
+                        COALESCE(p.snapshot_json,s.rate_snapshot) AS rate_snapshot,
+                        s.cost_multiplier, s.cost_before_discount_usd, s.cost_after_discount_usd,
+                        s.cost_breakdown_before_discount, s.cache_savings_before_discount_usd,
+                        s.cache_savings_after_discount_usd
                     FROM history_requests r JOIN history_snapshots s ON s.id=r.snapshot_id
-                    JOIN history_contexts c ON c.id=s.context_id""",
+                    JOIN history_contexts c ON c.id=s.context_id
+                    LEFT JOIN pricing_snapshots p ON p.id=s.rate_snapshot_id""",
             ]
             # Existing ledgers are preserved. Changed parser version makes
             # available logs rescan once, filling timing without clearing use.
@@ -1222,13 +1511,48 @@ class DashboardDB:
                 self._connection.execute("ALTER TABLE history_snapshots ADD COLUMN speed_group_key TEXT")
                 self._connection.execute("ALTER TABLE history_snapshots ADD COLUMN speed_output_tokens INTEGER NOT NULL DEFAULT 0")
                 self._connection.execute("ALTER TABLE history_snapshots ADD COLUMN speed_duration_ms REAL NOT NULL DEFAULT 0")
-            if not migrating:
-                self._connection.execute("DROP VIEW IF EXISTS usage_records")
-            statements[-1] = statements[-1].replace(
-                "s.reasoning_output_tokens, s.total_tokens",
-                "s.reasoning_output_tokens, s.total_tokens, s.speed_group_key, s.speed_output_tokens, s.speed_duration_ms")
+            if "history_snapshots" in tables:
+                migrations = {
+                    "cache_read_available": "INTEGER NOT NULL DEFAULT 0",
+                    "cache_write_available": "INTEGER NOT NULL DEFAULT 0",
+                    "ttft_ms": "REAL",
+                    "thread_key": "TEXT",
+                    "parent_thread_key": "TEXT",
+                    "task_id": "TEXT",
+                    "agent_role": "TEXT NOT NULL DEFAULT 'unknown'",
+                    "speed_exclusion_reason": "TEXT",
+                    "pricing_status": "TEXT NOT NULL DEFAULT 'unpriced'",
+                    "rate_snapshot": "TEXT NOT NULL DEFAULT '{}'",
+                    "rate_snapshot_id": "INTEGER",
+                    "cost_multiplier": "REAL NOT NULL DEFAULT 1",
+                    "cost_before_discount_usd": "REAL",
+                    "cost_after_discount_usd": "REAL",
+                    "cost_breakdown_before_discount": "TEXT NOT NULL DEFAULT '{}'",
+                    "cache_savings_before_discount_usd": "REAL",
+                    "cache_savings_after_discount_usd": "REAL",
+                }
+                present = {row[1] for row in self._connection.execute(
+                    "PRAGMA table_info(history_snapshots)")}
+                for column, definition in migrations.items():
+                    if column not in present:
+                        self._connection.execute(
+                            "ALTER TABLE history_snapshots ADD COLUMN %s %s" % (column, definition))
+            self._connection.execute("DROP VIEW IF EXISTS usage_records")
             for statement in statements:
                 self._connection.execute(statement)
+            # Deduplicate immutable rate objects while keeping the full JSON
+            # available through usage_records and the request APIs.
+            if "history_snapshots" in tables:
+                for snapshot_row in self._connection.execute("""SELECT id,rate_snapshot
+                    FROM history_snapshots WHERE rate_snapshot_id IS NULL
+                    AND rate_snapshot NOT IN ('', '{}')""").fetchall():
+                    snapshot_data = self._json_object(snapshot_row["rate_snapshot"])
+                    if not snapshot_data:
+                        continue
+                    rate_id = self._pricing_snapshot_id(snapshot_data)
+                    self._connection.execute("""UPDATE history_snapshots
+                        SET rate_snapshot='{}',rate_snapshot_id=? WHERE id=?""",
+                        (rate_id, snapshot_row["id"]))
             if migrating:
                 if "source_files" in tables:
                     for row in self._connection.execute("SELECT * FROM legacy_source_files").fetchall():
@@ -1338,22 +1662,81 @@ class DashboardDB:
                 row["source_line"] if "source_line" in row.keys() else 0,
                 row["source_path"] if "source_path" in row.keys() else "")
 
-    def _store_snapshot(self, key, row):
+    def _store_snapshot(self, key, row, force_reprice=False):
         context = (row["provider"], row["model"], row["workspace"])
         self._connection.execute("INSERT OR IGNORE INTO history_contexts(provider,model,workspace) VALUES (?,?,?)",
                                  context)
         context_id = self._connection.execute(
             "SELECT id FROM history_contexts WHERE provider=? AND model=? AND workspace=?", context).fetchone()[0]
         tokens = tuple(int(row[name]) for name in self._token_columns())
-        speed = (row["speed_group_key"], row["speed_output_tokens"], row["speed_duration_ms"]) if "speed_group_key" in row.keys() else (None, 0, 0.0)
+        columns = set(row.keys())
+        speed = (row["speed_group_key"], row["speed_output_tokens"], row["speed_duration_ms"]) \
+            if "speed_group_key" in columns else (None, 0, 0.0)
+        raw_thread = row["thread_id"] if "thread_id" in columns else None
+        raw_parent = row["parent_thread_id"] if "parent_thread_id" in columns else None
+        thread_key = row["thread_key"] if "thread_key" in columns else None
+        parent_thread_key = row["parent_thread_key"] if "parent_thread_key" in columns else None
+        if thread_key is None and raw_thread:
+            thread_key = hashlib.sha256(str(raw_thread).encode("utf-8")).hexdigest()
+        if parent_thread_key is None and raw_parent:
+            parent_thread_key = hashlib.sha256(str(raw_parent).encode("utf-8")).hexdigest()
+        if thread_key:
+            agent_role = "subagent" if parent_thread_key else "main"
+            task_id = row["task_id"] if "task_id" in columns and row["task_id"] else (parent_thread_key or thread_key)
+            self._connection.execute("""INSERT INTO thread_relationships
+                (thread_key,parent_thread_key,agent_role,updated_at) VALUES (?,?,?,?)
+                ON CONFLICT(thread_key) DO UPDATE SET
+                    parent_thread_key=COALESCE(excluded.parent_thread_key,thread_relationships.parent_thread_key),
+                    agent_role=CASE WHEN excluded.agent_role='unknown' THEN thread_relationships.agent_role
+                                    ELSE excluded.agent_role END,
+                    updated_at=excluded.updated_at""",
+                (thread_key, parent_thread_key, agent_role, _now_iso()))
+        else:
+            agent_role = "unknown"
+            task_id = None
+        cache_read_available = int(bool(row["cache_read_available"])) if "cache_read_available" in columns else 0
+        cache_write_available = int(bool(row["cache_write_available"])) if "cache_write_available" in columns else 0
+        ttft_ms = row["ttft_ms"] if "ttft_ms" in columns else None
+        exclusion = row["speed_exclusion_reason"] if "speed_exclusion_reason" in columns else None
+        previous = self._connection.execute("""SELECT s.*,
+            COALESCE(p.snapshot_json,s.rate_snapshot) AS effective_rate_snapshot
+            FROM history_requests r JOIN history_snapshots s ON s.id=r.snapshot_id
+            LEFT JOIN pricing_snapshots p ON p.id=s.rate_snapshot_id
+            WHERE r.logical_key=?""", (key,)).fetchone()
+        frozen_snapshot = self._json_object(previous["effective_rate_snapshot"]) if previous else {}
+        if force_reprice:
+            frozen_snapshot = {}
+        quote = self._quote_for_usage(
+            row["model"], row["provider"], row["timestamp"], tokens[0], tokens[2], tokens[3], tokens[1],
+            rate_snapshot=frozen_snapshot or None)
+        pricing_fields = (
+            quote["pricing_status"],
+            json.dumps(quote["rate_snapshot"], ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            quote["cost_multiplier"], quote["cost_before_discount_usd"], quote["cost_after_discount_usd"],
+            json.dumps(quote["cost_breakdown_before_discount"], ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":")), quote["cache_savings_before_discount_usd"],
+            quote["cache_savings_after_discount_usd"],
+        )
+        rate_snapshot_id = self._pricing_snapshot_id(quote["rate_snapshot"])
         fingerprint = hashlib.sha256(key + json.dumps(
-            [*context, row["timestamp"], *tokens, *([*speed] if speed[0] else [])], ensure_ascii=False).encode("utf-8")).digest()
+            [*context, row["timestamp"], *tokens, *([*speed] if speed[0] else []),
+             cache_read_available, cache_write_available, ttft_ms, thread_key, parent_thread_key,
+             task_id, agent_role, exclusion, *pricing_fields], ensure_ascii=False, sort_keys=True,
+             separators=(",", ":")).encode("utf-8")).digest()
         _, day, hour = _parse_timestamp(row["timestamp"], timezone=self.timezone)
         self._connection.execute("""INSERT OR IGNORE INTO history_snapshots
             (fingerprint,context_id,timestamp,day,hour,input_tokens,output_tokens,cached_input_tokens,
              cache_write_input_tokens,reasoning_output_tokens,total_tokens,
-             speed_group_key,speed_output_tokens,speed_duration_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (fingerprint, context_id, row["timestamp"], day, hour, *tokens, *speed))
+             speed_group_key,speed_output_tokens,speed_duration_ms,cache_read_available,
+             cache_write_available,ttft_ms,thread_key,parent_thread_key,task_id,agent_role,
+             speed_exclusion_reason,pricing_status,rate_snapshot,rate_snapshot_id,cost_multiplier,
+             cost_before_discount_usd,cost_after_discount_usd,cost_breakdown_before_discount,
+             cache_savings_before_discount_usd,cache_savings_after_discount_usd)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (fingerprint, context_id, row["timestamp"], day, hour, *tokens, *speed,
+             cache_read_available, cache_write_available, ttft_ms, thread_key, parent_thread_key,
+             task_id, agent_role, exclusion, pricing_fields[0], "{}", rate_snapshot_id,
+             *pricing_fields[2:]))
         return self._connection.execute(
             "SELECT id FROM history_snapshots WHERE fingerprint=?", (fingerprint,)).fetchone()[0]
 
@@ -1420,6 +1803,8 @@ class DashboardDB:
             SELECT snapshot_id FROM history_requests UNION SELECT retained_snapshot_id FROM history_requests
             WHERE retained_snapshot_id IS NOT NULL UNION SELECT snapshot_id FROM history_sources)""")
         self._connection.execute("DELETE FROM history_contexts WHERE id NOT IN (SELECT context_id FROM history_snapshots)")
+        self._connection.execute("""DELETE FROM pricing_snapshots WHERE id NOT IN (
+            SELECT rate_snapshot_id FROM history_snapshots WHERE rate_snapshot_id IS NOT NULL)""")
 
     def _maintain_storage(self, force=False):
         # Limit WAL and reclaim free pages without rewriting history each poll.
@@ -1562,10 +1947,21 @@ class DashboardDB:
         provider: Optional[str],
         workspace: Optional[str],
         model: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
     ) -> List[sqlite3.Row]:
         where: List[str] = []
         params: List[Any] = []
-        if days is not None and days > 0:
+        if start_date is not None or end_date is not None:
+            if not start_date or not end_date:
+                raise ValueError("start_date and end_date must be supplied together")
+            start = self._parse_local_date(start_date)
+            end = self._parse_local_date(end_date)
+            if start > end:
+                raise ValueError("start_date must not be after end_date")
+            where.append("day >= ? AND day <= ?")
+            params.extend((start.isoformat(), end.isoformat()))
+        elif days is not None and days > 0:
             today = self._local_now().date()
             cutoff = today - _dt.timedelta(days=days - 1)
             # day is an ISO date and is indexed, so this bounds the SQLite
@@ -1587,19 +1983,432 @@ class DashboardDB:
         reader = sqlite3.connect(str(self.db_path), timeout=5.0)
         try:
             reader.row_factory = sqlite3.Row
+            reader.create_function("canonical_model", 1, canonical_model)
+            if model:
+                where.append("canonical_model(model) = ?")
+                params.append(canonical_model(model))
+            predicate = (" WHERE " + " AND ".join(where)) if where else ""
             rows = reader.execute(
-                "SELECT * FROM usage_records" + predicate + " ORDER BY day, hour, source_path, source_line",
+                "SELECT * FROM usage_records" + predicate + " ORDER BY day, hour, timestamp, request_id",
                 params,
             ).fetchall()
         finally:
             reader.close()
-        if model:
-            # Model filters are matched on the canonical name so that a relay
-            # prefix such as "deepseek/deepseek-flash" still matches a
-            # "deepseek-flash" selection.
-            wanted = canonical_model(model)
-            rows = [row for row in rows if canonical_model(row["model"]) == wanted]
         return rows
+
+    @staticmethod
+    def _parse_local_date(value: str) -> _dt.date:
+        if not isinstance(value, str):
+            raise ValueError("date must use YYYY-MM-DD format")
+        try:
+            parsed = _dt.date.fromisoformat(value)
+        except ValueError:
+            raise ValueError("date must use YYYY-MM-DD format") from None
+        if parsed.isoformat() != value:
+            raise ValueError("date must use YYYY-MM-DD format")
+        return parsed
+
+    def _thread_relationship_map(self) -> Dict[str, Optional[str]]:
+        with self._lock:
+            return {row["thread_key"]: row["parent_thread_key"] for row in
+                    self._connection.execute("SELECT thread_key,parent_thread_key FROM thread_relationships")}
+
+    @staticmethod
+    def _root_thread_key(thread_key: Optional[str], relations: Mapping[str, Optional[str]]) -> Optional[str]:
+        if not thread_key:
+            return None
+        current = str(thread_key)
+        seen = set()
+        while current in relations and relations[current] and current not in seen:
+            seen.add(current)
+            current = str(relations[current])
+        return current
+
+    def _filter_sql(
+        self, *, days=0, provider=None, workspace=None, model=None,
+        start_date=None, end_date=None, task_id=None,
+    ) -> Tuple[str, List[Any]]:
+        where: List[str] = []
+        params: List[Any] = []
+        if start_date is not None or end_date is not None:
+            if not start_date or not end_date:
+                raise ValueError("start_date and end_date must be supplied together")
+            start, end = self._parse_local_date(start_date), self._parse_local_date(end_date)
+            if start > end:
+                raise ValueError("start_date must not be after end_date")
+            where.append("day >= ? AND day <= ?")
+            params.extend((start.isoformat(), end.isoformat()))
+        elif days is not None and int(days) > 0:
+            today = self._local_now().date()
+            cutoff = today - _dt.timedelta(days=int(days) - 1)
+            where.append("day >= ? AND day <= ?")
+            params.extend((cutoff.isoformat(), today.isoformat()))
+        providers = self.catalog.resolve(provider)
+        if providers:
+            where.append("provider IN (%s)" % ",".join("?" for _ in providers))
+            params.extend(providers)
+        if workspace:
+            where.append("workspace = ?")
+            params.append(workspace)
+        if model:
+            where.append("canonical_model(model) = ?")
+            params.append(canonical_model(model))
+        if task_id:
+            relations = self._thread_relationship_map()
+            task_root = str(task_id)
+            members = {key for key in relations
+                       if self._root_thread_key(key, relations) == task_root}
+            members.add(task_root)
+            if members:
+                where.append("thread_key IN (%s)" % ",".join("?" for _ in members))
+                params.extend(sorted(members))
+            else:
+                where.append("0=1")
+        predicate = (" WHERE " + " AND ".join(where)) if where else ""
+        return predicate, params
+
+    def _query_filtered_rows(
+        self, *, days=0, provider=None, workspace=None, model=None,
+        start_date=None, end_date=None, task_id=None,
+    ) -> List[sqlite3.Row]:
+        predicate, params = self._filter_sql(days=days, provider=provider, workspace=workspace,
+            model=model, start_date=start_date, end_date=end_date, task_id=task_id)
+        reader = sqlite3.connect(str(self.db_path), timeout=5.0)
+        try:
+            reader.row_factory = sqlite3.Row
+            reader.create_function("canonical_model", 1, canonical_model)
+            return reader.execute(
+                "SELECT * FROM usage_records" + predicate + " ORDER BY day,hour,timestamp,request_id",
+                params).fetchall()
+        finally:
+            reader.close()
+
+    def _request_dict(self, row: Mapping[str, Any], relations=None) -> Dict[str, Any]:
+        relations = relations or self._thread_relationship_map()
+        thread_key = row["thread_key"]
+        parent_key = row["parent_thread_key"]
+        task_id = self._root_thread_key(thread_key, relations) or row["task_id"]
+        rate_value = (row["effective_rate_snapshot"] if "effective_rate_snapshot" in row.keys()
+                      else row["rate_snapshot"])
+        rate_snapshot = self._json_object(rate_value)
+        breakdown = self._json_object(row["cost_breakdown_before_discount"])
+        return {
+            "request_id": str(row["request_id"]),
+            "timestamp": str(row["timestamp"]),
+            "provider": str(row["provider"]),
+            "provider_label": self.catalog.label(row["provider"]),
+            "model": str(row["model"]),
+            "workspace": str(row["workspace"]),
+            "input_tokens": int(row["input_tokens"] or 0),
+            "output_tokens": int(row["output_tokens"] or 0),
+            "cached_input_tokens": int(row["cached_input_tokens"] or 0),
+            "cache_write_input_tokens": int(row["cache_write_input_tokens"] or 0),
+            "fresh_input_tokens": _fresh_input_tokens(
+                row["input_tokens"], row["cached_input_tokens"], row["cache_write_input_tokens"]),
+            "fresh_input_tokens_estimated": not (
+                bool(row["cache_read_available"]) and bool(row["cache_write_available"])),
+            "reasoning_output_tokens": int(row["reasoning_output_tokens"] or 0),
+            "total_tokens": int(row["total_tokens"] or 0),
+            "cache_read_available": bool(row["cache_read_available"]),
+            "cache_write_available": bool(row["cache_write_available"]),
+            "task_id": task_id,
+            "thread_key": thread_key,
+            "parent_thread_key": parent_key,
+            "agent_role": row["agent_role"] or "unknown",
+            "cost_before_discount_usd": _as_float(row["cost_before_discount_usd"]),
+            "cost_after_discount_usd": _as_float(row["cost_after_discount_usd"]),
+            "pricing_status": str(row["pricing_status"] or "unpriced"),
+            "rate_snapshot": rate_snapshot,
+            "cost_multiplier": _as_float(row["cost_multiplier"]),
+            "cost_breakdown_before_discount": breakdown,
+            "cache_savings_before_discount_usd": _as_float(row["cache_savings_before_discount_usd"]),
+            "cache_savings_after_discount_usd": _as_float(row["cache_savings_after_discount_usd"]),
+            "ttft_ms": _as_float(row["ttft_ms"]),
+            "speed_duration_ms": float(row["speed_duration_ms"] or 0),
+            "speed_group_key": row["speed_group_key"],
+        }
+
+    def requests(
+        self, *, days=30, provider=None, workspace=None, model=None, start_date=None,
+        end_date=None, page=1, page_size=50, sort="time_desc", task_id=None, cost_mode="after",
+    ) -> Dict[str, Any]:
+        if type(page) is not int or page < 1:
+            raise ValueError("page must be a positive integer")
+        if type(page_size) is not int or not 1 <= page_size <= 500:
+            raise ValueError("page_size must be between 1 and 500")
+        if sort not in ("time_desc", "token_desc", "cost_desc"):
+            raise ValueError("sort must be time_desc, token_desc, or cost_desc")
+        if cost_mode not in ("before", "after"):
+            raise ValueError("cost_mode must be before or after")
+        offset = (page - 1) * page_size
+        predicate, params = self._filter_sql(
+            days=days, provider=provider, workspace=workspace, model=model,
+            start_date=start_date, end_date=end_date, task_id=task_id)
+        order = {
+            "time_desc": "timestamp DESC, request_id DESC",
+            "token_desc": "total_tokens DESC, timestamp DESC, request_id DESC",
+            "cost_desc": "(cost_%s_discount_usd IS NULL) ASC, cost_%s_discount_usd DESC, timestamp DESC, request_id DESC" % (cost_mode, cost_mode),
+        }[sort]
+        reader = sqlite3.connect(str(self.db_path), timeout=5.0)
+        try:
+            reader.row_factory = sqlite3.Row
+            reader.create_function("canonical_model", 1, canonical_model)
+            total = int(reader.execute("SELECT COUNT(*) FROM usage_records" + predicate, params).fetchone()[0])
+            selected = reader.execute("SELECT * FROM usage_records" + predicate +
+                " ORDER BY " + order + " LIMIT ? OFFSET ?", [*params, page_size, offset]).fetchall()
+        finally:
+            reader.close()
+        self.catalog.reload()
+        relations = self._thread_relationship_map()
+        return {
+            "data": [self._request_dict(row, relations) for row in selected],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+
+    def request_detail(self, request_id: str) -> Optional[Dict[str, Any]]:
+        if not isinstance(request_id, str) or len(request_id) != 64:
+            return None
+        try:
+            key = bytes.fromhex(request_id)
+        except ValueError:
+            return None
+        with self._lock:
+            row = self._connection.execute("""SELECT lower(hex(r.logical_key)) AS request_id,
+                s.*, COALESCE(p.snapshot_json,s.rate_snapshot) AS effective_rate_snapshot,
+                c.provider,c.model,c.workspace FROM history_requests r
+                JOIN history_snapshots s ON s.id=r.snapshot_id
+                JOIN history_contexts c ON c.id=s.context_id
+                LEFT JOIN pricing_snapshots p ON p.id=s.rate_snapshot_id
+                WHERE r.logical_key=?""", (key,)).fetchone()
+        if not row:
+            return None
+        self.catalog.reload()
+        return self._request_dict(row)
+
+    def tasks(
+        self, *, days=30, provider=None, workspace=None, model=None, start_date=None, end_date=None,
+    ) -> Dict[str, Any]:
+        rows = self._query_filtered_rows(days=days, provider=provider, workspace=workspace,
+                                         model=model, start_date=start_date, end_date=end_date)
+        self.catalog.reload()
+        relations = self._thread_relationship_map()
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            thread_key = row["thread_key"]
+            task_id = self._root_thread_key(thread_key, relations) or row["task_id"]
+            if not task_id:
+                continue
+            task = grouped.setdefault(str(task_id), {
+                "task_id": str(task_id), "workspace": str(row["workspace"]),
+                "summary": self._empty_metrics(), "agents": {},
+            })
+            quote = self._stored_quote(row)
+            self._add_metrics(task["summary"], row, quote)
+            role = str(row["agent_role"] or ("subagent" if row["parent_thread_key"] else "main"))
+            agent_key = (str(thread_key or "unknown"), str(row["model"]))
+            agent = task["agents"].setdefault(agent_key, {
+                "thread_key": thread_key, "parent_thread_key": row["parent_thread_key"],
+                "agent_role": role, "model": str(row["model"]),
+                "summary": self._empty_metrics(),
+            })
+            self._add_metrics(agent["summary"], row, quote)
+            if role == "main":
+                task["workspace"] = str(row["workspace"])
+        output = []
+        for task in grouped.values():
+            agents = sorted(task["agents"].values(), key=lambda item: (
+                item["agent_role"] != "main", str(item["thread_key"]), item["model"]))
+            for agent in agents:
+                agent["summary"] = self._metrics_aliases(agent["summary"])
+            task["summary"] = self._metrics_aliases(task["summary"])
+            task["agents"] = agents
+            output.append(task)
+        output.sort(key=lambda item: (-item["summary"]["total_tokens"], item["task_id"]))
+        return {"data": output}
+
+    def scan_options(self) -> Dict[str, Any]:
+        with self._lock:
+            values = {row["key"]: row["value"] for row in self._connection.execute(
+                "SELECT key,value FROM history_meta WHERE key IN ('auto_scan','scan_interval_seconds')")}
+        try:
+            interval = float(values.get("scan_interval_seconds", "2"))
+        except (TypeError, ValueError):
+            interval = 2.0
+        interval = min(86400.0, max(0.25, interval))
+        auto_scan = values.get("auto_scan", "1").strip().casefold() not in ("0", "false", "no")
+        return {"auto_scan": auto_scan, "interval_seconds": interval}
+
+    def set_scan_options(self, auto_scan: Any, interval_seconds: Any) -> Dict[str, Any]:
+        if type(auto_scan) is not bool:
+            raise ValueError("auto_scan must be a boolean")
+        if isinstance(interval_seconds, bool) or not isinstance(interval_seconds, (int, float)):
+            raise ValueError("interval_seconds must be a number")
+        interval = float(interval_seconds)
+        if not math.isfinite(interval) or not 0.25 <= interval <= 86400:
+            raise ValueError("interval_seconds must be between 0.25 and 86400")
+        with self._lock:
+            self._connection.execute("INSERT OR REPLACE INTO history_meta(key,value) VALUES ('auto_scan',?)",
+                                     ("1" if auto_scan else "0",))
+            self._connection.execute("INSERT OR REPLACE INTO history_meta(key,value) VALUES ('scan_interval_seconds',?)",
+                                     (str(interval),))
+            self._connection.commit()
+        return {"auto_scan": auto_scan, "interval_seconds": interval}
+
+    def pricing_settings(self) -> Dict[str, Any]:
+        with self._lock:
+            return {"rules": self._stored_pricing_rules(), "catalog": self.pricing.metadata()}
+
+    def set_pricing_rules(self, rules: Any) -> Dict[str, Any]:
+        normalized = validate_pricing_rules(rules)
+        encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        rules_hash = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        with self._lock:
+            self._connection.execute("""INSERT OR REPLACE INTO pricing_config
+                (id,rules_json,rules_hash,updated_at) VALUES (1,?,?,?)""",
+                (encoded, rules_hash, _now_iso()))
+            self._connection.commit()
+            self.pricing = PricingCatalog(rules=normalized)
+        with self._query_lock:
+            self._dashboard_cache.clear()
+        return self.pricing_settings()
+
+    def _pricing_rules_hash(self) -> str:
+        rules = validate_pricing_rules(getattr(self.pricing, "rules", []))
+        encoded = json.dumps(rules, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _reprice_data_hash(rows: Sequence[Mapping[str, Any]]) -> str:
+        data = []
+        for row in sorted(rows, key=lambda item: str(item["request_id"])):
+            data.append([
+                row["request_id"], row["timestamp"], row["provider"], row["model"], row["workspace"],
+                *(int(row[name] or 0) for name in DashboardDB._token_columns()),
+                row["rate_snapshot"], row["cost_before_discount_usd"],
+                row["cost_after_discount_usd"],
+            ])
+        return hashlib.sha256(json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+                              .encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _quote_totals(rows: Sequence[Mapping[str, Any]], quotes: Sequence[Mapping[str, Any]]) -> Tuple[float, float, int]:
+        before = 0.0
+        after = 0.0
+        unpriced = 0
+        for quote in quotes:
+            if quote["pricing_status"] == "unpriced":
+                unpriced += 1
+                continue
+            before += float(quote["cost_before_discount_usd"] or 0)
+            after += float(quote["cost_after_discount_usd"] or 0)
+        return round(before, 8), round(after, 8), unpriced
+
+    def reprice_preview(
+        self, *, days=0, provider=None, workspace=None, model=None,
+        start_date=None, end_date=None,
+    ) -> Dict[str, Any]:
+        filters = {"days": int(days or 0), "provider": provider, "workspace": workspace,
+                   "model": model, "start_date": start_date, "end_date": end_date}
+        # Match scan/dashboard lock order and hold a stable view through quote,
+        # data hashing, and preview persistence. A concurrent scan or price edit
+        # must invalidate this preview rather than mix two generations.
+        with self._query_lock, self._lock:
+            rows = self._query_filtered_rows(**filters)
+            new_quotes = [self._quote_for_usage(
+                row["model"], row["provider"], row["timestamp"], row["input_tokens"],
+                row["cached_input_tokens"], row["cache_write_input_tokens"], row["output_tokens"])
+                for row in rows]
+            old_quotes = [self._stored_quote(row) for row in rows]
+            old_before, old_after, _old_unpriced = self._quote_totals(rows, old_quotes)
+            new_before, new_after, unpriced = self._quote_totals(rows, new_quotes)
+            token = uuid.uuid4().hex
+            now = _dt.datetime.now(_dt.timezone.utc)
+            expires = now + _dt.timedelta(minutes=15)
+            rules_hash = self._pricing_rules_hash()
+            data_hash = self._reprice_data_hash(rows)
+            self._connection.execute("DELETE FROM reprice_previews WHERE expires_at < ?", (now.isoformat(),))
+            self._connection.execute("""INSERT INTO reprice_previews
+                (token,filters_json,rules_hash,data_hash,request_count,created_at,expires_at)
+                VALUES (?,?,?,?,?,?,?)""", (
+                token, json.dumps(filters, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                rules_hash, data_hash, len(rows), now.isoformat(), expires.isoformat()))
+            self._connection.commit()
+        return {
+            "request_count": len(rows),
+            "cost_before_discount_usd": new_before,
+            "cost_after_discount_usd": new_after,
+            "previous_cost_before_discount_usd": old_before,
+            "previous_cost_after_discount_usd": old_after,
+            "unpriced_request_count": unpriced,
+            "preview_token": token,
+        }
+
+    def reprice_apply(self, preview_token: str) -> Dict[str, Any]:
+        if not isinstance(preview_token, str) or len(preview_token) != 32:
+            raise ValueError("invalid or expired preview")
+        with self._lock:
+            preview = self._connection.execute(
+                "SELECT * FROM reprice_previews WHERE token=?", (preview_token,)).fetchone()
+            if not preview:
+                raise ValueError("invalid or expired preview")
+            try:
+                expires = _dt.datetime.fromisoformat(preview["expires_at"])
+                filters = json.loads(preview["filters_json"])
+            except (ValueError, TypeError):
+                raise ValueError("invalid or expired preview") from None
+            if expires <= _dt.datetime.now(_dt.timezone.utc):
+                self._connection.execute("DELETE FROM reprice_previews WHERE token=?", (preview_token,))
+                self._connection.commit()
+                raise ValueError("invalid or expired preview")
+            if preview["rules_hash"] != self._pricing_rules_hash():
+                self._connection.execute("DELETE FROM reprice_previews WHERE token=?", (preview_token,))
+                self._connection.commit()
+                raise ValueError("pricing settings changed after preview")
+            rows = self._query_filtered_rows(**filters)
+            if len(rows) != int(preview["request_count"]) or self._reprice_data_hash(rows) != preview["data_hash"]:
+                self._connection.execute("DELETE FROM reprice_previews WHERE token=?", (preview_token,))
+                self._connection.commit()
+                raise ValueError("usage data changed after preview")
+            stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup_path = self.db_path.parent / ("usage-reprice-%s-%s.sqlite3" % (stamp, uuid.uuid4().hex[:8]))
+            backup = sqlite3.connect(str(backup_path), timeout=5.0)
+            try:
+                self._connection.backup(backup)
+                check = backup.execute("PRAGMA integrity_check").fetchone()
+                if not check or check[0] != "ok":
+                    raise sqlite3.DatabaseError("reprice backup integrity check failed")
+            finally:
+                backup.close()
+            updated = 0
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                for row in rows:
+                    key = bytes.fromhex(str(row["request_id"]))
+                    stored = self._connection.execute("""SELECT r.snapshot_id,r.retained_snapshot_id,s.*,
+                        c.provider,c.model,c.workspace FROM history_requests r
+                        JOIN history_snapshots s ON s.id=r.snapshot_id
+                        JOIN history_contexts c ON c.id=s.context_id WHERE r.logical_key=?""", (key,)).fetchone()
+                    if not stored:
+                        raise ValueError("usage data changed after preview")
+                    new_snapshot = self._store_snapshot(key, dict(stored), force_reprice=True)
+                    self._connection.execute("""UPDATE history_requests SET snapshot_id=?,
+                        retained_snapshot_id=CASE WHEN retained_snapshot_id IS NULL THEN NULL ELSE ? END
+                        WHERE logical_key=?""", (new_snapshot, new_snapshot, key))
+                    self._connection.execute("UPDATE history_sources SET snapshot_id=? WHERE logical_key=?",
+                                             (new_snapshot, key))
+                    updated += 1
+                self._connection.execute("DELETE FROM reprice_previews WHERE token=?", (preview_token,))
+                self._rebuild_logical_records([bytes.fromhex(str(row["request_id"])) for row in rows])
+                self._collect_unused_snapshots()
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+            self._data_version += 1
+            self._dashboard_cache.clear()
+        return {"updated_count": updated, "backup_path": str(backup_path)}
 
     @staticmethod
     def _empty_metrics() -> Dict[str, Any]:
@@ -1612,6 +2421,15 @@ class DashboardDB:
             "total_tokens": 0,
             "request_count": 0,
             "estimated_cost_usd": 0.0,
+            "cost_before_discount_usd": 0.0,
+            "cost_after_discount_usd": 0.0,
+            "cache_savings_before_discount_usd": 0.0,
+            "cache_savings_after_discount_usd": 0.0,
+            "fresh_input_tokens": 0,
+            "cache_read_available_count": 0,
+            "cache_write_available_count": 0,
+            "cache_read_input_tokens": 0,
+            "_cache_read_cached_tokens": 0,
             "priced_tokens": 0,
             "unpriced_tokens": 0,
             "priced_request_count": 0,
@@ -1619,7 +2437,13 @@ class DashboardDB:
             "speed_output_tokens": 0,
             "speed_duration_ms": 0.0,
             "speed_sample_count": 0,
+            "ttft_sample_count": 0,
+            "_ttft_keys": set(),
+            "_ttft_values": [],
             "_speed_keys": set(),
+            "_speed_candidate_keys": set(),
+            "_speed_exclusion_keys": set(),
+            "_speed_exclusions": {},
         }
 
     @staticmethod
@@ -1635,18 +2459,77 @@ class DashboardDB:
             target[key] += int(row[key] or 0)
         target["request_count"] += 1
         speed_key = row["speed_group_key"]
-        if speed_key and speed_key not in target["_speed_keys"]:
+        request_id = str(row["request_id"] if "request_id" in row.keys() else "")
+        candidate_key = str(speed_key or request_id)
+        if candidate_key:
+            target["_speed_candidate_keys"].add(candidate_key)
+        if speed_key and speed_key not in target["_speed_keys"] and float(row["speed_duration_ms"] or 0) > 0:
             target["_speed_keys"].add(speed_key)
             target["speed_sample_count"] += 1
-            target["speed_output_tokens"] += int(row["speed_output_tokens"])
-            target["speed_duration_ms"] += float(row["speed_duration_ms"])
-        if quote.is_priced:
-            target["estimated_cost_usd"] += float(quote.estimated_cost_usd)
+            target["speed_output_tokens"] += int(row["speed_output_tokens"] or 0)
+            target["speed_duration_ms"] += float(row["speed_duration_ms"] or 0)
+        exclusion = row["speed_exclusion_reason"] if "speed_exclusion_reason" in row.keys() else None
+        if exclusion and exclusion != "outside_sample_day" and candidate_key and candidate_key not in target["_speed_exclusion_keys"]:
+            target["_speed_exclusion_keys"].add(candidate_key)
+            target["_speed_exclusions"][str(exclusion)] = target["_speed_exclusions"].get(str(exclusion), 0) + 1
+        ttft = _as_float(row["ttft_ms"] if "ttft_ms" in row.keys() else None)
+        ttft_key = str(speed_key or request_id)
+        if ttft and ttft > 0 and ttft_key and ttft_key not in target["_ttft_keys"]:
+            target["_ttft_keys"].add(ttft_key)
+            target["_ttft_values"].append(ttft)
+            target["ttft_sample_count"] += 1
+        target["fresh_input_tokens"] += _fresh_input_tokens(
+            row["input_tokens"], row["cached_input_tokens"], row["cache_write_input_tokens"])
+        target["cache_read_available_count"] += int(bool(row["cache_read_available"]))
+        target["cache_write_available_count"] += int(bool(row["cache_write_available"]))
+        if bool(row["cache_read_available"]):
+            target["cache_read_input_tokens"] += int(row["input_tokens"] or 0)
+            target["_cache_read_cached_tokens"] += int(row["cached_input_tokens"] or 0)
+        if quote["is_priced"]:
+            before = float(quote["cost_before_discount_usd"] or 0)
+            after = float(quote["cost_after_discount_usd"] or 0)
+            target["cost_before_discount_usd"] += before
+            target["cost_after_discount_usd"] += after
+            target["estimated_cost_usd"] += after
+            target["cache_savings_before_discount_usd"] += float(quote["cache_savings_before_discount_usd"] or 0)
+            target["cache_savings_after_discount_usd"] += float(quote["cache_savings_after_discount_usd"] or 0)
             target["priced_tokens"] += int(row["total_tokens"] or 0)
             target["priced_request_count"] += 1
         else:
             target["unpriced_tokens"] += int(row["total_tokens"] or 0)
             target["unpriced_request_count"] += 1
+
+    def _stored_quote(self, row: Mapping[str, Any]) -> Dict[str, Any]:
+        status = str(row["pricing_status"] or "unpriced")
+        before = _as_float(row["cost_before_discount_usd"])
+        after = _as_float(row["cost_after_discount_usd"])
+        rate_snapshot = self._json_object(row["rate_snapshot"])
+        is_priced = status in ("priced", "free")
+        if is_priced and (before is None or after is None):
+            result = self._quote_for_usage(
+                row["model"], row["provider"], row["timestamp"], row["input_tokens"],
+                row["cached_input_tokens"], row["cache_write_input_tokens"], row["output_tokens"],
+                rate_snapshot=rate_snapshot or None)
+            before = result["cost_before_discount_usd"]
+            after = result["cost_after_discount_usd"]
+            status = result["pricing_status"]
+        return {
+            "is_priced": is_priced,
+            "pricing_status": status,
+            "cost_before_discount_usd": before,
+            "cost_after_discount_usd": after,
+            "estimated_cost_usd": after,
+            "cost_multiplier": (_as_float(row["cost_multiplier"])
+                                if _as_float(row["cost_multiplier"]) is not None else 1.0),
+            "rate_snapshot": rate_snapshot,
+            "cost_breakdown_before_discount": self._json_object(row["cost_breakdown_before_discount"]),
+            "cache_savings_before_discount_usd": _as_float(row["cache_savings_before_discount_usd"]),
+            "cache_savings_after_discount_usd": _as_float(row["cache_savings_after_discount_usd"]),
+            "pricing_model": rate_snapshot.get("model"),
+            "rate_band": rate_snapshot.get("rate_band"),
+            "source_url": rate_snapshot.get("source"),
+            "note": rate_snapshot.get("note"),
+        }
 
     @staticmethod
     def _metrics_aliases(metrics: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1654,13 +2537,34 @@ class DashboardDB:
         # *_tokens names remain canonical and unambiguous.
         aliases = {
             **{key: int(value) for key, value in metrics.items()
-               if key not in ("estimated_cost_usd", "speed_duration_ms", "_speed_keys")},
+               if key not in ("estimated_cost_usd", "cost_before_discount_usd",
+                              "cost_after_discount_usd", "cache_savings_before_discount_usd",
+                              "cache_savings_after_discount_usd", "speed_duration_ms",
+                              "_speed_keys", "_ttft_keys", "_ttft_values",
+                              "_speed_candidate_keys", "_speed_exclusion_keys", "_speed_exclusions",
+                              "_cache_read_cached_tokens")},
             "speed_duration_ms": float(metrics["speed_duration_ms"]),
             "output_tokens_per_second": (round(metrics["speed_output_tokens"] * 1000 / metrics["speed_duration_ms"], 4)
                                         if metrics["speed_duration_ms"] > 0 else None),
-            "estimated_cost_usd": round(float(metrics.get("estimated_cost_usd", 0.0)), 8),
+            "estimated_cost_usd": round(float(metrics.get("cost_after_discount_usd", 0.0)), 8),
+            "cost_before_discount_usd": round(float(metrics.get("cost_before_discount_usd", 0.0)), 8),
+            "cost_after_discount_usd": round(float(metrics.get("cost_after_discount_usd", 0.0)), 8),
+            "cache_savings_before_discount_usd": round(float(metrics.get("cache_savings_before_discount_usd", 0.0)), 8),
+            "cache_savings_after_discount_usd": round(float(metrics.get("cache_savings_after_discount_usd", 0.0)), 8),
+            "ttft_median_ms": DashboardDB._percentile_float(metrics.get("_ttft_values", []), 0.50),
+            "ttft_p90_ms": DashboardDB._percentile_float(metrics.get("_ttft_values", []), 0.90),
+            "ttft_coverage": (int(metrics.get("ttft_sample_count", 0)) / int(metrics.get("request_count", 0))
+                              if int(metrics.get("request_count", 0)) else 0.0),
+            "cache_hit_rate": (int(metrics.get("_cache_read_cached_tokens", 0)) /
+                               int(metrics.get("cache_read_input_tokens", 0))
+                               if int(metrics.get("cache_read_input_tokens", 0)) else None),
+            "speed_coverage": (int(metrics.get("speed_sample_count", 0)) /
+                               (int(metrics.get("speed_sample_count", 0)) + len(metrics.get("_speed_exclusion_keys", set())))
+                               if (int(metrics.get("speed_sample_count", 0)) + len(metrics.get("_speed_exclusion_keys", set()))) else 0.0),
+            "speed_exclusions": dict(metrics.get("_speed_exclusions", {})),
             "input": int(metrics["input_tokens"]),
             "output": int(metrics["output_tokens"]),
+            "cache": int(metrics["cached_input_tokens"]),
             "cached": int(metrics["cached_input_tokens"]),
             "cache_write": int(metrics["cache_write_input_tokens"]),
             "reasoning": int(metrics["reasoning_output_tokens"]),
@@ -1686,16 +2590,32 @@ class DashboardDB:
         fraction = rank - lower
         return int(round(ordered[lower] + (ordered[upper] - ordered[lower]) * fraction))
 
-    def dashboard(self, days=30, provider=None, workspace=None, model=None):
+    @staticmethod
+    def _percentile_float(values: Sequence[float], percentile: float) -> Optional[float]:
+        if not values:
+            return None
+        ordered = sorted(float(value) for value in values)
+        if len(ordered) == 1:
+            return round(ordered[0], 3)
+        rank = (len(ordered) - 1) * percentile
+        lower = int(rank)
+        upper = min(lower + 1, len(ordered) - 1)
+        fraction = rank - lower
+        return round(ordered[lower] + (ordered[upper] - ordered[lower]) * fraction, 3)
+
+    def dashboard(self, days=30, provider=None, workspace=None, model=None,
+                  start_date=None, end_date=None, compare=False):
         # Serialize cache population; repeated SSE/filter requests reuse aggregates.
         with self._query_lock:
             self.catalog.reload()
             key = (self._data_version, self._local_now().date().isoformat(),
-                   days, provider, workspace, model, repr(self.catalog.__dict__))
+                   days, provider, workspace, model, start_date, end_date, bool(compare),
+                   repr(self.catalog.__dict__), repr(getattr(self.pricing, "rules", [])))
             if key not in self._dashboard_cache:
                 if len(self._dashboard_cache) >= 16:
                     self._dashboard_cache.clear()
-                self._dashboard_cache[key] = self._build_dashboard(days, provider, workspace, model)
+                self._dashboard_cache[key] = self._build_dashboard(
+                    days, provider, workspace, model, start_date, end_date, bool(compare))
             return self._dashboard_cache[key]
 
     def _build_dashboard(
@@ -1704,12 +2624,15 @@ class DashboardDB:
         provider: Optional[str] = None,
         workspace: Optional[str] = None,
         model: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        compare: bool = False,
     ) -> Dict[str, Any]:
         # Display labels and filter aliases are configuration, not immutable
         # cached data. Reloading here makes provider renames immediately
         # visible for historical rows without rescanning rollout files.
         self.catalog.reload()
-        available = self._fetch_rows(days, None, None)
+        available = self._fetch_rows(days, None, None, start_date=start_date, end_date=end_date)
         selected_model = model
         providers = self.catalog.resolve(provider)
         # Relay and provider routers report the same model under different
@@ -1734,14 +2657,7 @@ class DashboardDB:
         request_sizes: List[int] = []
         provider_groups: Dict[str, Dict[str, str]] = {}
         for row in rows:
-            quote = self.pricing.quote(
-                row["model"],
-                timestamp=row["timestamp"],
-                input_tokens=int(row["input_tokens"] or 0),
-                cached_input_tokens=int(row["cached_input_tokens"] or 0),
-                cache_write_input_tokens=int(row["cache_write_input_tokens"] or 0),
-                output_tokens=int(row["output_tokens"] or 0),
-            )
+            quote = self._stored_quote(row)
             self._add_metrics(summary, row, quote)
             request_sizes.append(int(row["total_tokens"] or 0))
             workspace_key = str(row["workspace"])
@@ -1765,17 +2681,18 @@ class DashboardDB:
             model_source_names.setdefault(model_key, set()).add(str(row["model"]))
             pricing_group = model_pricing_groups.setdefault(
                 model_key,
-                {"models": set(), "bands": set(), "sources": set(), "notes": set()},
+                {"models": set(), "bands": set(), "sources": set(), "notes": set(), "statuses": set()},
             )
-            if quote.pricing_model:
-                pricing_group["models"].add(str(quote.pricing_model))
-            if quote.rate_band:
-                pricing_group["bands"].add(str(quote.rate_band))
-            if quote.source_url:
-                pricing_group["sources"].add(str(quote.source_url))
-            if quote.note:
-                pricing_group["notes"].add(str(quote.note))
-            if not quote.is_priced:
+            pricing_group["statuses"].add(str(quote["pricing_status"]))
+            if quote["pricing_model"]:
+                pricing_group["models"].add(str(quote["pricing_model"]))
+            if quote["rate_band"]:
+                pricing_group["bands"].add(str(quote["rate_band"]))
+            if quote["source_url"]:
+                pricing_group["sources"].add(str(quote["source_url"]))
+            if quote["note"]:
+                pricing_group["notes"].add(str(quote["note"]))
+            if not quote["is_priced"]:
                 unpriced_key = (str(row["provider"]), canonical)
                 unpriced_model_groups[unpriced_key] = (
                     unpriced_model_groups.get(unpriced_key, 0)
@@ -1811,7 +2728,7 @@ class DashboardDB:
                 pricing_status = "unpriced"
             pricing_group = model_pricing_groups.get(
                 (day, provider_id, provider_label, model),
-                {"models": set(), "bands": set(), "sources": set(), "notes": set()},
+                {"models": set(), "bands": set(), "sources": set(), "notes": set(), "statuses": set()},
             )
             item = {
                 "date": day,
@@ -1886,11 +2803,33 @@ class DashboardDB:
             )
         ]
 
+        effective_start = start_date
+        effective_end = end_date
+        if not effective_start and days is not None and days > 0:
+            effective_end = self._local_now().date().isoformat()
+            effective_start = (self._local_now().date() - _dt.timedelta(days=days - 1)).isoformat()
+        comparison = None
+        if compare and effective_start and effective_end:
+            current_start = self._parse_local_date(effective_start)
+            current_end = self._parse_local_date(effective_end)
+            period_days = (current_end - current_start).days + 1
+            previous_end = current_start - _dt.timedelta(days=1)
+            previous_start = previous_end - _dt.timedelta(days=period_days - 1)
+            previous = self._build_dashboard(
+                0, provider, workspace, model, previous_start.isoformat(), previous_end.isoformat(), False)
+            comparison = {
+                "summary": previous["summary"],
+                "start_date": previous_start.isoformat(),
+                "end_date": previous_end.isoformat(),
+            }
+
         return {
             "generated_at": _now_iso(),
             "timezone": self.timezone_name,
             "local_date": self._local_now().date().isoformat(),
             "days": days,
+            "start_date": effective_start,
+            "end_date": effective_end,
             "filters": {
                 "provider": provider,
                 "workspace": workspace,
@@ -1900,6 +2839,8 @@ class DashboardDB:
                 "model": selected_model,
             },
             "summary": summary_aliases,
+            "speed_exclusions": dict(summary_aliases["speed_exclusions"]),
+            "comparison": comparison,
             "pricing": pricing_metadata,
             "providers": [{"provider": key, "provider_label": label} for key, label in sorted(available_providers.items())],
             "workspaces": available_workspaces,
@@ -1958,10 +2899,13 @@ def default_roots() -> List[Path]:
 class DashboardService:
     """Scanner plus a small condition-based change stream for SSE clients."""
 
-    def __init__(self, database: DashboardDB, interval: float = 2.0) -> None:
+    def __init__(self, database: DashboardDB, interval: Optional[float] = None) -> None:
         self.database = database
-        self.interval = max(0.25, float(interval))
+        stored_options = database.scan_options()
+        self.interval = max(0.25, float(interval if interval is not None else stored_options["interval_seconds"]))
+        self.auto_scan = bool(stored_options["auto_scan"])
         self._stop = threading.Event()
+        self._wake_scan = threading.Event()
         self._changed = threading.Condition()
         self._version = 0
         self._thread: Optional[threading.Thread] = None
@@ -2013,7 +2957,7 @@ class DashboardService:
     def start(self, initial_refresh: bool = True) -> None:
         if self._thread and self._thread.is_alive():
             return
-        if initial_refresh:
+        if initial_refresh and self.auto_scan:
             try:
                 self.refresh()
             except Exception:
@@ -2025,7 +2969,15 @@ class DashboardService:
         self._thread.start()
 
     def _run(self) -> None:
-        while not self._stop.wait(self.interval):
+        while not self._stop.is_set():
+            woke = self._wake_scan.wait(self.interval)
+            self._wake_scan.clear()
+            if self._stop.is_set():
+                break
+            if woke:
+                continue
+            if not self.auto_scan:
+                continue
             try:
                 self.refresh()
             except Exception:
@@ -2033,10 +2985,19 @@ class DashboardService:
                 # keep the poller alive and let the next pass retry it.
                 continue
 
+    def set_scan_options(self, auto_scan: Any, interval_seconds: Any) -> Dict[str, Any]:
+        options = self.database.set_scan_options(auto_scan, interval_seconds)
+        with self._changed:
+            self.auto_scan = options["auto_scan"]
+            self.interval = options["interval_seconds"]
+            self._wake_scan.set()
+        return options
+
     def stop(self) -> None:
         self._stop.set()
+        self._wake_scan.set()
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=max(1.0, self.interval + 1.0))
+            self._thread.join(timeout=3.0)
 
     def wait_for_change(self, version: int, timeout: float = 15.0) -> int:
         with self._changed:
@@ -2105,6 +3066,72 @@ class DashboardHandler(BaseHTTPRequestHandler):
         parsed = parse_qs(urlparse(self.path).query, keep_blank_values=False)
         return {key: values[-1] for key, values in parsed.items() if values}
 
+    def _query_bool(self, name: str, default: bool = False) -> bool:
+        value = self._query().get(name)
+        if value is None:
+            return default
+        if value.casefold() in ("1", "true", "yes"):
+            return True
+        if value.casefold() in ("0", "false", "no"):
+            return False
+        raise ValueError("invalid boolean query parameter")
+
+    def _same_local_origin(self) -> bool:
+        if self.headers.get("X-Dashboard-Request") != "1":
+            return False
+        origin = self.headers.get("Origin")
+        host_header = self.headers.get("Host")
+        if not origin or not host_header:
+            return False
+        parsed = urlparse(origin)
+        if parsed.scheme != "http" or parsed.path not in ("", "/") \
+                or parsed.params or parsed.query or parsed.fragment or parsed.username or parsed.password:
+            return False
+        if parsed.netloc.casefold() != host_header.casefold():
+            return False
+        try:
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            return False
+        if not hostname or port != int(self.server.server_port):
+            return False
+        if hostname.casefold() == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            return False
+
+    def _read_mutation_json(self) -> Optional[Dict[str, Any]]:
+        if not self._same_local_origin():
+            self._write_json({"error": "forbidden_origin"}, HTTPStatus.FORBIDDEN)
+            return None
+        if self.headers.get("Transfer-Encoding"):
+            self._write_json({"error": "invalid_body"}, HTTPStatus.BAD_REQUEST)
+            return None
+        content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().casefold()
+        if content_type != "application/json":
+            self._write_json({"error": "invalid_content_type"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            return None
+        try:
+            length = int(self.headers.get("Content-Length", "-1"))
+        except ValueError:
+            length = -1
+        if not 0 <= length <= 1024 * 1024:
+            self._write_json({"error": "invalid_body_size"}, HTTPStatus.BAD_REQUEST)
+            return None
+        try:
+            raw = self.rfile.read(length)
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, OSError):
+            self._write_json({"error": "invalid_json"}, HTTPStatus.BAD_REQUEST)
+            return None
+        if not isinstance(value, dict):
+            self._write_json({"error": "invalid_body"}, HTTPStatus.BAD_REQUEST)
+            return None
+        return value
+
     def _write_static(self, filename: str) -> None:
         web_root = (APP_DIR / "web").resolve()
         path = (web_root / filename).resolve()
@@ -2131,7 +3158,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         service, _host = self.app
         route = urlparse(self.path).path
         static_routes = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js",
-                         "/data-settings.js": "data-settings.js", "/styles.css": "styles.css"}
+                         "/cache-metrics.js": "cache-metrics.js",
+                         "/layout.js": "layout.js",
+                         "/analytics.js": "analytics.js", "/data-settings.js": "data-settings.js",
+                         "/styles.css": "styles.css"}
         if route in static_routes:
             self._write_static(static_routes[route])
             return
@@ -2142,23 +3172,159 @@ class DashboardHandler(BaseHTTPRequestHandler):
             query = self._query()
             try:
                 days = int(query.get("days", "30"))
-            except ValueError:
-                days = 30
-            try:
+                compare = self._query_bool("compare", False)
                 value = service.database.dashboard(
                     days=days,
                     provider=query.get("provider"),
                     workspace=query.get("workspace"),
                     model=query.get("model"),
+                    start_date=query.get("start_date"),
+                    end_date=query.get("end_date"),
+                    compare=compare,
                 )
                 self._write_json(value)
+            except ValueError:
+                self._write_json({"error": "invalid_filters"}, HTTPStatus.BAD_REQUEST)
             except Exception:
                 self._write_json({"error": "dashboard_unavailable"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        if route == "/api/requests":
+            query = self._query()
+            try:
+                value = service.database.requests(
+                    days=int(query.get("days", "30")), provider=query.get("provider"),
+                    workspace=query.get("workspace"), model=query.get("model"),
+                    start_date=query.get("start_date"), end_date=query.get("end_date"),
+                    page=int(query.get("page", "1")), page_size=int(query.get("page_size", "50")),
+                    sort=query.get("sort", "time_desc"), task_id=query.get("task_id"),
+                    cost_mode=query.get("cost_mode", "after"))
+                self._write_json(value)
+            except ValueError:
+                self._write_json({"error": "invalid_filters"}, HTTPStatus.BAD_REQUEST)
+            except Exception:
+                self._write_json({"error": "requests_unavailable"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        if route == "/api/request":
+            request = service.database.request_detail(self._query().get("id", ""))
+            if request is None:
+                self._write_json({"error": "request_not_found"}, HTTPStatus.NOT_FOUND)
+            else:
+                self._write_json({"request": request})
+            return
+        if route == "/api/tasks":
+            query = self._query()
+            try:
+                value = service.database.tasks(
+                    days=int(query.get("days", "30")), provider=query.get("provider"),
+                    workspace=query.get("workspace"), model=query.get("model"),
+                    start_date=query.get("start_date"), end_date=query.get("end_date"))
+                self._write_json(value)
+            except ValueError:
+                self._write_json({"error": "invalid_filters"}, HTTPStatus.BAD_REQUEST)
+            except Exception:
+                self._write_json({"error": "tasks_unavailable"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        if route == "/api/diagnostics":
+            try:
+                database = service.database
+                with database._query_lock, database._lock:
+                    all_history = database.dashboard(days=0)
+                    formats = {"modern": 0, "legacy": 0}
+                    for row in database._connection.execute(
+                            "SELECT usage_format,COUNT(*) AS count FROM source_files GROUP BY usage_format"):
+                        if row["usage_format"] in formats:
+                            formats[row["usage_format"]] = int(row["count"])
+                    roots = []
+                    for root in database.roots:
+                        try:
+                            available = root.is_dir() and os.access(str(root), os.R_OK)
+                        except OSError:
+                            available = False
+                        roots.append({"path": str(root), "available": bool(available)})
+                    scan_options = database.scan_options()
+                    storage = database.storage_status()
+                    scan_health = service.health()
+                    diagnostics = {
+                        "scan": scan_health, "roots": roots, "formats": formats,
+                        "unpriced_models": all_history["pricing"].get("unpriced_model_usage", []),
+                        "scan_options": scan_options, "storage": storage,
+                        "speed_exclusions": all_history.get("speed_exclusions", {}),
+                    }
+                self._write_json(diagnostics)
+            except Exception:
+                self._write_json({"error": "diagnostics_unavailable"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        if route == "/api/pricing":
+            try:
+                self._write_json(service.database.pricing_settings())
+            except Exception:
+                self._write_json({"error": "pricing_unavailable"}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
         if route == "/api/events":
             self._events(service)
             return
         self._write_json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        self._write_json({"error": "cross_origin_preflight_not_allowed"}, HTTPStatus.FORBIDDEN)
+
+    def do_POST(self) -> None:  # noqa: N802
+        body = self._read_mutation_json()
+        if body is None:
+            return
+        route = urlparse(self.path).path
+        service, _host = self.app
+        try:
+            if route == "/api/pricing":
+                if set(body) != {"rules"} or not isinstance(body.get("rules"), list):
+                    self._write_json({"error": "invalid_pricing_rules"}, HTTPStatus.BAD_REQUEST)
+                    return
+                result = service.database.set_pricing_rules(body["rules"])
+                service.notify_change()
+                self._write_json(result)
+                return
+            if route == "/api/reprice/preview":
+                allowed = {"days", "provider", "workspace", "model", "start_date", "end_date"}
+                if set(body).difference(allowed):
+                    self._write_json({"error": "invalid_filters"}, HTTPStatus.BAD_REQUEST)
+                    return
+                result = service.database.reprice_preview(**body)
+                self._write_json(result)
+                return
+            if route == "/api/reprice":
+                if set(body) != {"preview_token"}:
+                    self._write_json({"error": "invalid_reprice_preview"}, HTTPStatus.BAD_REQUEST)
+                    return
+                result = service.database.reprice_apply(body["preview_token"])
+                service.notify_change()
+                self._write_json(result)
+                return
+            if route == "/api/scan/options":
+                if set(body) != {"auto_scan", "interval_seconds"}:
+                    self._write_json({"error": "invalid_scan_options"}, HTTPStatus.BAD_REQUEST)
+                    return
+                result = service.set_scan_options(body["auto_scan"], body["interval_seconds"])
+                self._write_json(result)
+                return
+            if route == "/api/scan/now":
+                if body:
+                    self._write_json({"error": "invalid_body"}, HTTPStatus.BAD_REQUEST)
+                    return
+                result = service.refresh()
+                self._write_json({"health": service.health(), "scan": result.as_dict()})
+                return
+            self._write_json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
+        except ValueError:
+            if route == "/api/reprice":
+                self._write_json({"error": "preview_invalid_or_stale"}, HTTPStatus.CONFLICT)
+            elif route == "/api/pricing":
+                self._write_json({"error": "invalid_pricing_rules"}, HTTPStatus.BAD_REQUEST)
+            elif route == "/api/scan/options":
+                self._write_json({"error": "invalid_scan_options"}, HTTPStatus.BAD_REQUEST)
+            else:
+                self._write_json({"error": "invalid_request"}, HTTPStatus.BAD_REQUEST)
+        except Exception:
+            self._write_json({"error": "operation_failed"}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def _events(self, service: DashboardService) -> None:
         self.send_response(HTTPStatus.OK)
@@ -2240,7 +3406,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _common_options(serve_parser)
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8765)
-    serve_parser.add_argument("--interval", type=float, default=2.0)
+    serve_parser.add_argument("--interval", type=float, default=None)
     serve_parser.add_argument("--no-open", action="store_true", help="do not open the dashboard in a browser")
 
     doctor_parser = subparsers.add_parser("doctor", help="check roots, SQLite, and parser availability")
@@ -2253,6 +3419,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     export_parser.add_argument("--workspace")
     export_parser.add_argument("--format", choices=("json", "csv"), default="json")
     export_parser.add_argument("--output", type=Path)
+    export_parser.add_argument("--cost-mode", choices=("before", "after"), default="after")
+    for filter_parser in (summary_parser, export_parser):
+        filter_parser.add_argument("--model")
+        filter_parser.add_argument("--start-date")
+        filter_parser.add_argument("--end-date")
+        filter_parser.add_argument("--compare", action="store_true")
 
     args = parser.parse_args(argv)
     db = _database_from_args(args)
@@ -2262,7 +3434,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
         if args.command == "summary":
             db.scan()
-            _print_json(db.dashboard(args.days, args.provider, args.workspace))
+            _print_json(db.dashboard(args.days, args.provider, args.workspace, args.model,
+                                     start_date=args.start_date, end_date=args.end_date, compare=args.compare))
             return 0
         if args.command == "doctor":
             roots = []
@@ -2279,11 +3452,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0 if usable else 1
         if args.command == "export":
             db.scan()
-            dashboard = db.dashboard(args.days, args.provider, args.workspace)
+            dashboard = db.dashboard(args.days, args.provider, args.workspace, args.model,
+                                     start_date=args.start_date, end_date=args.end_date, compare=args.compare)
             if args.format == "json":
                 output = json.dumps(dashboard, ensure_ascii=False, indent=2, sort_keys=True)
             else:
-                rows = dashboard["daily_model_usage"]
+                rows = [dict(row, cost_display_mode=args.cost_mode,
+                             displayed_cost_usd=row["cost_%s_discount_usd" % args.cost_mode],
+                             estimated_cost_usd=row["cost_%s_discount_usd" % args.cost_mode])
+                        for row in dashboard["daily_model_usage"]]
                 columns = [
                     "date",
                     "provider",
@@ -2304,6 +3481,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "speed_duration_ms",
                     "speed_sample_count",
                     "output_tokens_per_second",
+                    "cost_display_mode", "displayed_cost_usd", "cost_before_discount_usd", "cost_after_discount_usd",
+                    "fresh_input_tokens", "cache_read_available_count", "cache_write_available_count",
+                    "cache_read_input_tokens", "cache_hit_rate",
+                    "cache_savings_before_discount_usd", "cache_savings_after_discount_usd",
+                    "ttft_median_ms", "ttft_p90_ms", "ttft_sample_count", "ttft_coverage",
                 ]
                 import io
 

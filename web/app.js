@@ -7,6 +7,7 @@
   const HEALTH_REFRESH_MS = 15000;
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
+  const cacheMetrics = window.CodexCacheMetrics;
   const nf = new Intl.NumberFormat('zh-CN');
   const compactNf = new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 });
   const svgEscape = value => String(value == null ? '' : value).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
@@ -32,7 +33,10 @@
     tablePageSize: 50,
     preferencesLoading: false,
     preferencesLoaded: false,
-    theme: readTheme()
+    theme: readTheme(),
+    costMode: readCostMode(),
+    customStartDate: '',
+    customEndDate: ''
   };
 
   function readTheme() {
@@ -41,6 +45,11 @@
       if (saved === 'light' || saved === 'dark') return saved;
     } catch (_) { /* localStorage may be unavailable in a locked-down browser */ }
     return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+
+  function readCostMode() {
+    try { return localStorage.getItem('codex-token-cost-mode') === 'before' ? 'before' : 'after'; }
+    catch (_) { return 'after'; }
   }
 
   function desktopBridge() {
@@ -242,6 +251,10 @@
     return `${(toNumber(value) * 100).toFixed(toNumber(value) < .1 ? 1 : 0)}%`;
   }
 
+  function formatCachePercent(value, available) {
+    return cacheMetrics.formatPercent(value, available);
+  }
+
   function formatCurrency(value) {
     const number = Math.max(0, toNumber(value));
     const decimals = number >= 1 ? 2 : number >= .01 ? 4 : 6;
@@ -336,11 +349,16 @@
   function detailRow(item, fallbackDate = '') {
     const input = metricFrom(item, ['input', 'input_tokens', 'inputTokens', 'prompt_tokens', 'promptTokens']);
     const output = metricFrom(item, ['output', 'output_tokens', 'outputTokens', 'completion_tokens', 'completionTokens']);
-    const cache = metricFrom(item, ['cache', 'cached', 'cache_tokens', 'cached_input_tokens', 'cacheTokens', 'cached_tokens', 'cachedTokens', 'prompt_cache_hit_tokens']);
-    const cacheWrite = metricFrom(item, ['cache_write', 'cache_write_input_tokens', 'cacheWriteInputTokens', 'cache_creation_input_tokens']);
+    const cache = metricFrom(item, ['cache', 'cache_read_tokens', 'cached', 'cache_tokens', 'cached_input_tokens', 'cacheTokens', 'cached_tokens', 'cachedTokens', 'prompt_cache_hit_tokens']);
+    const cacheWrite = metricFrom(item, ['cache_write', 'cache_write_tokens', 'cache_write_input_tokens', 'cacheWriteInputTokens', 'cache_creation_input_tokens']);
     const reasoning = metricFrom(item, ['reasoning', 'reasoning_tokens', 'reasoningTokens']);
     const totalValue = metricFrom(item, ['total', 'total_tokens', 'totalTokens', 'tokens']);
     const outputTokensPerSecond = pick(item, 'output_tokens_per_second');
+    const costBeforeRaw = pick(item, 'cost_before_discount_usd', 'costBeforeDiscountUsd');
+    const costAfterRaw = pick(item, 'cost_after_discount_usd', 'costAfterDiscountUsd');
+    const oldCost = metricFrom(item, ['estimated_cost_usd', 'estimated_cost', 'cost_usd']);
+    const cacheReadAvailability = pick(item, 'cache_read_available', 'cacheReadAvailable');
+    const cacheWriteAvailability = pick(item, 'cache_write_available', 'cacheWriteAvailable');
     const providerId = text(pick(item, 'provider_id', 'providerId', 'provider', 'vendor_id'));
     const providerLabel = text(pick(item, 'provider_label', 'providerLabel', 'provider_name', 'providerName', 'vendor'), providerId || '未知供应商');
     return {
@@ -348,10 +366,29 @@
       model: text(pick(item, 'model', 'model_name', 'modelName', 'model_id', 'modelId', 'name'), '未知模型'),
       provider: providerLabel,
       providerId,
+      workspace: text(pick(item, 'workspace', 'workspace_id', 'workspaceId')),
       input,
       output,
       cache,
       cacheWrite,
+      freshInput: metricFrom(item, ['fresh_input_tokens', 'freshInputTokens']),
+      cacheReadAvailable: cacheReadAvailability == null
+        ? (pick(item, 'cache_read_available_count', 'cacheReadAvailableCount') !== undefined
+          ? toNumber(pick(item, 'cache_read_available_count', 'cacheReadAvailableCount')) > 0
+          : ['cache', 'cache_read_tokens', 'cached_input_tokens', 'cached_tokens', 'prompt_cache_hit_tokens'].some(key => item[key] !== undefined))
+        : Boolean(cacheReadAvailability),
+      cacheWriteAvailable: cacheWriteAvailability == null ? ['cache_write', 'cache_write_tokens', 'cache_write_input_tokens', 'cache_creation_input_tokens'].some(key => item[key] !== undefined) : Boolean(cacheWriteAvailability),
+      cacheReadAvailableCount: pick(item, 'cache_read_available_count', 'cacheReadAvailableCount'),
+      cacheWriteAvailableCount: pick(item, 'cache_write_available_count', 'cacheWriteAvailableCount'),
+      cacheReadInputProvided: Object.prototype.hasOwnProperty.call(item, 'cache_read_input_tokens') || Object.prototype.hasOwnProperty.call(item, 'cacheReadInputTokens'),
+      cacheReadInput: Object.prototype.hasOwnProperty.call(item, 'cache_read_input_tokens') ? item.cache_read_input_tokens : pick(item, 'cacheReadInputTokens'),
+      cacheHitRate: Object.prototype.hasOwnProperty.call(item, 'cache_hit_rate') ? item.cache_hit_rate : pick(item, 'cacheHitRate'),
+      cacheSavingsBefore: pick(item, 'cache_savings_before_discount_usd', 'cacheSavingsBeforeDiscountUsd'),
+      cacheSavingsAfter: pick(item, 'cache_savings_after_discount_usd', 'cacheSavingsAfterDiscountUsd'),
+      ttftMedianMs: pick(item, 'ttft_median_ms', 'ttftMedianMs'),
+      ttftP90Ms: pick(item, 'ttft_p90_ms', 'ttftP90Ms'),
+      ttftSampleCount: pick(item, 'ttft_sample_count', 'ttftSampleCount'),
+      ttftCoverage: pick(item, 'ttft_coverage', 'ttftCoverage'),
       reasoning,
       total: totalValue || input + output,
       requests: metricFrom(item, ['requests', 'request_count', 'requestCount', 'calls', 'count']),
@@ -359,7 +396,9 @@
       speedDurationMs: metricFrom(item, ['speed_duration_ms']),
       speedSampleCount: metricFrom(item, ['speed_sample_count']),
       outputTokensPerSecond: outputTokensPerSecond == null ? null : toNumber(outputTokensPerSecond),
-      cost: metricFrom(item, ['estimated_cost_usd', 'estimated_cost', 'cost_usd']),
+      costBefore: costBeforeRaw == null ? oldCost : toNumber(costBeforeRaw),
+      costAfter: costAfterRaw == null ? (costBeforeRaw == null ? oldCost : toNumber(costBeforeRaw)) : toNumber(costAfterRaw),
+      cost: costAfterRaw == null ? oldCost : toNumber(costAfterRaw),
       pricingStatus: text(pick(item, 'pricing_status', 'pricingStatus')),
       pricingModel: text(pick(item, 'pricing_model', 'pricingModel')),
       pricingRateBand: text(pick(item, 'pricing_rate_band', 'pricingRateBand')),
@@ -378,7 +417,7 @@
         return;
       }
       if (value && typeof value === 'object') {
-        const looksLikeMetric = ['input', 'output', 'total', 'tokens', 'requests', 'input_tokens', 'total_tokens', 'speed_output_tokens', 'speed_duration_ms', 'speed_sample_count', 'output_tokens_per_second'].some(key => value[key] !== undefined);
+        const looksLikeMetric = ['input', 'output', 'total', 'tokens', 'requests', 'input_tokens', 'total_tokens', 'speed_output_tokens', 'speed_duration_ms', 'speed_sample_count', 'output_tokens_per_second', 'cost_before_discount_usd', 'cost_after_discount_usd', 'fresh_input_tokens', 'cache_read_available_count'].some(key => value[key] !== undefined);
         if (looksLikeMetric) {
           rows.push(detailRow(value, normalizedDay));
           return;
@@ -396,9 +435,10 @@
     const grouped = new Map();
     rows.forEach(row => {
       const key = `${row.model}|||${row.provider}`;
-      if (!grouped.has(key)) grouped.set(key, { model: row.model, provider: row.provider, providerId: row.providerId || row.provider, input: 0, output: 0, cache: 0, reasoning: 0, total: 0, requests: 0, cost: 0, speedOutputTokens: 0, speedDurationMs: 0, speedSampleCount: 0, pricingStatuses: new Set() });
+      if (!grouped.has(key)) grouped.set(key, { model: row.model, provider: row.provider, providerId: row.providerId || row.provider, input: 0, output: 0, cache: 0, cacheWrite: 0, freshInput: 0, reasoning: 0, total: 0, requests: 0, cost: 0, costBefore: 0, costAfter: 0, speedOutputTokens: 0, speedDurationMs: 0, speedSampleCount: 0, pricingStatuses: new Set() });
       const result = grouped.get(key);
-      ['input', 'output', 'cache', 'reasoning', 'total', 'requests', 'cost', 'speedOutputTokens', 'speedDurationMs', 'speedSampleCount'].forEach(metric => { result[metric] += toNumber(row[metric]); });
+      ['input', 'output', 'cache', 'cacheWrite', 'freshInput', 'reasoning', 'total', 'requests', 'costBefore', 'costAfter', 'speedOutputTokens', 'speedDurationMs', 'speedSampleCount'].forEach(metric => { result[metric] += toNumber(row[metric]); });
+      result.cost = state.costMode === 'before' ? result.costBefore : result.costAfter;
       if (row.pricingStatus) result.pricingStatuses.add(row.pricingStatus);
     });
     return Array.from(grouped.values()).map(row => ({
@@ -463,7 +503,7 @@
     const workspaceRows = normalizeWorkspaceRows(pick(body, 'workspace_distribution', 'workspaceDistribution', 'workspace_active_distribution') || []);
     const dailyActive = pick(body, 'daily_activity', 'dailyActivity', 'daily_active', 'daily_active_distribution') || [];
     const hourlyActive = pick(body, 'hourly_activity', 'hourlyActivity') || dailyActive;
-    const dailyUsageRaw = pick(body, 'daily_model_usage', 'dailyModelUsage', 'daily_model_distribution', 'model_daily_distribution') || pick(summary, 'daily_model_usage', 'dailyModelUsage');
+    const dailyUsageRaw = pick(body, 'daily_usage', 'dailyUsage', 'daily_model_usage', 'dailyModelUsage', 'daily_model_distribution', 'model_daily_distribution') || pick(summary, 'daily_usage', 'daily_model_usage', 'dailyModelUsage');
     const dailyModelUsage = flattenDailyUsage(dailyUsageRaw);
     const dailyActivity = normalizeDailyActivity(dailyActive);
     const hourlyActivity = normalizeHourly(hourlyActive);
@@ -479,6 +519,8 @@
       summary,
       filters: normalizeFilters(filterPayload, source),
       pricing: body.pricing && typeof body.pricing === 'object' ? body.pricing : {},
+      comparison: body.comparison && typeof body.comparison === 'object' ? body.comparison : {},
+      speed_exclusions: body.speed_exclusions && typeof body.speed_exclusions === 'object' ? body.speed_exclusions : {},
       workspaceRows,
       dailyActivity,
       hourlyActivity,
@@ -498,8 +540,8 @@
   }
 
   function summaryMetric(summary, names, fallback = 0) {
-    const result = metricFrom(summary, names);
-    return result || fallback;
+    const raw = pick(summary, ...names);
+    return raw === undefined ? fallback : toNumber(raw);
   }
 
   function viewMetrics(data) {
@@ -517,13 +559,45 @@
     const requests = summaryMetric(data.summary, ['requests', 'request_count', 'requestCount', 'calls'], modelRows.reduce((sum, row) => sum + row.requests, 0));
     const active = summaryMetric(data.summary, ['active_workspaces', 'activeWorkspaces', 'workspaces'], workspaceRows.filter(row => row.active > 0).length);
     const models = summaryMetric(data.summary, ['models', 'model_count', 'modelCount'], new Set(modelRows.map(row => `${row.model}|||${row.provider}`)).size);
-    const cache = summaryMetric(data.summary, ['cache', 'cached', 'cache_tokens', 'cached_input_tokens', 'cacheTokens', 'cached_tokens'], modelRows.reduce((sum, row) => sum + row.cache, 0));
-    const cost = summaryMetric(data.summary, ['estimated_cost_usd', 'estimated_cost', 'cost_usd'], modelRows.reduce((sum, row) => sum + row.cost, 0));
+    const cache = summaryMetric(data.summary, ['cache', 'cache_read_tokens', 'cached', 'cache_tokens', 'cached_input_tokens', 'cacheTokens', 'cached_tokens'], modelRows.reduce((sum, row) => sum + row.cache, 0));
+    const costBefore = summaryMetric(data.summary, ['cost_before_discount_usd', 'costBeforeDiscountUsd'], modelRows.reduce((sum, row) => sum + row.costBefore, 0));
+    const costAfter = summaryMetric(data.summary, ['cost_after_discount_usd', 'costAfterDiscountUsd'], modelRows.reduce((sum, row) => sum + row.costAfter, 0));
+    const cost = state.costMode === 'before' ? costBefore : costAfter;
+    const freshInput = summaryMetric(data.summary, ['fresh_input_tokens', 'freshInputTokens'], modelRows.reduce((sum, row) => sum + row.freshInput, 0));
+    const cacheReadAvailableCount = summaryMetric(data.summary, ['cache_read_available_count', 'cacheReadAvailableCount'], modelRows.filter(row => row.cacheReadAvailable).length);
+    const cacheWriteAvailableCount = summaryMetric(data.summary, ['cache_write_available_count', 'cacheWriteAvailableCount'], modelRows.filter(row => row.cacheWriteAvailable).length);
     const pricedTokens = summaryMetric(data.summary, ['priced_tokens', 'pricedTokens'], modelRows.reduce((sum, row) => sum + (row.pricingStatus === 'unpriced' ? 0 : row.total), 0));
     const unpricedTokens = summaryMetric(data.summary, ['unpriced_tokens', 'unpricedTokens'], modelRows.reduce((sum, row) => sum + (row.pricingStatus === 'unpriced' ? row.total : 0), 0));
     const coverageTokens = pricedTokens + unpricedTokens;
     const coverage = summaryMetric(data.summary, ['pricing_coverage', 'pricingCoverage'], coverageTokens ? pricedTokens / coverageTokens : 0);
-    return { total, input, output, requests, active, models, cache, cacheRate: input > 0 ? cache / input : 0, cost, pricedTokens, unpricedTokens, coverage, ...speed };
+    const summary = data.summary || {};
+    const summaryCacheInput = Object.prototype.hasOwnProperty.call(summary, 'cache_read_input_tokens')
+      ? summary.cache_read_input_tokens
+      : pick(summary, 'cacheReadInputTokens');
+    const summaryCacheRateProvided = Object.prototype.hasOwnProperty.call(summary, 'cache_hit_rate') || Object.prototype.hasOwnProperty.call(summary, 'cacheHitRate');
+    const summaryCacheRate = Object.prototype.hasOwnProperty.call(summary, 'cache_hit_rate') ? summary.cache_hit_rate : summary.cacheHitRate;
+    const cacheInput = summaryCacheInput !== undefined
+      ? toNumber(summaryCacheInput)
+      : modelRows.reduce((sum, row) => sum + (row.cacheReadInput == null ? 0 : toNumber(row.cacheReadInput)), 0);
+    const hasCacheInput = summaryCacheInput !== undefined || modelRows.some(row => row.cacheReadInputProvided);
+    const cacheCoverageKnown = pick(summary, 'cache_read_available_count', 'cacheReadAvailableCount') !== undefined;
+    const cacheRate = cacheMetrics.calculateRate({
+      cachedTokens: cache,
+      inputTokens: input,
+      cacheReadInputTokens: cacheInput,
+      denominatorProvided: hasCacheInput,
+      hitRate: summaryCacheRate,
+      hitRateProvided: summaryCacheRateProvided,
+      availableCount: cacheReadAvailableCount,
+      requestCount: requests,
+      availabilityKnown: cacheCoverageKnown,
+      available: cacheReadAvailableCount > 0
+    });
+    const cacheAvailable = cacheRate !== null && cacheRate !== undefined && cacheReadAvailableCount > 0;
+    const cacheCoverageText = requests > 0
+      ? `${formatNumber(cacheReadAvailableCount)} / ${formatNumber(requests)} 条请求提供缓存字段${cacheReadAvailableCount > 0 && cacheReadAvailableCount < requests ? ' · 部分记录可用' : ''}`
+      : cacheReadAvailableCount > 0 ? `${formatNumber(cacheReadAvailableCount)} 条提供缓存字段` : '暂无可用缓存记录';
+    return { total, input, output, requests, active, models, cache, cacheInput, cacheRate, cacheRateText: formatCachePercent(cacheRate || 0, cacheAvailable), cacheAvailable, cacheCoverageText, cacheReadAvailableCount, cacheWriteAvailableCount, freshInput, cost, costBefore, costAfter, pricedTokens, unpricedTokens, coverage, ...speed };
   }
 
   function setConnection(status, message) {
@@ -620,6 +694,10 @@
     const node = $('#rangeDescription');
     if (!node) return;
     const end = (data && data.localDate) || dateKey(new Date());
+    if (state.range === 'custom' && state.customStartDate && state.customEndDate) {
+      node.textContent = `${dateLabel(state.customStartDate, true)} — ${dateLabel(state.customEndDate, true)} · 自定义日期（含首尾）`;
+      return;
+    }
     if (state.range === 'all') {
       node.textContent = `全部历史数据，截止 ${dateLabel(end, true)}`;
       return;
@@ -669,14 +747,15 @@
     const costSub = m.total > 0
       ? `计价覆盖率 ${formatPercent(m.coverage)} · ${m.unpricedTokens ? `${formatCompact(m.unpricedTokens)} Token 未计价` : '全部已计价'}`
       : '计价覆盖率 — · 暂无用量';
+    const activeCost = state.costMode === 'before' ? m.costBefore : m.costAfter;
     const cards = [
-      ['预估费用 USD', formatCurrency(m.cost), costSub, '$', m.cost, costDetails],
+      [`预估费用 USD · ${state.costMode === 'before' ? '折扣前' : '折扣后'}`, formatCurrency(activeCost), costSub, '$', activeCost, costDetails],
       ['总 Token', formatCompact(m.total), 'Input + Output（Reasoning 为子集）', '◈', m.total],
       ['今日 Token', formatCompact(today), todayRows.length ? `${todayRows.length} 条模型记录` : '今日暂无记录', '◷', today],
       ['请求数', formatCompact(m.requests), '当前筛选范围', '↗', m.requests],
       ['活跃工作空间', formatNumber(m.active), '有请求记录的空间', '⌘', m.active],
       ['模型 / 供应商', formatNumber(m.models), '去重后的组合数', '✦', m.models],
-      ['缓存占比', m.input ? formatPercent(m.cacheRate) : '—', m.input ? `${formatCompact(m.cache)} cache tokens` : '暂无缓存数据', '▣', m.cacheRate],
+      ['缓存占比', m.cacheRateText, m.cacheAvailable ? `${formatCompact(m.cache)} cache tokens · ${m.cacheCoverageText}` : m.cacheCoverageText, '▣', m.cacheRate],
       ['轮次平均输出速度', formatSpeed(m), m.speedSampleCount > 0 ? `${formatNumber(m.speedSampleCount)} 个完整轮次样本` : '暂无完整计时轮次', '⏱', formatSpeed(m)]
     ];
     $('#kpiGrid').innerHTML = cards.map(card => {
@@ -886,13 +965,14 @@
     $('#detailMeta').textContent = rows.length ? `共 ${formatNumber(rows.length)} 条 · 第 ${state.tablePage}/${totalPages} 页` : '无数据';
     $('#tableEmpty').hidden = rows.length > 0;
     tbody.innerHTML = pageRows.map(row => {
+      const displayCost = state.costMode === 'before' ? row.costBefore : row.costAfter;
       const cost = row.pricingStatus === 'unpriced'
         ? '<span class="provider-pill" title="官方价格未公开或尚未配置">未计价</span>'
-        : `<strong title="${htmlEscape(formatCurrencyDetailed(row.cost))}">${htmlEscape(formatCurrency(row.cost))}${row.pricingStatus === 'partial' ? '*' : ''}</strong>`;
+        : `<strong title="${htmlEscape(formatCurrencyDetailed(displayCost))}">${htmlEscape(formatCurrency(displayCost))}${row.pricingStatus === 'partial' ? '*' : ''}</strong>`;
       const pricingTitle = row.pricingStatus === 'unpriced'
         ? (row.pricingNote || '未计价')
         : `${row.pricingModel || row.model}${row.pricingRateBand ? ` · ${row.pricingRateBand}` : ''}`;
-      return `<tr><td>${htmlEscape(dateLabel(row.date, true))}</td><td><strong title="${htmlEscape(row.model)}">${htmlEscape(row.model)}</strong></td><td><span class="provider-pill" title="${htmlEscape(row.provider)}">${htmlEscape(row.provider)}</span></td><td class="num">${htmlEscape(formatCompact(row.input))}</td><td class="num">${htmlEscape(formatCompact(row.output))}</td><td class="num">${htmlEscape(formatCompact(row.cache))}</td><td class="num">${htmlEscape(formatCompact(row.reasoning))}</td><td class="num"><strong title="${htmlEscape(formatNumber(row.total))}">${htmlEscape(formatCompact(row.total))}</strong></td><td class="num" title="${htmlEscape(pricingTitle)}">${cost}</td><td class="num">${htmlEscape(formatSpeed(row))}</td><td class="num">${htmlEscape(formatNumber(row.speedSampleCount))}</td><td class="num">${htmlEscape(formatCompact(row.requests))}</td></tr>`;
+      return `<tr class="usage-summary-row" tabindex="0" role="button" aria-label="查看 ${htmlEscape(row.date)} ${htmlEscape(row.model)} ${htmlEscape(row.provider)} 的请求明细" data-date="${htmlEscape(row.date)}" data-model="${htmlEscape(row.model)}" data-provider="${htmlEscape(row.providerId || row.provider)}" data-workspace="${htmlEscape(row.workspace || '')}"><td>${htmlEscape(dateLabel(row.date, true))}</td><td><strong title="${htmlEscape(row.model)}">${htmlEscape(row.model)}</strong></td><td><span class="provider-pill" title="${htmlEscape(row.provider)}">${htmlEscape(row.provider)}</span></td><td class="num">${htmlEscape(formatCompact(row.input))}</td><td class="num">${htmlEscape(formatCompact(row.output))}</td><td class="num">${htmlEscape(formatCompact(row.cache))}</td><td class="num">${htmlEscape(formatCompact(row.reasoning))}</td><td class="num"><strong title="${htmlEscape(formatNumber(row.total))}">${htmlEscape(formatCompact(row.total))}</strong></td><td class="num" title="${htmlEscape(pricingTitle)}">${cost}</td><td class="num">${htmlEscape(formatSpeed(row))}</td><td class="num">${htmlEscape(formatNumber(row.speedSampleCount))}</td><td class="num">${htmlEscape(formatCompact(row.requests))}</td></tr>`;
     }).join('');
     $('#tablePaginationSummary').textContent = rows.length
       ? `共 ${formatNumber(rows.length)} 条，每页 ${state.tablePageSize} 条 · 第 ${state.tablePage} / ${totalPages} 页`
@@ -919,10 +999,13 @@
       return `<article class="model-stat"><div class="model-stat-heading"><strong>${htmlEscape(row.model)}</strong><span class="provider-pill">${htmlEscape(row.provider)}</span></div><div class="model-stat-value" title="${formatNumber(row.total)} Token">${formatCompact(row.total)} <small>Token</small></div><div class="model-stat-bar"><i style="width:${total ? row.total / total * 100 : 0}%;background:${palette[index % palette.length]}"></i></div><div class="model-stat-meta">${formatPercent(total ? row.total / total : 0)} · ${formatNumber(row.requests)} 次请求 · ${htmlEscape(costLabel)}</div><div class="model-stat-meta">输入 ${formatNumber(row.input)} · 输出 ${formatNumber(row.output)}</div><div class="model-stat-meta">轮次平均输出速度 ${htmlEscape(formatSpeed(row))} · ${formatNumber(row.speedSampleCount)} 个完整轮次样本</div></article>`;
     }).join('') : '<div class="empty-state">当前组合暂无模型用量，可直接切换任一筛选项。</div>';
     enhanceChartTooltips();
+    window.dispatchEvent(new CustomEvent('codex-dashboard:render', { detail: { data, state: dashboardSnapshot() } }));
   }
 
   function setRange(value) {
     state.range = String(value);
+    state.customStartDate = '';
+    state.customEndDate = '';
     state.tablePage = 1;
     $$('#rangeControls button').forEach(button => button.classList.toggle('is-active', button.dataset.range === state.range));
     fetchDashboard();
@@ -930,7 +1013,13 @@
 
   function buildUrl() {
     const params = new URLSearchParams();
-    params.set('days', state.range === 'all' ? '0' : state.range);
+    if (state.range === 'custom' && state.customStartDate && state.customEndDate) {
+      params.set('start_date', state.customStartDate);
+      params.set('end_date', state.customEndDate);
+    } else {
+      params.set('days', state.range === 'all' ? '0' : state.range);
+    }
+    params.set('compare', '1');
     if (state.provider !== 'all') params.set('provider', state.provider);
     if (state.workspace !== 'all') params.set('workspace', state.workspace);
     if (state.model !== 'all') params.set('model', state.model);
@@ -1045,6 +1134,26 @@
       $('.table-wrap').scrollTop = 0;
     });
     window.addEventListener('resize', () => { if (!state.data) return; clearTimeout(window.__codexResize); window.__codexResize = setTimeout(() => renderAll(state.data), 130); });
+    window.addEventListener('codex-dashboard:set-cost-mode', event => setCostMode(event.detail && event.detail.mode));
+    window.addEventListener('codex-dashboard:set-date-range', event => {
+      const detail = event.detail || {};
+      if (/^\d{4}-\d{2}-\d{2}$/.test(detail.startDate || '') && /^\d{4}-\d{2}-\d{2}$/.test(detail.endDate || '') && detail.startDate <= detail.endDate) {
+        state.range = 'custom'; state.customStartDate = detail.startDate; state.customEndDate = detail.endDate; state.tablePage = 1;
+        $$('#rangeControls button').forEach(button => button.classList.remove('is-active'));
+        fetchDashboard();
+      }
+    });
+    window.addEventListener('codex-dashboard:set-filters', event => {
+      const detail = event.detail || {};
+      if (detail.provider !== undefined) state.provider = String(detail.provider || 'all');
+      if (detail.workspace !== undefined) state.workspace = String(detail.workspace || 'all');
+      if (detail.model !== undefined) state.model = String(detail.model || 'all');
+      if (/^\d{4}-\d{2}-\d{2}$/.test(detail.startDate || '') && /^\d{4}-\d{2}-\d{2}$/.test(detail.endDate || '') && detail.startDate <= detail.endDate) {
+        state.range = 'custom'; state.customStartDate = detail.startDate; state.customEndDate = detail.endDate;
+        $$('#rangeControls button').forEach(button => button.classList.remove('is-active'));
+      }
+      state.tablePage = 1; fetchDashboard();
+    });
   }
 
   function csvCell(value) {
@@ -1055,7 +1164,7 @@
 
   async function exportCsv() {
     if (!state.data) return;
-    const fields = ['date', 'model', 'provider', 'provider_label', 'input_tokens', 'output_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'reasoning_output_tokens', 'total_tokens', 'estimated_cost_usd', 'pricing_status', 'pricing_model', 'pricing_rate_band', 'request_count', 'speed_output_tokens', 'speed_duration_ms', 'speed_sample_count', 'output_tokens_per_second'];
+    const fields = ['date', 'model', 'provider', 'provider_label', 'input_tokens', 'fresh_input_tokens', 'output_tokens', 'cached_input_tokens', 'cache_read_input_tokens', 'cache_hit_rate', 'cache_read_available_count', 'cache_write_input_tokens', 'cache_write_available_count', 'reasoning_output_tokens', 'total_tokens', 'cost_display_mode', 'displayed_cost_usd', 'estimated_cost_usd', 'cost_before_discount_usd', 'cost_after_discount_usd', 'cache_savings_before_discount_usd', 'cache_savings_after_discount_usd', 'ttft_median_ms', 'ttft_p90_ms', 'ttft_sample_count', 'ttft_coverage', 'pricing_status', 'pricing_model', 'pricing_rate_band', 'request_count', 'speed_output_tokens', 'speed_duration_ms', 'speed_sample_count', 'output_tokens_per_second'];
     const rows = rowsForView(state.data.dailyModelUsage)
       .filter(row => state.workspace === 'all' || !row.workspace || row.workspace === state.workspace)
       .sort((a, b) => b.date.localeCompare(a.date) || b.total - a.total)
@@ -1065,12 +1174,27 @@
         provider: row.providerId,
         provider_label: row.provider,
         input_tokens: row.input,
+        fresh_input_tokens: row.freshInput,
         output_tokens: row.output,
         cached_input_tokens: row.cache,
+        cache_read_input_tokens: row.cacheReadInput == null ? '' : row.cacheReadInput,
+        cache_hit_rate: row.cacheHitRate == null ? (row.cacheReadInput > 0 ? (row.cache / row.cacheReadInput).toFixed(6) : '') : row.cacheHitRate,
+        cache_read_available_count: row.cacheReadAvailableCount == null ? '' : row.cacheReadAvailableCount,
         cache_write_input_tokens: row.cacheWrite,
+        cache_write_available_count: row.cacheWriteAvailableCount == null ? '' : row.cacheWriteAvailableCount,
         reasoning_output_tokens: row.reasoning,
         total_tokens: row.total,
-        estimated_cost_usd: row.pricingStatus === 'unpriced' ? '' : row.cost.toFixed(8),
+        cost_display_mode: state.costMode,
+        displayed_cost_usd: row.pricingStatus === 'unpriced' ? '' : (state.costMode === 'before' ? row.costBefore : row.costAfter).toFixed(8),
+        estimated_cost_usd: row.pricingStatus === 'unpriced' ? '' : (state.costMode === 'before' ? row.costBefore : row.costAfter).toFixed(8),
+        cost_before_discount_usd: row.pricingStatus === 'unpriced' ? '' : row.costBefore.toFixed(8),
+        cost_after_discount_usd: row.pricingStatus === 'unpriced' ? '' : row.costAfter.toFixed(8),
+        cache_savings_before_discount_usd: row.cacheSavingsBefore == null ? '' : toNumber(row.cacheSavingsBefore).toFixed(8),
+        cache_savings_after_discount_usd: row.cacheSavingsAfter == null ? '' : toNumber(row.cacheSavingsAfter).toFixed(8),
+        ttft_median_ms: row.ttftMedianMs == null ? '' : row.ttftMedianMs,
+        ttft_p90_ms: row.ttftP90Ms == null ? '' : row.ttftP90Ms,
+        ttft_sample_count: row.ttftSampleCount == null ? '' : row.ttftSampleCount,
+        ttft_coverage: row.ttftCoverage == null ? '' : row.ttftCoverage,
         pricing_status: row.pricingStatus,
         pricing_model: row.pricingModel || row.model,
         pricing_rate_band: row.pricingRateBand,
@@ -1141,6 +1265,42 @@
       target.addEventListener('blur', () => { tooltip.hidden = true; });
     });
   }
+
+  function dashboardSnapshot() {
+    const endDate = state.range === 'custom' ? state.customEndDate : (state.data && state.data.localDate) || dateKey(new Date());
+    let startDate = state.range === 'custom' ? state.customStartDate : '';
+    if (!startDate && state.range !== 'all') {
+      const days = Math.max(1, toNumber(state.range));
+      const date = new Date(`${endDate}T12:00:00`);
+      date.setDate(date.getDate() - days + 1);
+      startDate = dateKey(date);
+    }
+    return { range: state.range, startDate, endDate, provider: state.provider, workspace: state.workspace, model: state.model, costMode: state.costMode };
+  }
+
+  function setCostMode(mode) {
+    state.costMode = mode === 'before' ? 'before' : 'after';
+    try { localStorage.setItem('codex-token-cost-mode', state.costMode); } catch (_) { /* browser storage is optional */ }
+    if (state.data) renderAll(state.data);
+    window.dispatchEvent(new CustomEvent('codex-dashboard:cost-mode', { detail: { mode: state.costMode } }));
+  }
+
+  window.CodexDashboard = {
+    getState: dashboardSnapshot,
+    getData: () => state.data,
+    getCostMode: () => state.costMode,
+    setCostMode,
+    setRange: value => setRange(value),
+    setDateRange: (startDate, endDate) => window.dispatchEvent(new CustomEvent('codex-dashboard:set-date-range', { detail: { startDate, endDate } })),
+    setFilters: filters => window.dispatchEvent(new CustomEvent('codex-dashboard:set-filters', { detail: filters || {} })),
+    refresh: () => fetchDashboard(),
+    exportCsv: () => exportCsv(),
+    formatCurrency,
+    formatCurrencyDetailed,
+    formatNumber,
+    formatCompact,
+    formatCachePercent: (value, available) => cacheMetrics.formatPercent(value, available)
+  };
 
   window.addEventListener('pywebviewready', loadDesktopPreferences);
   window.addEventListener('pywebviewready', initializeUpdater);

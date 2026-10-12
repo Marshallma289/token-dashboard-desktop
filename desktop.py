@@ -14,7 +14,7 @@ import threading
 import time
 import tempfile
 from typing import Any, Iterable, Mapping, Optional
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from backend import DashboardDB, DashboardService, create_server, safe_csv_row, local_data_dir
 from updater import Updater, cleanup_completed_updates, confirm_startup, installation_dir
@@ -40,6 +40,21 @@ CSV_FIELDS = [
     "speed_duration_ms",
     "speed_sample_count",
     "output_tokens_per_second",
+    "cost_before_discount_usd",
+    "cost_after_discount_usd",
+    "cost_display_mode",
+    "displayed_cost_usd",
+    "fresh_input_tokens",
+    "cache_read_available_count",
+    "cache_write_available_count",
+    "cache_read_input_tokens",
+    "cache_hit_rate",
+    "cache_savings_before_discount_usd",
+    "cache_savings_after_discount_usd",
+    "ttft_median_ms",
+    "ttft_p90_ms",
+    "ttft_sample_count",
+    "ttft_coverage",
 ]
 
 _PREFERENCES_LOCK = threading.RLock()
@@ -377,12 +392,14 @@ def run_self_test() -> Mapping[str, Any]:
                      "model": "self-test-model" if duration else "self-test-pending"}),
                 event(index, 10, "token_usage_record", {
                     "thread_id": "self-test-thread", "turn_id": turn_id, "response_id": f"self-test-response-{index}",
-                    "usage": {"input_tokens": 5000, "output_tokens": 1000 if duration else 250,
+                    "usage": {"input_tokens": 5000, "cached_input_tokens": 4575,
+                              "output_tokens": 1000 if duration else 250,
                               "reasoning_output_tokens": 100, "total_tokens": 6000 if duration else 5250}}),
             ])
             if duration:
                 rows.append(event(index, 50, "event_msg", {"type": "task_complete", "turn_id": turn_id,
-                                                           "duration_ms": duration}))
+                                                           "duration_ms": duration,
+                                                           "time_to_first_token_ms": 1500 * index}))
         log = sessions / "self-test.jsonl"
         log.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
         shutil.copy2(log, sessions / "duplicate.jsonl")
@@ -400,6 +417,12 @@ def run_self_test() -> Mapping[str, Any]:
             def read(path):
                 with urlopen(url + path, timeout=5) as response:
                     return response.read().decode("utf-8")
+            def write(path, value):
+                request = Request(url + path, data=json.dumps(value).encode("utf-8"),
+                                  headers={"Content-Type": "application/json", "X-Dashboard-Request": "1",
+                                           "Origin": url}, method="POST")
+                with urlopen(request, timeout=5) as response:
+                    return json.loads(response.read().decode("utf-8"))
             health = json.loads(read("/api/health"))
             if health["status"] != "ok":
                 raise RuntimeError("Self-test scanner is unhealthy")
@@ -417,10 +440,44 @@ def run_self_test() -> Mapping[str, Any]:
             if "轮次平均输出速度" not in html or "speed_sample_count" not in script or not styles:
                 raise RuntimeError("Shipped dashboard assets are missing speed UI")
             checks.append("shipped_web_assets")
+            layout = read("/layout.js")
+            if "CodexDashboardLayout" not in layout or any(
+                    f'id="view-{view}"' not in html for view in ("overview", "trends", "usage", "pricing")):
+                raise RuntimeError("Shipped dashboard navigation assets are missing")
+            checks.append("shipped_layout_navigation")
             exported = list(csv.DictReader(io.StringIO(dashboard_csv(data["daily_model_usage"]).lstrip("\ufeff"))))
             if sorted(row["output_tokens_per_second"] for row in exported) != ["", "33.3333"]:
                 raise RuntimeError("Self-test CSV speed export failed")
             checks.append("csv_speed_and_missing_value")
+            if summary["ttft_sample_count"] != 2 or summary["ttft_median_ms"] != 2250:
+                raise RuntimeError("Self-test first-token latency samples failed")
+            if "未提供" not in read("/analytics.js"):
+                raise RuntimeError("Shipped analytics assets are missing")
+            if "formatPercent" not in read("/cache-metrics.js"):
+                raise RuntimeError("Shipped cache formatting asset is missing")
+            requests = json.loads(read("/api/requests?days=0&page=1&page_size=2&sort=token_desc"))
+            if requests["total"] != 3 or len(requests["data"]) != 2:
+                raise RuntimeError("Self-test request pagination failed")
+            if not json.loads(read("/api/tasks?days=0"))["data"]:
+                raise RuntimeError("Self-test task summaries failed")
+            json.loads(read("/api/diagnostics"))
+            checks.extend(["first_token_latency", "analytics_assets", "request_pagination", "task_summary", "diagnostics"])
+            write("/api/pricing", {"rules": [{"id": "self-test-rule", "provider": "openai",
+                  "model": "self-test-model", "effective_at": "2020-01-01T00:00:00Z",
+                  "input": 2, "cached_input": .2, "cache_write": 2.5, "output": 10,
+                  "multiplier": .8, "source": "Synthetic self-test", "note": ""}]})
+            unchanged = json.loads(read("/api/dashboard?days=0"))["summary"]
+            if unchanged["cost_after_discount_usd"] != summary["cost_after_discount_usd"]:
+                raise RuntimeError("Editing prices unexpectedly changed retained history")
+            preview = write("/api/reprice/preview", {"days": 0})
+            result = write("/api/reprice", {"preview_token": preview["preview_token"]})
+            if not Path(result["backup_path"]).is_file():
+                raise RuntimeError("Self-test repricing backup is missing")
+            summary = json.loads(read("/api/dashboard?days=0"))["summary"]
+            if summary["cost_before_discount_usd"] <= 0 or abs(
+                    summary["cost_after_discount_usd"] - summary["cost_before_discount_usd"] * .8) > 1e-8:
+                raise RuntimeError("Self-test discounted repricing failed")
+            checks.extend(["editable_prices", "frozen_history_prices", "preview_and_backup_repricing", "discount_before_after"])
         finally:
             if server is not None:
                 if thread is not None:

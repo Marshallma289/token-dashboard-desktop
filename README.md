@@ -1,6 +1,20 @@
 # Codex Token Dashboard
 
-同版本计价补丁：`codex-auto-review` 在本地费用估算中按免费处理，输入、输出、缓存读取和缓存写入均为 0 USD；用量仍计入统计和计价覆盖率。这是本软件配置的估算规则。
+## 1.6.1：页面布局整理
+
+将页面分成总览、趋势分析、用量明细、价格与数据四个页签。所有日期、供应商、工作空间、模型和费用显示筛选统一放在顶部；请求、任务、价格和诊断按用途分组，不再混排在同一长页面。每日汇总仍可点击进入对应请求明细，页签切换保留筛选和折扣模式。统计与计价口径不变。
+
+## 1.6.0：费用、请求与扫描分析
+
+1. **价格规则与费用展示**：页面可编辑内置模型价格、为其增加覆盖规则，也可新增尚未收录的模型；按供应商和模型设置输入、缓存读取、缓存写入、输出四项单价，以及倍率、生效时间、来源和备注。规则保存在 SQLite。所有费用视图可切换折扣前或按倍率计算后的费用。请求记录保存当时适用的价格，改规则不会自动重算历史；需要调整时，先预览范围再确认重算，重算前会生成备份。旧库升级备份见 [1.6.0 升级说明](UPGRADE-1.6.0.md)。
+2. **首字延迟与轮次速度**：展示日志中可用 TTFT 样本的中位数、P90 和样本数。首字延迟衡量请求开始到首个 Token；轮次平均输出速度包含等待、推理和工具执行耗时，不是模型流式生成速度。
+3. **缓存与输入拆分**：区分未缓存输入、缓存读取和缓存写入；日志未提供缓存字段时标为“未提供”，不会当成零。缓存占比以缓存读取量占 Input 的比例显示，固定保留一位小数，例如 `91.5%`；Input 已包含缓存读取 Token。
+4. **单次请求明细**：支持分页，并按时间、Token 数或费用排序；请求详情展示 Token 拆分、费用拆分、适用模型、价格规则及计价状态。
+5. **任务与代理消耗**：按可识别的任务及父子线程关系汇总主代理、子代理的请求、Token 和估算费用。并行代理的墙钟耗时不相加。
+6. **日期与趋势**：支持自定义起止日期、本周、本月及与上一等长周期比较；趋势可切换 Token、请求数、费用和缓存量。
+7. **扫描诊断与控制**：查看日志扫描来源和状态，可暂停自动扫描、调整扫描间隔或立即同步。
+
+本地估算规则将 `codex-auto-review` 的输入、输出、缓存读取和缓存写入记为 0 USD；用量仍计入统计和计价覆盖率。这是软件配置，不代表供应商账单或订阅额度。
 
 ## 1.5.2：修复子代理速度样本遗漏
 
@@ -26,7 +40,7 @@ CSV 新增 `speed_output_tokens`、`speed_duration_ms`、`speed_sample_count`、
 
 手动自检：Windows 在终端运行 `CodexTokenDesktop.exe --self-test --self-test-report self-test-report.json`；Mac 使用 `.app/Contents/MacOS/CodexTokenDesktop` 加相同参数；源码使用 `python desktop.py --self-test`。通过时返回 0，失败时返回非 0。Windows 无控制台版本请查看指定的 JSON 报告。
 
-本地 Codex Token 用量看板：读取本机 rollout JSONL 日志，实时展示用量、请求分布和按公开参考价估算的美元费用。支持 Windows x64、Apple Silicon Mac 桌面版，以及浏览器模式。
+本地 Codex Token 用量看板：读取本机 rollout JSONL 日志，展示用量、请求分布和按内置参考价格或自定义规则估算的美元费用。支持 Windows x64、Apple Silicon Mac 桌面版，以及浏览器模式。
 
 [下载桌面版](https://github.com/Marshallma289/token-dashboard-desktop/releases/latest) · [构建记录](https://github.com/Marshallma289/token-dashboard-desktop/actions/workflows/build-desktop.yml) · [问题反馈](https://github.com/Marshallma289/token-dashboard-desktop/issues)
 
@@ -145,7 +159,7 @@ Windows 与 Mac 共用 `backend.py`、`desktop.py`、`pricing.py` 和 `web/`，�
 
 **历史保留有边界**：软件关闭期间未采集、且随后被删除的日志无法补回；数据库本身被删除或损坏后，已不存在的源日志也无法重新扫描恢复。
 
-首次迁移旧版数据库时会保留 `usage.sqlite3.pre-history.bak`。1.4.0 采用新的历史结构，回退旧版前须停止软件并还原迁移备份。数据库损坏时，会先将原文件及 WAL / SHM 副本改名为带 UTC 时间戳的 `.corrupt-*.bak`，再从可读日志重建。
+首次迁移旧版数据库时会保留 `usage.sqlite3.pre-history.bak`。1.4.0 采用新的历史结构，回退旧版前须停止软件并还原迁移备份。升级到 1.6.0 时，需迁移的旧库会额外保留 `usage.sqlite3.pre-analytics.bak`；请参阅 [1.6.0 升级说明](UPGRADE-1.6.0.md)。数据库损坏时，会先将原文件及 WAL / SHM 副本改名为带 UTC 时间戳的 `.corrupt-*.bak`，再从可读日志重建。
 
 ### 隐私与网络
 
@@ -167,7 +181,7 @@ Windows 与 Mac 共用 `backend.py`、`desktop.py`、`pricing.py` 和 `web/`，�
 
 ### 费用估算
 
-费用使用应用内 `pricing.py` 的参考价格表，**不会在线自动同步价格**。按每条请求的模型、输入、缓存、输出和时间匹配价格档位后再汇总。页面与 CSV 标明计价状态，未配置价格的模型保留 Token 统计并显示“未计价”。
+费用按每条请求适用的价格规则估算。`pricing.py` 提供内置参考价格和模型别名；在页面“价格规则”中可编辑内置模型价格、建立覆盖规则或新增未知模型，也可按供应商和模型设置输入、缓存读取、缓存写入、输出单价（USD / 百万 Token）、倍率、生效时间、来源和备注。规则保存在本地 SQLite 历史库中，**不会在线自动同步价格**，也无需编辑 `pricing.py`。自定义规则按供应商、模型及生效时间匹配；未命中自定义规则时使用内置参考价。页面与 CSV 标明计价状态，未配置价格的模型保留 Token 统计并显示“未计价”。
 
 | 价格来源 | 当前实现 |
 | --- | --- |
@@ -178,11 +192,11 @@ Windows 与 Mac 共用 `backend.py`、`desktop.py`、`pricing.py` 和 `web/`，�
 
 模型名按已配置别名归一化，例如 `deepseek/deepseek-flash` 并入 `deepseek-flash`；原始名称保留在 API 的 `source_models` 字段中。不会将任意带前缀的名称自动认作已知模型。
 
-价格匹配不限制 provider ID，因此第三方供应商同名模型也按公开参考价估算。订阅额度、服务端重试、供应商折扣、合同价、区域价格和未写入本机日志的请求可能造成差异。DeepSeek 中国法定节假日的低谷价例外未自动识别，需人工核对。
+没有对应自定义规则时，内置参考价格按模型匹配，因此第三方供应商的同名模型也会使用该参考价。订阅额度、服务端重试、供应商折扣、合同价、区域价格和未写入本机日志的请求可能造成差异。DeepSeek 中国法定节假日的低谷价例外未自动识别，需人工核对。
 
-`codex-auto-review` 没有配置独立公开单价，保持“未计价”；它触发的后端模型调用若出现在本机日志中，按对应模型单独计量。
+当前本地规则将 `codex-auto-review` 的输入、输出、缓存读取和缓存写入按 0 USD 估算；其 Token 仍计入用量和计价覆盖率。这只说明本软件采用的估算规则，不表示服务免费或不消耗订阅额度。它触发的后端模型调用若出现在本机日志中，按对应模型单独计量。
 
-参考来源：[OpenAI](https://developers.openai.com/api/docs/pricing)、[DeepSeek](https://api-docs.deepseek.com/quick_start/pricing/)、[Alibaba Cloud Model Studio](https://www.alibabacloud.com/help/en/model-studio/model-pricing)、[Xiaomi MiMo](https://xiaomimimo.com)。具体模型、价格和参考日期以 [pricing.py](pricing.py) 为准。
+参考来源：[OpenAI](https://developers.openai.com/api/docs/pricing)、[DeepSeek](https://api-docs.deepseek.com/quick_start/pricing/)、[Alibaba Cloud Model Studio](https://www.alibabacloud.com/help/en/model-studio/model-pricing)、[Xiaomi MiMo](https://xiaomimimo.com)。内置模型、参考价格和参考日期见 [pricing.py](pricing.py)；自定义规则保存在本机数据库。
 
 ## 配置供应商显示名
 
@@ -306,7 +320,7 @@ python backend.py export --days 30 --format csv --output usage.csv
 ```text
 backend.py              日志解析、持久历史、聚合统计、HTTP API 与 SSE
 desktop.py              桌面窗口、主题偏好、数据管理与原生 CSV 保存
-pricing.py              参考价格和模型别名
+pricing.py              内置参考价格和模型别名；用户价格规则保存在 SQLite 历史库
 updater.py              更新检查、下载与校验
 update_helpers.py       程序替换、重启与失败恢复
 web/                    共用前端
@@ -358,6 +372,7 @@ sh build-macos.sh
 
 | 版本 | 主要变化 |
 | --- | --- |
+| 1.6.0 | 自定义价格与历史重算；首字延迟、缓存拆分、请求与代理分析；日期比较及扫描控制 |
 | 1.4.2 | 成功更新及重复安装后自动清理旧程序备份、更新包和安装暂存文件 |
 | 1.4.1 | 深色主题统一配色与层级；自定义历史保存位置；预览和确认清理指定天数前的数据 |
 | 1.4.0 | 独立持久历史；日志删除后保留已采集用量；迁移备份与空间回收 |

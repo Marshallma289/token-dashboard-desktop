@@ -3105,6 +3105,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _read_mutation_json(self) -> Optional[Dict[str, Any]]:
         if not self._same_local_origin():
+            # Drain small, bounded bodies before rejecting the request. Closing a
+            # TCP connection with unread request bytes can reset the response on
+            # Windows, making the intended 403 look like a transport failure.
+            if not self.headers.get("Transfer-Encoding"):
+                try:
+                    rejected_length = int(self.headers.get("Content-Length", "-1"))
+                except ValueError:
+                    rejected_length = -1
+                if 0 <= rejected_length <= 1024 * 1024:
+                    previous_timeout = self.connection.gettimeout()
+                    try:
+                        self.connection.settimeout(1.0)
+                        discarded = self.rfile.read(rejected_length)
+                        if len(discarded) != rejected_length:
+                            self.close_connection = True
+                    except OSError:
+                        self.close_connection = True
+                    finally:
+                        self.connection.settimeout(previous_timeout)
             self._write_json({"error": "forbidden_origin"}, HTTPStatus.FORBIDDEN)
             return None
         if self.headers.get("Transfer-Encoding"):

@@ -875,11 +875,18 @@
     $('#requestMeta').textContent = rows.length ? `${formatNumber(rows.reduce((sum, row) => sum + row.count, 0))} 次请求` : '暂无分布';
     const host = $('#requestChart');
     if (!rows.length) { emptyChart(host, '暂无直方图', percentiles.p50 ? '接口返回了分位数，但还没有直方图分桶。' : '当前筛选范围内没有请求数据。'); return; }
-    const width = Math.max(host.clientWidth || 620, 360), height = 220, left = 41, right = 12, top = 18, bottom = 34;
+    const width = Math.max(host.clientWidth || 620, 360), height = 246, left = 41, right = 12, top = 44, bottom = 34;
     const plotWidth = width - left - right, plotHeight = height - top - bottom;
     const maxCount = Math.max(...rows.map(row => row.count), 1);
     const maxValue = Math.max(...rows.map(row => row.max || row.min), percentiles.p99, 1);
     const barWidth = plotWidth / rows.length;
+    const minAxisLabelSpacing = 84;
+    const minAxisIndexSpacing = Math.max(1, Math.ceil(minAxisLabelSpacing / Math.max(barWidth, 1)));
+    const maxAxisLabels = Math.max(2, Math.floor((rows.length - 1) / minAxisIndexSpacing) + 1);
+    const axisLabelCount = Math.min(rows.length, maxAxisLabels);
+    const axisLabelIndexes = new Set(Array.from({ length: axisLabelCount }, (_, index) => axisLabelCount === 1
+      ? 0
+      : Math.round(index * (rows.length - 1) / (axisLabelCount - 1))));
     const xFor = value => {
       const index = rows.findIndex((row, i) => value < row.max || i === rows.length - 1);
       const row = rows[Math.max(0, index)];
@@ -887,19 +894,38 @@
       return left + (Math.max(0, index) + Math.max(0, Math.min(1, (value - row.min) / Math.max(1, upper - row.min)))) * barWidth;
     };
     const yFor = value => top + plotHeight - value / maxCount * plotHeight;
-    let markup = `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img" aria-label="单次请求 Token 大小直方图"><title>单次请求 Token 大小分布</title>`;
+    let markup = `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img" aria-label="单次请求 Token 大小直方图"><title>单次请求 Token 大小分布</title><desc>横轴为单次请求中的 Token 数量，纵轴为请求次数；彩色虚线分别表示 P50、P90 和 P99。</desc>`;
     [0, .5, 1].forEach(ratio => { const yy = yFor(maxCount * ratio); markup += `<line class="chart-grid-line" x1="${left}" y1="${yy}" x2="${width - right}" y2="${yy}"/><text class="chart-axis-label" x="${left - 6}" y="${yy + 3}" text-anchor="end">${formatCompact(maxCount * ratio)}</text>`; });
     rows.forEach((row, index) => {
       const x = left + index * barWidth + 1, barHeight = Math.max(row.count ? 1 : 0, row.count / maxCount * plotHeight);
       markup += `<rect class="bar-hover" x="${x}" y="${top + plotHeight - barHeight}" width="${Math.max(1, barWidth - 2)}" height="${barHeight}" rx="2" fill="var(--accent)"><title>${htmlEscape(row.label)}：${formatNumber(row.count)} 次</title></rect>`;
-      if (rows.length <= 14 || index % Math.ceil(rows.length / 8) === 0 || index === rows.length - 1) markup += `<text class="chart-axis-label" x="${x + barWidth / 2 - 1}" y="${height - 11}" text-anchor="middle">${htmlEscape(row.label)}</text>`;
+      if (axisLabelIndexes.has(index)) markup += `<text class="chart-axis-label" x="${x + barWidth / 2 - 1}" y="${height - 11}" text-anchor="middle">${htmlEscape(row.label)}</text>`;
     });
-    [['p50', percentiles.p50, 'var(--accent)'], ['p90', percentiles.p90, 'var(--green)'], ['p99', percentiles.p99, 'var(--amber)']].forEach(([label, value, color]) => {
-      if (!value) return;
-      const x = xFor(value);
-      markup += `<line x1="${x}" y1="${top - 3}" x2="${x}" y2="${top + plotHeight}" stroke="${color}" stroke-width="1.5" stroke-dasharray="4 3"/><text x="${Math.min(width - 8, x + 4)}" y="${top + 2}" fill="${color}" font-size="9">${label}</text>`;
+    const markerPoints = [['P50', percentiles.p50, 'var(--accent)'], ['P90', percentiles.p90, 'var(--green)'], ['P99', percentiles.p99, 'var(--amber)']]
+      .filter(([, value]) => value > 0)
+      .map(([label, value, color]) => ({ label, color, x: xFor(value) }))
+      .sort((a, b) => a.x - b.x);
+    const markerGroups = [];
+    markerPoints.forEach(point => {
+      const previousGroup = markerGroups[markerGroups.length - 1];
+      if (previousGroup && point.x - previousGroup[previousGroup.length - 1].x < 44) previousGroup.push(point);
+      else markerGroups.push([point]);
     });
-    markup += `<line class="chart-axis-line" x1="${left}" y1="${top + plotHeight}" x2="${width - right}" y2="${top + plotHeight}"/><text class="chart-axis-label" x="${width - right}" y="${height - 11}" text-anchor="end">Token 数量</text></svg>`;
+    markerGroups.forEach((group, groupIndex) => {
+      group.forEach((point, pointIndex) => {
+        const overlapOffset = group.length > 1 ? (pointIndex - (group.length - 1) / 2) * 2 : 0;
+        const x = Math.max(left + 1, Math.min(width - right - 1, point.x + overlapOffset));
+        markup += `<line x1="${x}" y1="${top - 3}" x2="${x}" y2="${top + plotHeight}" stroke="${point.color}" stroke-width="1.5" stroke-dasharray="4 3"/>`;
+      });
+      const centerX = group.reduce((sum, point) => sum + point.x, 0) / group.length;
+      const alignRight = centerX > width * .62;
+      const labelX = alignRight ? width - right - 3 : Math.max(left + 3, centerX + 4);
+      const labelY = top - 32 + groupIndex * 11;
+      const label = group.map(point => point.label).join(' · ');
+      const labelColor = group.length === 1 ? group[0].color : 'var(--text)';
+      markup += `<text x="${labelX}" y="${labelY}" text-anchor="${alignRight ? 'end' : 'start'}" fill="${labelColor}" stroke="var(--surface)" stroke-width="3" paint-order="stroke" font-size="10">${label}</text>`;
+    });
+    markup += `<line class="chart-axis-line" x1="${left}" y1="${top + plotHeight}" x2="${width - right}" y2="${top + plotHeight}"/></svg>`;
     host.innerHTML = markup;
   }
 

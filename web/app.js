@@ -25,6 +25,11 @@
     eventSource: null,
     requestId: 0,
     dashboardController: null,
+    dashboardPromise: null,
+    dashboardUrl: '',
+    dashboardEventVersion: null,
+    latestEventVersion: null,
+    manualRefreshPromise: null,
     healthController: null,
     pollTimer: null,
     refreshTimer: null,
@@ -521,6 +526,7 @@
       pricing: body.pricing && typeof body.pricing === 'object' ? body.pricing : {},
       comparison: body.comparison && typeof body.comparison === 'object' ? body.comparison : {},
       speed_exclusions: body.speed_exclusions && typeof body.speed_exclusions === 'object' ? body.speed_exclusions : {},
+      dataVersion: pick(body, 'data_version', 'dataVersion'),
       workspaceRows,
       dailyActivity,
       hourlyActivity,
@@ -1007,7 +1013,7 @@
     $('#nextTablePage').disabled = !rows.length || state.tablePage >= totalPages;
   }
 
-  function renderAll(data) {
+  function renderAll(data, options = {}) {
     renderFilterOptions(data);
     updateRangeDescription(data);
     renderKpis(data);
@@ -1025,7 +1031,7 @@
       return `<article class="model-stat"><div class="model-stat-heading"><strong>${htmlEscape(row.model)}</strong><span class="provider-pill">${htmlEscape(row.provider)}</span></div><div class="model-stat-value" title="${formatNumber(row.total)} Token">${formatCompact(row.total)} <small>Token</small></div><div class="model-stat-bar"><i style="width:${total ? row.total / total * 100 : 0}%;background:${palette[index % palette.length]}"></i></div><div class="model-stat-meta">${formatPercent(total ? row.total / total : 0)} · ${formatNumber(row.requests)} 次请求 · ${htmlEscape(costLabel)}</div><div class="model-stat-meta">输入 ${formatNumber(row.input)} · 输出 ${formatNumber(row.output)}</div><div class="model-stat-meta">轮次平均输出速度 ${htmlEscape(formatSpeed(row))} · ${formatNumber(row.speedSampleCount)} 个完整轮次样本</div></article>`;
     }).join('') : '<div class="empty-state">当前组合暂无模型用量，可直接切换任一筛选项。</div>';
     enhanceChartTooltips();
-    window.dispatchEvent(new CustomEvent('codex-dashboard:render', { detail: { data, state: dashboardSnapshot() } }));
+    window.dispatchEvent(new CustomEvent('codex-dashboard:render', { detail: { data, state: dashboardSnapshot(), refreshQueries: Boolean(options.refreshQueries) } }));
   }
 
   function setRange(value) {
@@ -1053,40 +1059,89 @@
     return query ? `${API_URL}?${query}` : API_URL;
   }
 
-  async function fetchDashboard(options = {}) {
+  function fetchDashboard(options = {}) {
+    const url = buildUrl();
+    const eventVersion = options.eventVersion ?? state.latestEventVersion;
+    if (options.silent && !options.refreshQueries && state.dashboardPromise && state.dashboardUrl === url && state.dashboardEventVersion === eventVersion) {
+      return state.dashboardPromise;
+    }
     if (state.dashboardController) state.dashboardController.abort();
     const controller = typeof AbortController === 'function' ? new AbortController() : null;
     state.dashboardController = controller;
+    state.dashboardUrl = url;
+    state.dashboardEventVersion = eventVersion;
     const requestId = ++state.requestId;
     state.loading = true;
     if (!options.silent) setConnection('connecting', '读取数据');
-    try {
-      const response = await fetch(buildUrl(), {
-        headers: { Accept: 'application/json' },
-        cache: 'no-store',
-        signal: controller ? controller.signal : undefined
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const payload = await response.json();
-      if (requestId !== state.requestId || state.dashboardController !== controller) return;
-      state.data = normalize(payload);
-      renderAll(state.data);
-      updateUpdated(state.data.generatedAt);
-      showError('');
-      if (!state.eventSource || state.eventSource.readyState === EventSource.OPEN) setConnection('online', '实时连接');
-    } catch (error) {
-      if (error && error.name === 'AbortError') return;
-      if (requestId !== state.requestId || state.dashboardController !== controller) return;
-      const message = error && error.message ? error.message : '网络请求失败';
-      showError(`无法读取看板数据（${message}）。请确认服务已启动后重试。`);
-      if (!state.data) renderEmptyDashboard();
-      setConnection('offline', '暂时离线');
-    } finally {
-      if (requestId === state.requestId && state.dashboardController === controller) {
-        state.loading = false;
-        state.dashboardController = null;
+    window.dispatchEvent(new CustomEvent('codex-dashboard:loading', { detail: { state: dashboardSnapshot() } }));
+    state.dashboardPromise = (async () => {
+      try {
+        const response = await fetch(url, {
+          headers: { Accept: 'application/json' },
+          cache: 'no-store',
+          signal: controller ? controller.signal : undefined
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json();
+        if (requestId !== state.requestId || state.dashboardController !== controller) return;
+        state.data = normalize(payload);
+        renderAll(state.data, options);
+        updateUpdated(state.data.generatedAt);
+        showError('');
+        if (!state.eventSource || state.eventSource.readyState === EventSource.OPEN) setConnection('online', '实时连接');
+        return state.data;
+      } catch (error) {
+        if (error && error.name === 'AbortError') return;
+        if (requestId !== state.requestId || state.dashboardController !== controller) return;
+        const message = error && error.message ? error.message : '网络请求失败';
+        showError(`无法读取看板数据（${message}）。请确认服务已启动后重试。`);
+        if (!state.data) renderEmptyDashboard();
+        setConnection('offline', '暂时离线');
+      } finally {
+        if (requestId === state.requestId && state.dashboardController === controller) {
+          state.loading = false;
+          state.dashboardController = null;
+          state.dashboardPromise = null;
+        }
       }
-    }
+    })();
+    return state.dashboardPromise;
+  }
+
+  function refreshNow() {
+    if (state.manualRefreshPromise) return state.manualRefreshPromise;
+    clearTimeout(state.refreshTimer);
+    const button = $('#refreshButton');
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    button.setAttribute('aria-label', '正在同步请求日志');
+    button.title = '正在同步请求日志…';
+    setConnection('connecting', '同步日志');
+    state.manualRefreshPromise = (async () => {
+      try {
+        const response = await fetch('/api/scan/now', {
+          method: 'POST',
+          headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'X-Dashboard-Request': '1' },
+          body: '{}'
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return await fetchDashboard({ refreshQueries: true });
+      } catch (error) {
+        const message = error && error.message ? error.message : '网络请求失败';
+        showError(`同步请求日志失败（${message}）。请重试。`);
+        setConnection('offline', '同步失败');
+      } finally {
+        button.disabled = false;
+        button.setAttribute('aria-busy', 'false');
+        button.setAttribute('aria-label', '立即刷新数据');
+        button.title = '立即刷新';
+        state.manualRefreshPromise = null;
+        // Events received after the dashboard GET began may describe data
+        // newer than that response. Replay that version with a GET only.
+        if (state.latestEventVersion !== state.dashboardEventVersion) scheduleRefresh();
+      }
+    })();
+    return state.manualRefreshPromise;
   }
 
   function renderEmptyDashboard() {
@@ -1095,9 +1150,24 @@
     updateUpdated('');
   }
 
-  function scheduleRefresh() {
+  function scheduleRefresh(event) {
+    let version = null;
+    if (event && event.data) {
+      try {
+        const message = JSON.parse(event.data);
+        if (message.type === 'ping' || message.event === 'ping') return;
+        if (message.version !== undefined && message.version !== null) version = String(message.version);
+      } catch (_) { /* Other event payloads are still refresh signals. */ }
+    }
+    if (version !== null) {
+      if (version === state.latestEventVersion) return;
+      state.latestEventVersion = version;
+    }
+    // A manual scan fetches once after it finishes. Its own SSE notification
+    // does not need to start a second scan or race that fetch.
+    if (state.manualRefreshPromise) return;
     clearTimeout(state.refreshTimer);
-    state.refreshTimer = setTimeout(() => fetchDashboard({ silent: true }), 300);
+    state.refreshTimer = setTimeout(() => fetchDashboard({ silent: true, eventVersion: state.latestEventVersion }), 150);
   }
 
   function connectEvents() {
@@ -1112,11 +1182,7 @@
       source.onopen = () => { setConnection('online', '实时连接'); };
       source.onmessage = event => {
         if (!event.data) return;
-        try {
-          const message = JSON.parse(event.data);
-          if (message.type === 'ping' || message.event === 'ping') return;
-        } catch (_) { /* any non-empty event is treated as a refresh signal */ }
-        scheduleRefresh();
+        scheduleRefresh(event);
       };
       ['dashboard', 'dashboard_updated', 'dashboard-update', 'usage.updated', 'update', 'refresh'].forEach(eventName => source.addEventListener(eventName, scheduleRefresh));
       source.onerror = () => {
@@ -1143,9 +1209,9 @@
     $('#workspaceFilter').addEventListener('change', event => { state.workspace = event.target.value; state.tablePage = 1; fetchDashboard(); });
     $('#modelFilter').addEventListener('change', event => { state.model = event.target.value; state.tablePage = 1; fetchDashboard(); });
     $('#resetFilters').addEventListener('click', () => { state.provider = state.workspace = state.model = 'all'; setRange('30'); });
-    $('#refreshButton').addEventListener('click', () => fetchDashboard());
+    $('#refreshButton').addEventListener('click', refreshNow);
     $('#exportButton').addEventListener('click', exportCsv);
-    $('#retryButton').addEventListener('click', () => fetchDashboard());
+    $('#retryButton').addEventListener('click', () => fetchDashboard({ refreshQueries: true }));
     $('#themeButton').addEventListener('click', () => { setTheme(state.theme === 'dark' ? 'light' : 'dark', { persist: true }); if (state.data) renderAll(state.data); });
     $('#prevTablePage').addEventListener('click', () => {
       if (!state.data || state.tablePage <= 1) return;
@@ -1319,7 +1385,7 @@
     setRange: value => setRange(value),
     setDateRange: (startDate, endDate) => window.dispatchEvent(new CustomEvent('codex-dashboard:set-date-range', { detail: { startDate, endDate } })),
     setFilters: filters => window.dispatchEvent(new CustomEvent('codex-dashboard:set-filters', { detail: filters || {} })),
-    refresh: () => fetchDashboard(),
+    refresh: () => fetchDashboard({ refreshQueries: true }),
     exportCsv: () => exportCsv(),
     formatCurrency,
     formatCurrencyDetailed,
@@ -1331,7 +1397,7 @@
   window.addEventListener('pywebviewready', loadDesktopPreferences);
   window.addEventListener('pywebviewready', initializeUpdater);
   document.addEventListener('DOMContentLoaded', initializeUpdater, { once: true });
-  document.addEventListener('data-settings:refresh', () => { fetchDashboard(); fetchHealth(); });
+  document.addEventListener('data-settings:refresh', () => { fetchDashboard({ refreshQueries: true }); fetchHealth(); });
   loadDesktopPreferences();
   startHealthPolling();
   setTheme(state.theme);

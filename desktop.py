@@ -60,6 +60,40 @@ CSV_FIELDS = [
 _PREFERENCES_LOCK = threading.RLock()
 
 
+def _validated_layout(value: Any) -> Optional[dict[str, Any]]:
+    """Keep bounded UI data only; never persist arbitrary bridge arguments."""
+    if not isinstance(value, dict) or type(value.get("version")) is not int or value["version"] != 1:
+        return None
+    views = ("overview", "trends", "usage", "pricing")
+    pages = value.get("pages")
+    if not isinstance(pages, dict):
+        return None
+    result: dict[str, Any] = {"version": 1, "pages": {}}
+    result["view"] = value.get("view") if value.get("view") in views else "overview"
+    result["usage"] = value.get("usage") if value.get("usage") in ("daily", "requests", "tasks", "all") else "daily"
+    result["pricing"] = value.get("pricing") if value.get("pricing") in ("rules", "diagnostics", "all") else "rules"
+    for view in views:
+        items = pages.get(view, [])
+        if not isinstance(items, list) or len(items) > 30:
+            return None
+        accepted = []
+        seen = set()
+        for item in items:
+            if not isinstance(item, dict):
+                return None
+            identity, span, height = item.get("id"), item.get("span"), item.get("height")
+            if not isinstance(identity, str) or not re.fullmatch(view + r"-[a-z0-9-]{1,64}", identity):
+                return None
+            if identity in seen or type(span) is not int or not 3 <= span <= 12:
+                return None
+            if type(height) is not int or not (height == 0 or 200 <= height <= 2400):
+                return None
+            accepted.append({"id": identity, "span": span, "height": height})
+            seen.add(identity)
+        result["pages"][view] = accepted
+    return result
+
+
 def _read_preferences() -> dict[str, Any]:
     path = local_data_dir() / "preferences.json"
     try:
@@ -155,7 +189,7 @@ class DesktopRuntime:
         *,
         db_path: Optional[Path] = None,
         providers_path: Optional[Path] = None,
-        interval: float = 2.0,
+        interval: Optional[float] = None,
     ) -> None:
         data_dir = local_data_dir()
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -185,6 +219,7 @@ class DesktopRuntime:
         # Show the window immediately. Existing cached totals are readable
         # while the first fresh scan runs in the background.
         self.service.start(initial_refresh=False)
+        self.service.request_refresh()
         self.thread = threading.Thread(
             target=self.server.serve_forever,
             name="codex-token-desktop-http",
@@ -251,6 +286,25 @@ class DesktopBridge:
                 return {"ok": True}
             except (OSError, ValueError):
                 return {"ok": False, "error": "无法保存主题设置"}
+
+    def load_layout(self) -> Mapping[str, Any]:
+        """Layout survives private WebView sessions and changing loopback ports."""
+        with self._preferences_lock:
+            try:
+                return {"ok": True, "layout": _validated_layout(_read_preferences().get("layout"))}
+            except (OSError, ValueError):
+                return {"ok": False, "layout": None, "error": "无法读取布局设置"}
+
+    def save_layout(self, layout: Mapping[str, Any]) -> Mapping[str, Any]:
+        validated = _validated_layout(layout)
+        if validated is None:
+            return {"ok": False, "error": "无效的布局设置"}
+        with self._preferences_lock:
+            try:
+                _write_preferences({"layout": validated})
+                return {"ok": True}
+            except (OSError, ValueError):
+                return {"ok": False, "error": "无法保存布局设置"}
 
     def _data_database(self) -> DashboardDB:
         if self._runtime is None:
@@ -390,11 +444,16 @@ def run_self_test() -> Mapping[str, Any]:
                 event(index, 0, "event_msg", {"type": "task_started", "turn_id": turn_id}),
                 event(index, 0, "turn_context", {"turn_id": turn_id,
                      "model": "self-test-model" if duration else "self-test-pending"}),
+                event(index, 9, "response_item", {"type": "message", "role": "assistant", "content": []}),
                 event(index, 10, "token_usage_record", {
                     "thread_id": "self-test-thread", "turn_id": turn_id, "response_id": f"self-test-response-{index}",
                     "usage": {"input_tokens": 5000, "cached_input_tokens": 4575,
                               "output_tokens": 1000 if duration else 250,
                               "reasoning_output_tokens": 100, "total_tokens": 6000 if duration else 5250}}),
+                event(index, 12, "event_msg", {"type": "token_count", "info": {"last_token_usage": {
+                    "input_tokens": 5000, "cached_input_tokens": 4575,
+                    "output_tokens": 1000 if duration else 250,
+                    "reasoning_output_tokens": 100, "total_tokens": 6000 if duration else 5250}}}),
             ])
             if duration:
                 rows.append(event(index, 50, "event_msg", {"type": "task_complete", "turn_id": turn_id,
@@ -426,6 +485,9 @@ def run_self_test() -> Mapping[str, Any]:
             health = json.loads(read("/api/health"))
             if health["status"] != "ok":
                 raise RuntimeError("Self-test scanner is unhealthy")
+            if not service.auto_scan or service.interval != 60:
+                raise RuntimeError("Self-test automatic scan defaults failed")
+            checks.append("sixty_second_automatic_scan")
             data = json.loads(read("/api/dashboard?days=0"))
             summary = data["summary"]
             if (summary["speed_sample_count"], summary["speed_output_tokens"], summary["speed_duration_ms"],
@@ -458,6 +520,13 @@ def run_self_test() -> Mapping[str, Any]:
             requests = json.loads(read("/api/requests?days=0&page=1&page_size=2&sort=token_desc"))
             if requests["total"] != 3 or len(requests["data"]) != 2:
                 raise RuntimeError("Self-test request pagination failed")
+            for item in requests["data"]:
+                if item.get("request_duration_estimate_ms") != 10000 or item.get("request_output_tokens_per_second_estimate") != 100:
+                    raise RuntimeError("Self-test per-request estimated speed failed")
+                detail = json.loads(read("/api/request?id=" + item["request_id"]))["request"]
+                if detail.get("request_output_tokens_per_second_estimate") != 100:
+                    raise RuntimeError("Self-test per-request speed detail failed")
+            checks.append("per_request_log_estimate_includes_wait")
             if not json.loads(read("/api/tasks?days=0"))["data"]:
                 raise RuntimeError("Self-test task summaries failed")
             json.loads(read("/api/diagnostics"))
@@ -500,7 +569,44 @@ def run_self_test() -> Mapping[str, Any]:
             "gui_tested": False, "speed_sample_count": 2, "output_tokens_per_second": 33.3333, "checks": checks}
 
 
+def probe_desktop_dependencies() -> Mapping[str, Any]:
+    """Load native dependencies without accessing history or opening a window."""
+    import webview
+    from webview.guilib import initialize
+    imports = ["webview"]
+    renderer = "cocoa" if sys.platform == "darwin" else "edgechromium"
+    backend = initialize(renderer)
+    if getattr(backend, "renderer", None) != renderer:
+        raise RuntimeError(f"Desktop renderer unavailable: {renderer}")
+    if sys.platform == "win32":
+        import clr
+        import clr_loader
+        import cffi
+        import pycparser
+        from System.Windows.Forms import Form
+        from Microsoft.Web.WebView2.WinForms import WebView2
+        imports.extend(["clr", "clr_loader", "cffi", "pycparser", "WinForms", "WebView2"])
+    return {"status": "passed", "frozen": bool(getattr(sys, "frozen", False)),
+            "renderer": renderer, "imports": imports, "gui_tested": False}
+
+
 def main() -> int:
+    if "--probe-desktop-dependencies" in sys.argv:
+        import argparse
+        parser = argparse.ArgumentParser(description="Check native desktop dependencies without reading personal data.")
+        parser.add_argument("--probe-desktop-dependencies", action="store_true")
+        parser.add_argument("--probe-report", type=Path)
+        args = parser.parse_args()
+        try:
+            report, code = probe_desktop_dependencies(), 0
+        except Exception as error:
+            report, code = {"status": "failed", "gui_tested": False, "error": str(error)}, 1
+        output = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+        if args.probe_report:
+            args.probe_report.write_text(output, encoding="utf-8")
+        elif sys.stdout is not None:
+            print(output, end="")
+        return code
     if "--self-test" in sys.argv:
         import argparse
         parser = argparse.ArgumentParser(description="Validate shipped analytics with isolated synthetic data; no GUI.")

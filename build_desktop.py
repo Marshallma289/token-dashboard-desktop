@@ -99,7 +99,7 @@ def make_macos_icon(stage: Path, build_root: Path) -> None:
     run(["iconutil", "-c", "icns", str(iconset), "-o", str(stage / "assets" / "app-icon.icns")], stage)
 
 
-def file_manifest(package: Path) -> list[dict[str, str]]:
+def file_manifest(package: Path) -> list[dict[str, str | int]]:
     records = []
     for path in sorted(package.rglob("*"), key=lambda value: value.relative_to(package).as_posix()):
         name = path.relative_to(package).as_posix()
@@ -112,7 +112,7 @@ def file_manifest(package: Path) -> list[dict[str, str]]:
             with path.open("rb") as handle:
                 for block in iter(lambda: handle.read(1024 * 1024), b""):
                     digest.update(block)
-            records.append({"path": name, "sha256": digest.hexdigest()})
+            records.append({"path": name, "sha256": digest.hexdigest(), "size_bytes": path.stat().st_size})
     return records
 
 
@@ -182,8 +182,19 @@ def build(output_dir: Path, *, skip_tests: bool = False) -> tuple[Path, Path]:
     self_test = json.loads(self_test_path.read_text(encoding="utf-8"))
     if self_test.get("status") != "passed" or self_test.get("frozen") is not True:
         raise RuntimeError("Packaged executable self-test did not pass.")
+    desktop_dependencies = None
+    if sys.platform == "win32":
+        probe_path = build_root / "desktop-dependencies-report.json"
+        run([str(executable), "--probe-desktop-dependencies", "--probe-report", str(probe_path)], stage, test_env)
+        desktop_dependencies = json.loads(probe_path.read_text(encoding="utf-8"))
+        if (desktop_dependencies.get("status") != "passed"
+                or desktop_dependencies.get("frozen") is not True
+                or desktop_dependencies.get("renderer") != "edgechromium"):
+            raise RuntimeError("Packaged desktop dependency probe did not pass.")
+    files = file_manifest(package)
     manifest = {
         "self_test": self_test,
+        "desktop_dependencies": desktop_dependencies,
         "version": version,
         "built_at": datetime.now(timezone.utc).isoformat(),
         "platform": sys.platform,
@@ -193,7 +204,8 @@ def build(output_dir: Path, *, skip_tests: bool = False) -> tuple[Path, Path]:
         "source_digest_algorithm": "sha256:path-length/path/content-length/content;sorted-posix-paths;raw-bytes",
         "source_commit": os.environ.get("GITHUB_SHA") or None,
         "validation": "skipped" if skip_tests else "unittest-and-node-check-passed",
-        "files": file_manifest(package),
+        "payload_size_bytes": sum(item.get("size_bytes", 0) for item in files),
+        "files": files,
     }
     suffix = build_root.name.rsplit("-", 1)[-1]
     stem = f"CodexTokenDashboard-{os_label}-{architecture}-{version}-{stamp}-{suffix}"

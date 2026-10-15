@@ -213,6 +213,22 @@ class FeatureAcceptanceTests(unittest.TestCase):
     def scan_now(self) -> Any:
         return self.post_json("/api/scan/now", {})
 
+    def test_refresh_alias_matches_manual_scan_and_exposes_request_estimates(self) -> None:
+        from tests.test_request_estimates import modern_request
+        write_jsonl(self.sessions / "request-estimate.jsonl", modern_request())
+        self.start_server()
+        refreshed = self.post_json("/api/refresh", {})
+        self.assertIn("health", refreshed)
+        self.assertIn("scan", refreshed)
+        listed = self.get_json("/api/requests?days=0")["data"][0]
+        detail = self.get_json("/api/request?" + urlencode({"id": listed["request_id"]}))["request"]
+        for record in (listed, detail):
+            self.assertEqual(record["request_duration_estimate_ms"], 7500)
+            self.assertEqual(record["request_output_tokens_per_second_estimate"], 80)
+            self.assertEqual(record["request_timing_source"], "token_usage_record")
+            self.assertIsNone(record["request_speed_exclusion_reason"])
+        self.assertIn("data_version", self.get_json("/api/dashboard?days=0"))
+
     def test_pricing_catalog_prefers_provider_and_latest_effective_rule(self) -> None:
         catalog = PricingCatalog([
             pricing_rule(rule_id="global", provider="*", model="custom-model",

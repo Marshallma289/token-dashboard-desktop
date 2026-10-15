@@ -44,7 +44,8 @@ def local_data_dir() -> Path:
 
 DEFAULT_DB = local_data_dir() / "usage.sqlite3"
 DEFAULT_PROVIDER_CONFIG = APP_DIR / "providers.json"
-PARSER_SCHEMA_VERSION = 6
+PARSER_SCHEMA_VERSION = 7
+DEFAULT_SCAN_INTERVAL_SECONDS = 60.0
 APP_VERSION = (Path(__file__).resolve().parent / "VERSION").read_text(encoding="utf-8").strip()
 
 try:
@@ -302,6 +303,238 @@ class ParsedRecord:
     ttft_ms: Optional[float] = None
     parent_thread_id: Optional[str] = None
     speed_exclusion_reason: Optional[str] = None
+    request_duration_estimate_ms: Optional[float] = None
+    request_output_tokens_per_second_estimate: Optional[float] = None
+    request_timing_source: Optional[str] = None
+    request_speed_exclusion_reason: Optional[str] = "unmatched_token_count"
+
+
+class _RequestTimer:
+    """Metadata-only RequestTimer estimates, separate from whole-turn metrics.
+
+    Freeze the last boundary at first model output. A modern usage timestamp
+    is useful only after a token_count proves the input/cache/output signature.
+    No response text, tool content or local path is retained by this timer.
+    """
+
+    def __init__(self, modern: bool = False) -> None:
+        self.modern = modern
+        self.owner = ""
+        self.windows: Dict[str, Dict[str, Any]] = {}
+        self.timings: Dict[int, Dict[str, Any]] = {}
+        self.matched: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        self.pending: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        self.responses: Dict[Tuple[str, str], Tuple[Any, ...]] = {}
+        self.totals: Dict[str, Usage] = {}
+        self.last_snapshot: Dict[str, str] = {}
+
+    def _window(self, owner: str) -> Dict[str, Any]:
+        return self.windows.setdefault(owner, {
+            "boundary": None, "last_count": None, "start": None,
+            "has_output": False, "last_output": None, "tool_after": None,
+            "compaction": False, "last_usage": None, "legacy_overlap": False,
+        })
+
+    @staticmethod
+    def _reset_output(window) -> None:
+        window.update(start=None, has_output=False, last_output=None, tool_after=None,
+                      compaction=False, legacy_overlap=False)
+
+    @staticmethod
+    def _timestamp(value: Any) -> Optional[float]:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value) * 1000 if math.isfinite(value) else None
+        if isinstance(value, str):
+            try:
+                instant = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if instant.tzinfo is not None:
+                    return round(instant.timestamp() * 1000, 3)
+            except (ValueError, OverflowError, OSError):
+                pass
+        return None
+
+    @staticmethod
+    def _signature(usage: Usage) -> Tuple[int, int, int]:
+        return usage.input_tokens, usage.cached_input_tokens, usage.output_tokens
+
+    @staticmethod
+    def _excluded(reason: str) -> Dict[str, Any]:
+        return {"request_duration_estimate_ms": None,
+                "request_output_tokens_per_second_estimate": None,
+                "request_timing_source": None,
+                "request_speed_exclusion_reason": reason}
+
+    def _estimate(self, start, end, output, source, has_output, reason=None):
+        if reason is None:
+            reason = ("missing_model_output" if not has_output else
+                      "missing_start" if start is None else
+                      "missing_timestamp" if end is None else None)
+        duration = end - start if reason is None else None
+        if duration is not None and not 0 < duration <= 3600000:
+            reason, duration = "invalid_duration", None
+        result = self._excluded(reason) if reason else self._excluded("")
+        if duration is not None:
+            reason = ("output_below_200" if output < 200 else
+                      "duration_below_1000ms" if duration < 1000 else None)
+            result.update(request_duration_estimate_ms=duration,
+                          request_timing_source=source,
+                          request_speed_exclusion_reason=reason,
+                          request_output_tokens_per_second_estimate=(
+                              round(output * 1000 / duration, 6) if reason is None else None))
+        return result
+
+    def observe(self, line: int, event: Mapping[str, Any]) -> None:
+        kind = event.get("type")
+        payload = _as_dict(event.get("payload"))
+        sub = str(payload.get("type") or "")
+        at = self._timestamp(event.get("timestamp"))
+        if kind == "session_meta":
+            self.owner = str(_first(payload, "id", "thread_id", "session_id") or "")
+            self.windows.pop(self.owner, None)
+            return
+        if kind == "turn_context" or (kind == "event_msg" and sub == "thread_settings_applied"):
+            self.owner = str(_first(payload, "thread_id", "threadId") or self.owner)
+        owner = str(_first(payload, "thread_id", "threadId") or self.owner)
+        if not self.owner and owner:
+            # A truncated log can still explicitly identify its stream owner.
+            self.windows.setdefault(owner, self._window(self.owner))
+            self.owner = owner
+        window = self._window(owner)
+        if kind == "compacted" or (kind == "event_msg" and sub in ("context_compacted", "compacted")):
+            self._abandon("compaction", owner)
+            self._reset_output(window)
+            window.update(compaction=True, boundary=None)
+        elif kind == "event_msg" and sub in ("task_started", "turn_aborted"):
+            if sub == "turn_aborted":
+                self._abandon("interrupted_request", owner)
+            self._reset_output(window)
+            if at is not None:
+                window["boundary"] = max(window["boundary"] if window["boundary"] is not None else at, at)
+        elif kind == "turn_context" or (kind == "response_item" and sub == "message"
+                                         and payload.get("role") in ("user", "developer")):
+            if at is not None:
+                window["boundary"] = max(window["boundary"] if window["boundary"] is not None else at, at)
+        elif kind == "response_item" and sub.endswith("_output"):
+            if at is not None:
+                window["boundary"] = max(window["boundary"] if window["boundary"] is not None else at, at)
+                if window["has_output"]:
+                    window["tool_after"] = at
+        elif kind == "response_item" and (sub == "reasoning" or sub.endswith("_call")
+                or (sub == "message" and payload.get("role") == "assistant")):
+            # Final response items can trail their token_count in one flush.
+            if not window["has_output"] and at is not None and window["last_count"] is not None \
+                    and 0 <= at - window["last_count"] <= 100:
+                return
+            if not window["has_output"] and at is not None and window["last_usage"] is not None \
+                    and 0 <= at - window["last_usage"] <= 100:
+                return
+            if not self.modern and window["has_output"] and window["tool_after"] is not None:
+                # Two model calls preceded one delayed legacy counter. Their
+                # usage cannot be assigned safely; never include the tool wait.
+                window["legacy_overlap"] = True
+            if not window["has_output"]:
+                window["start"] = window["boundary"]
+            window.update(has_output=True, last_output=at, tool_after=None)
+        elif kind == "token_usage_record":
+            self.modern = True
+            usage = parse_usage(payload.get("usage") or event.get("usage"))
+            if usage is None:
+                return
+            response = _first(payload, "response_id", "responseId") or event.get("response_id")
+            identity = (owner, str(response or ""), self._signature(usage))
+            response_key = (owner, str(response or ""))
+            if response and response_key in self.responses and self.responses[response_key] != identity:
+                # A replayed/corrected snapshot is still the same request.
+                # An altered signature cannot consume a later output window.
+                self.timings[line] = self._excluded("usage_signature_mismatch")
+                return
+            if response:
+                self.responses[response_key] = identity
+            if response and identity in self.matched:
+                self.timings[line] = self.matched[identity]
+            else:
+                # Duplicate response snapshots cannot move a request's end.
+                identity = identity if response else (*identity, line)
+                candidate = self.pending.get(identity)
+                if candidate is None:
+                    candidate = self.pending[identity] = {
+                        "lines": [], "start": window["start"], "end": at,
+                        "has_output": window["has_output"], "usage": usage,
+                        "compaction": window["compaction"],
+                    }
+                    # Usage completes this model output window. Its delayed
+                    # token_count must not reset a later request's outputs.
+                    self._reset_output(window)
+                    window["last_usage"] = at
+                candidate["lines"].append(line)
+        elif kind == "event_msg" and sub == "token_count":
+            self._finish(line, at, payload)
+
+    def _abandon(self, reason: str, owner: str) -> None:
+        for identity, candidate in list(self.pending.items()):
+            if identity[0] != owner:
+                continue
+            for line in candidate["lines"]:
+                self.timings[line] = self._excluded(reason)
+            del self.pending[identity]
+
+    def _finish(self, line: int, at: Optional[float], payload: Mapping[str, Any]) -> None:
+        info = _as_dict(payload.get("info"))
+        usage = parse_usage(info.get("last_token_usage")) or parse_usage(info.get("usage"))
+        total = parse_usage(info.get("total_token_usage"))
+        if usage is None and total is None:
+            return
+        owner = str(_first(payload, "thread_id", "threadId") or self.owner)
+        window = self._window(owner)
+        # Identical cumulative snapshots are telemetry duplicates, not requests.
+        snapshot = json.dumps([info.get("last_token_usage"), info.get("total_token_usage")], sort_keys=True)
+        if total is not None and self.last_snapshot.get(owner) == snapshot:
+            return
+        self.last_snapshot[owner] = snapshot
+        previous = self.totals.get(owner)
+        if total is not None:
+            self.totals[owner] = total
+        reason = None
+        if usage is None:
+            if previous is None or total.total_tokens <= previous.total_tokens:
+                reason = "missing_cumulative_baseline"
+            else:
+                usage = Usage(*(max(0, getattr(total, key) - getattr(previous, key))
+                                for key in ("input_tokens", "output_tokens", "cached_input_tokens",
+                                            "cache_write_input_tokens", "reasoning_output_tokens", "total_tokens")))
+        matches = [(identity, candidate) for identity, candidate in self.pending.items()
+                   if identity[0] == owner and usage is not None
+                   and self._signature(candidate["usage"]) == self._signature(usage)]
+        if len(matches) == 1 and reason is None:
+            identity, candidate = matches[0]
+            timing = self._estimate(candidate["start"], candidate["end"], usage.output_tokens,
+                                    "token_usage_record", candidate["has_output"],
+                                    "compaction" if candidate["compaction"] else None)
+            self.matched[identity] = timing
+            for usage_line in candidate["lines"]:
+                self.timings[usage_line] = timing
+            del self.pending[identity]
+        for identity, candidate in self.pending.items():
+            if identity[0] != owner:
+                continue
+            if len(matches) == 1 and identity == matches[0][0] and reason is None:
+                continue
+            exclusion = reason or ("ambiguous_usage_match" if len(matches) > 1 else "usage_signature_mismatch")
+            for usage_line in candidate["lines"]:
+                self.timings[usage_line] = self._excluded(exclusion)
+        if not self.modern:
+            source = "last_model_output" if window["tool_after"] is not None else "token_count"
+            end = window["last_output"] if window["tool_after"] is not None else at
+            self.timings[line] = self._estimate(
+                window["start"], end, usage.output_tokens if usage else 0, source, window["has_output"],
+                "compaction" if window["compaction"] else
+                "interrupted_request" if window["legacy_overlap"] else reason)
+            self._reset_output(window)
+        if at is not None:
+            window["boundary"] = max(window["boundary"] if window["boundary"] is not None else at, at)
+        window["last_count"] = at
 
 
 @dataclass
@@ -340,8 +573,20 @@ class RolloutParser:
 
     def _iter_json(self, path: Path) -> Iterator[Tuple[int, Dict[str, Any]]]:
         try:
-            with path.open("r", encoding="utf-8", errors="replace") as handle:
-                for line_number, line in enumerate(handle, 1):
+            # Both schema detection and parsing read the same byte prefix.
+            # A writer may append indefinitely; committed lines in this prefix
+            # must remain usable without chasing a moving EOF.
+            with path.open("rb") as handle:
+                remaining = self._read_limit
+                line_number = 0
+                while remaining > 0:
+                    raw = handle.readline(remaining)
+                    if not raw:
+                        self._read_failed = True
+                        break
+                    remaining -= len(raw)
+                    line_number += 1
+                    line = raw.decode("utf-8", errors="replace")
                     if not line.strip():
                         continue
                     try:
@@ -351,6 +596,8 @@ class RolloutParser:
                         # still being written; retry it on the next scan.
                         if line.endswith(("\n", "\r")):
                             self._parse_errors += 1
+                        else:
+                            self._incomplete_tail = True
                         continue
                     if isinstance(value, dict):
                         yield line_number, value
@@ -379,6 +626,12 @@ class RolloutParser:
         # single-request source of truth and old totals would double count it.
         self._parse_errors = 0
         self._read_failed = False
+        self._incomplete_tail = False
+        try:
+            self._read_limit = path.stat().st_size
+        except OSError:
+            self._read_limit = 0
+            self._read_failed = True
         has_modern = False
         try:
             for _, event in self._iter_json(path):
@@ -416,6 +669,7 @@ class RolloutParser:
         turn_output_totals: Dict[Tuple[str, str], int] = {}
         turn_ttft: Dict[Tuple[str, str], float] = {}
         parent_by_thread: Dict[str, str] = {}
+        request_timer = _RequestTimer(modern=has_modern)
         parse_errors = 0
         try:
             fallback_mtime = path.stat().st_mtime
@@ -426,6 +680,7 @@ class RolloutParser:
             event_type = self._event_type(event)
             payload = self._payload(event)
             payload_type = str(payload.get("type") or "").strip()
+            request_timer.observe(line_number, event)
 
             if event_type == "session_meta":
                 session_provider = str(
@@ -715,6 +970,10 @@ class RolloutParser:
                         parent_thread_id=str(parent_value) if parent_value is not None else None,
                     )
                 )
+        for index, record in enumerate(records):
+            timing = request_timer.timings.get(record.source_line)
+            if timing:
+                records[index] = replace(record, **timing)
         # A whole turn includes waits and tools. Never invent API-request or
         # streaming timings from adjacent usage timestamps. Carry the same
         # sample on its requests; aggregation deduplicates the hashed turn id.
@@ -852,6 +1111,7 @@ class DashboardDB:
         self._dashboard_cache = {}
         self._data_version = 0
         self._lock = threading.RLock()
+        self._scan_lock = threading.Lock()
         self._connection = self._open_connection()
         self._connection.row_factory = sqlite3.Row
         with self._lock:
@@ -897,7 +1157,7 @@ class DashboardDB:
         return sqlite3.connect(str(self.db_path), check_same_thread=False)
 
     def close(self) -> None:
-        with self._lock:
+        with self._scan_lock, self._lock:
             self._maintain_storage(force=True)
             self._connection.close()
 
@@ -1394,6 +1654,21 @@ class DashboardDB:
         }
         analytics_upgrade = bool(tables.intersection({"history_snapshots", "usage_records", "source_files"})) \
             and not analytics_columns.issubset(snapshot_columns)
+        request_timing_columns = {
+            "request_duration_estimate_ms": "REAL",
+            "request_output_tokens_per_second_estimate": "REAL",
+            "request_timing_source": "TEXT",
+            "request_speed_exclusion_reason": "TEXT",
+        }
+        request_timing_upgrade = bool(snapshot_columns) and not set(request_timing_columns).issubset(snapshot_columns)
+        if request_timing_upgrade:
+            request_backup = Path(str(self.db_path) + ".pre-request-speed.bak")
+            if not request_backup.exists():
+                target = sqlite3.connect(str(request_backup))
+                try:
+                    self._connection.backup(target)
+                finally:
+                    target.close()
         analytics_backup = None
         if analytics_upgrade:
             analytics_backup = Path(str(self.db_path) + ".pre-analytics.bak")
@@ -1454,6 +1729,9 @@ class DashboardDB:
                     reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL,
                     speed_group_key TEXT, speed_output_tokens INTEGER NOT NULL DEFAULT 0,
                     speed_duration_ms REAL NOT NULL DEFAULT 0,
+                    request_duration_estimate_ms REAL,
+                    request_output_tokens_per_second_estimate REAL,
+                    request_timing_source TEXT, request_speed_exclusion_reason TEXT,
                     cache_read_available INTEGER NOT NULL DEFAULT 0,
                     cache_write_available INTEGER NOT NULL DEFAULT 0,
                     ttft_ms REAL, thread_key TEXT, parent_thread_key TEXT, task_id TEXT,
@@ -1476,6 +1754,8 @@ class DashboardDB:
                 "CREATE INDEX IF NOT EXISTS idx_history_day ON history_snapshots(day)",
                 "CREATE INDEX IF NOT EXISTS idx_history_task ON history_snapshots(task_id)",
                 "CREATE INDEX IF NOT EXISTS idx_history_thread ON history_snapshots(thread_key)",
+                "CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history_snapshots(timestamp DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_history_tokens ON history_snapshots(total_tokens DESC, timestamp DESC)",
                 """CREATE TABLE IF NOT EXISTS thread_relationships (
                     thread_key TEXT PRIMARY KEY, parent_thread_key TEXT,
                     agent_role TEXT NOT NULL DEFAULT 'main', updated_at TEXT NOT NULL) WITHOUT ROWID""",
@@ -1494,6 +1774,8 @@ class DashboardDB:
                         s.input_tokens, s.output_tokens, s.cached_input_tokens,
                         s.cache_write_input_tokens, s.reasoning_output_tokens, s.total_tokens,
                         s.speed_group_key, s.speed_output_tokens, s.speed_duration_ms,
+                        s.request_duration_estimate_ms, s.request_output_tokens_per_second_estimate,
+                        s.request_timing_source, s.request_speed_exclusion_reason,
                         s.cache_read_available, s.cache_write_available, s.ttft_ms,
                         s.thread_key, s.parent_thread_key, s.task_id, s.agent_role,
                         s.speed_exclusion_reason, s.pricing_status,
@@ -1513,6 +1795,7 @@ class DashboardDB:
                 self._connection.execute("ALTER TABLE history_snapshots ADD COLUMN speed_duration_ms REAL NOT NULL DEFAULT 0")
             if "history_snapshots" in tables:
                 migrations = {
+                    **request_timing_columns,
                     "cache_read_available": "INTEGER NOT NULL DEFAULT 0",
                     "cache_write_available": "INTEGER NOT NULL DEFAULT 0",
                     "ttft_ms": "REAL",
@@ -1540,6 +1823,14 @@ class DashboardDB:
             self._connection.execute("DROP VIEW IF EXISTS usage_records")
             for statement in statements:
                 self._connection.execute(statement)
+            if not self._connection.execute(
+                    "SELECT 1 FROM history_meta WHERE key='scan_defaults_60s_v1'").fetchone():
+                # Apply this release's requested default once. Later explicit
+                # user choices survive all subsequent starts and upgrades.
+                self._connection.executemany("INSERT OR REPLACE INTO history_meta(key,value) VALUES (?,?)", [
+                    ("auto_scan", "1"), ("scan_interval_seconds", str(DEFAULT_SCAN_INTERVAL_SECONDS)),
+                    ("scan_defaults_60s_v1", "1"),
+                ])
             # Deduplicate immutable rate objects while keeping the full JSON
             # available through usage_records and the request APIs.
             if "history_snapshots" in tables:
@@ -1658,6 +1949,8 @@ class DashboardDB:
                 sum(row[key] not in (None, "", "unknown", "Unknown") for key in
                     ("model", "provider", "workspace")),
                 bool(row["speed_group_key"]) if "speed_group_key" in row.keys() else False,
+                row["request_duration_estimate_ms"] is not None
+                    if "request_duration_estimate_ms" in row.keys() else False,
                 row["timestamp"],
                 row["source_line"] if "source_line" in row.keys() else 0,
                 row["source_path"] if "source_path" in row.keys() else "")
@@ -1672,6 +1965,9 @@ class DashboardDB:
         columns = set(row.keys())
         speed = (row["speed_group_key"], row["speed_output_tokens"], row["speed_duration_ms"]) \
             if "speed_group_key" in columns else (None, 0, 0.0)
+        request_timing = tuple(row[name] if name in columns else None for name in (
+            "request_duration_estimate_ms", "request_output_tokens_per_second_estimate",
+            "request_timing_source", "request_speed_exclusion_reason"))
         raw_thread = row["thread_id"] if "thread_id" in columns else None
         raw_parent = row["parent_thread_id"] if "parent_thread_id" in columns else None
         thread_key = row["thread_key"] if "thread_key" in columns else None
@@ -1721,7 +2017,7 @@ class DashboardDB:
         fingerprint = hashlib.sha256(key + json.dumps(
             [*context, row["timestamp"], *tokens, *([*speed] if speed[0] else []),
              cache_read_available, cache_write_available, ttft_ms, thread_key, parent_thread_key,
-             task_id, agent_role, exclusion, *pricing_fields], ensure_ascii=False, sort_keys=True,
+             task_id, agent_role, exclusion, *request_timing, *pricing_fields], ensure_ascii=False, sort_keys=True,
              separators=(",", ":")).encode("utf-8")).digest()
         _, day, hour = _parse_timestamp(row["timestamp"], timezone=self.timezone)
         self._connection.execute("""INSERT OR IGNORE INTO history_snapshots
@@ -1731,12 +2027,14 @@ class DashboardDB:
              cache_write_available,ttft_ms,thread_key,parent_thread_key,task_id,agent_role,
              speed_exclusion_reason,pricing_status,rate_snapshot,rate_snapshot_id,cost_multiplier,
              cost_before_discount_usd,cost_after_discount_usd,cost_breakdown_before_discount,
-             cache_savings_before_discount_usd,cache_savings_after_discount_usd)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             cache_savings_before_discount_usd,cache_savings_after_discount_usd,
+             request_duration_estimate_ms,request_output_tokens_per_second_estimate,
+             request_timing_source,request_speed_exclusion_reason)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (fingerprint, context_id, row["timestamp"], day, hour, *tokens, *speed,
              cache_read_available, cache_write_available, ttft_ms, thread_key, parent_thread_key,
              task_id, agent_role, exclusion, pricing_fields[0], "{}", rate_snapshot_id,
-             *pricing_fields[2:]))
+             *pricing_fields[2:], *request_timing))
         return self._connection.execute(
             "SELECT id FROM history_snapshots WHERE fingerprint=?", (fingerprint,)).fetchone()[0]
 
@@ -1853,46 +2151,65 @@ class DashboardDB:
         return value.astimezone(self.timezone)
 
     def scan(self) -> ScanResult:
+        # Manual refreshes and the poller share parser state and source indexes.
+        # Serialize scans, while leaving the database writer free during I/O.
+        with self._scan_lock:
+            return self._scan_files()
+
+    def _scan_files(self) -> ScanResult:
         result = ScanResult()
         files = self._files()
+        complete_roots = tuple(self._complete_roots)
         result.unavailable_roots = self._unavailable_roots
         result.files_seen = len(files)
         seen = {str(path) for path in files}
         with self._lock:
             existing = {row["path"]: row for row in self._connection.execute("SELECT * FROM source_files")}
+        prepared = []
+        for path in files:
+            key = str(path)
+            try:
+                stat = path.stat()
+            except OSError:
+                result.incomplete_files += 1
+                continue
+            signature = (stat.st_mtime_ns, stat.st_size, self.timezone_name, PARSER_SCHEMA_VERSION)
+            previous = existing.get(key)
+            if previous and tuple(previous[name] for name in
+                    ("mtime_ns", "size", "timezone", "parser_version")) == signature:
+                result.files_unchanged += 1
+                continue
+            result.files_scanned += 1
+            records, parse_errors = self.parser.parse(path)
+            result.parse_errors += parse_errors
+            try:
+                after = path.stat()
+                stable = (after.st_size, after.st_mtime_ns) == (stat.st_size, stat.st_mtime_ns)
+                grew = after.st_size > stat.st_size and after.st_size >= self.parser._read_limit \
+                    and after.st_ino == stat.st_ino
+            except OSError:
+                stable = grew = False
+            complete = stable and not self.parser._incomplete_tail
+            if self.parser._read_failed or not complete:
+                result.incomplete_files += 1
+            # A growing append-only log has usable committed JSONL records.
+            # Replacements/truncations/read failures need a clean retry.
+            if self.parser._read_failed or not (stable or grew):
+                continue
+            if parse_errors and previous:
+                result.records_skipped += previous["record_count"]
+                continue
+            prepared.append((key, signature, records, parse_errors, complete,
+                             "modern" if self.parser._has_modern else "legacy"))
+        with self._lock:
             try:
                 self._connection.execute("BEGIN")
                 _cleanup_days, cleanup_before = self._cleanup_meta_locked()
+                # A user cleanup/relocation may have committed while parsing.
+                existing = {row["path"]: row for row in self._connection.execute("SELECT * FROM source_files")}
                 affected = set()
-                for path in files:
-                    key = str(path)
-                    try:
-                        stat = path.stat()
-                    except OSError:
-                        result.incomplete_files += 1
-                        continue
-                    signature = (stat.st_mtime_ns, stat.st_size, self.timezone_name, PARSER_SCHEMA_VERSION)
+                for key, signature, records, parse_errors, complete, usage_format in prepared:
                     previous = existing.get(key)
-                    if previous and tuple(previous[name] for name in
-                            ("mtime_ns", "size", "timezone", "parser_version")) == signature:
-                        result.files_unchanged += 1
-                        continue
-                    result.files_scanned += 1
-                    records, parse_errors = self.parser.parse(path)
-                    result.parse_errors += parse_errors
-                    try:
-                        after = path.stat()
-                        stable = (after.st_size, after.st_mtime_ns) == (stat.st_size, stat.st_mtime_ns)
-                    except OSError:
-                        stable = False
-                    if self.parser._read_failed or not stable:
-                        result.incomplete_files += 1
-                        continue
-                    # Never replace a previously good ledger from a damaged
-                    # read. New files may contribute valid rows; retry errors.
-                    if parse_errors and previous:
-                        result.records_skipped += previous["record_count"]
-                        continue
                     parsed = []
                     purged_records = 0
                     for record in records:
@@ -1904,11 +2221,11 @@ class DashboardDB:
                         parsed.append((self._history_key(row), row))
                     result.records_skipped += purged_records
                     new_keys = {logical for logical, _ in parsed}
-                    usage_format = "modern" if self.parser._has_modern else "legacy"
-                    if previous:
+                    superseded = previous and previous["usage_format"] == "legacy" and usage_format == "modern"
+                    if previous and (complete or superseded):
                         # Old cumulative telemetry superseded by modern usage
                         # must not survive as a second copy of the same calls.
-                        retire = previous["usage_format"] == "legacy" and usage_format == "modern"
+                        retire = bool(superseded)
                         affected.update(self._detach_source(previous["id"], new_keys, retire))
                     self._connection.execute("""INSERT INTO source_files
                         (path,mtime_ns,size,scanned_at,record_count,timezone,parser_version,usage_format)
@@ -1917,15 +2234,20 @@ class DashboardDB:
                         record_count=excluded.record_count,timezone=excluded.timezone,
                         parser_version=excluded.parser_version,usage_format=excluded.usage_format""",
                         (key, signature[0], signature[1], _now_iso(), len(new_keys),
-                         self.timezone_name, PARSER_SCHEMA_VERSION if not parse_errors else 0, usage_format))
+                         self.timezone_name, PARSER_SCHEMA_VERSION if complete and not parse_errors else 0,
+                         usage_format))
                     file_id = self._connection.execute("SELECT id FROM source_files WHERE path=?", (key,)).fetchone()[0]
                     for logical, row in parsed:
                         self._store_source(file_id, logical, self._store_snapshot(logical, row), row["source_line"])
+                    if not complete:
+                        self._connection.execute("""UPDATE source_files SET record_count=(
+                            SELECT COUNT(*) FROM history_sources WHERE file_id=?) WHERE id=?""",
+                            (file_id, file_id))
                     affected.update(new_keys)
                     result.records_added += len(new_keys)
                     result.records_skipped += len(parsed) - len(new_keys)
                 for path, previous in existing.items():
-                    if path not in seen and any(_is_within(Path(path), root) for root in self._complete_roots):
+                    if path not in seen and any(_is_within(Path(path), root) for root in complete_roots):
                         affected.update(self._detach_source(previous["id"]))
                         self._connection.execute("DELETE FROM source_files WHERE id=?", (previous["id"],))
                         result.files_removed += 1
@@ -1933,7 +2255,7 @@ class DashboardDB:
                 if affected or result.files_removed:
                     self._collect_unused_snapshots()
                 self._connection.commit()
-                if result.files_scanned or result.files_removed:
+                if affected or result.files_removed:
                     self._data_version += 1
                 self._maintain_storage()
             except Exception:
@@ -2008,10 +2330,16 @@ class DashboardDB:
             raise ValueError("date must use YYYY-MM-DD format")
         return parsed
 
-    def _thread_relationship_map(self) -> Dict[str, Optional[str]]:
-        with self._lock:
+    def _thread_relationship_map(self, reader=None) -> Dict[str, Optional[str]]:
+        if reader is not None:
             return {row["thread_key"]: row["parent_thread_key"] for row in
-                    self._connection.execute("SELECT thread_key,parent_thread_key FROM thread_relationships")}
+                    reader.execute("SELECT thread_key,parent_thread_key FROM thread_relationships")}
+        reader = sqlite3.connect(str(self.db_path), timeout=5.0)
+        try:
+            reader.row_factory = sqlite3.Row
+            return self._thread_relationship_map(reader)
+        finally:
+            reader.close()
 
     @staticmethod
     def _root_thread_key(thread_key: Optional[str], relations: Mapping[str, Optional[str]]) -> Optional[str]:
@@ -2084,7 +2412,7 @@ class DashboardDB:
             reader.close()
 
     def _request_dict(self, row: Mapping[str, Any], relations=None) -> Dict[str, Any]:
-        relations = relations or self._thread_relationship_map()
+        relations = self._thread_relationship_map() if relations is None else relations
         thread_key = row["thread_key"]
         parent_key = row["parent_thread_key"]
         task_id = self._root_thread_key(thread_key, relations) or row["task_id"]
@@ -2126,6 +2454,11 @@ class DashboardDB:
             "ttft_ms": _as_float(row["ttft_ms"]),
             "speed_duration_ms": float(row["speed_duration_ms"] or 0),
             "speed_group_key": row["speed_group_key"],
+            "request_duration_estimate_ms": _as_float(row["request_duration_estimate_ms"]),
+            "request_output_tokens_per_second_estimate": _as_float(
+                row["request_output_tokens_per_second_estimate"]),
+            "request_timing_source": row["request_timing_source"],
+            "request_speed_exclusion_reason": row["request_speed_exclusion_reason"],
         }
 
     def requests(
@@ -2153,13 +2486,14 @@ class DashboardDB:
         try:
             reader.row_factory = sqlite3.Row
             reader.create_function("canonical_model", 1, canonical_model)
+            reader.execute("BEGIN")
             total = int(reader.execute("SELECT COUNT(*) FROM usage_records" + predicate, params).fetchone()[0])
             selected = reader.execute("SELECT * FROM usage_records" + predicate +
                 " ORDER BY " + order + " LIMIT ? OFFSET ?", [*params, page_size, offset]).fetchall()
+            relations = self._thread_relationship_map(reader)
         finally:
             reader.close()
         self.catalog.reload()
-        relations = self._thread_relationship_map()
         return {
             "data": [self._request_dict(row, relations) for row in selected],
             "total": total,
@@ -2174,18 +2508,24 @@ class DashboardDB:
             key = bytes.fromhex(request_id)
         except ValueError:
             return None
-        with self._lock:
-            row = self._connection.execute("""SELECT lower(hex(r.logical_key)) AS request_id,
+        reader = sqlite3.connect(str(self.db_path), timeout=5.0)
+        try:
+            reader.row_factory = sqlite3.Row
+            reader.execute("BEGIN")
+            row = reader.execute("""SELECT lower(hex(r.logical_key)) AS request_id,
                 s.*, COALESCE(p.snapshot_json,s.rate_snapshot) AS effective_rate_snapshot,
                 c.provider,c.model,c.workspace FROM history_requests r
                 JOIN history_snapshots s ON s.id=r.snapshot_id
                 JOIN history_contexts c ON c.id=s.context_id
                 LEFT JOIN pricing_snapshots p ON p.id=s.rate_snapshot_id
                 WHERE r.logical_key=?""", (key,)).fetchone()
+            relations = self._thread_relationship_map(reader) if row else {}
+        finally:
+            reader.close()
         if not row:
             return None
         self.catalog.reload()
-        return self._request_dict(row)
+        return self._request_dict(row, relations)
 
     def tasks(
         self, *, days=30, provider=None, workspace=None, model=None, start_date=None, end_date=None,
@@ -2233,9 +2573,11 @@ class DashboardDB:
             values = {row["key"]: row["value"] for row in self._connection.execute(
                 "SELECT key,value FROM history_meta WHERE key IN ('auto_scan','scan_interval_seconds')")}
         try:
-            interval = float(values.get("scan_interval_seconds", "2"))
+            interval = float(values.get("scan_interval_seconds", str(DEFAULT_SCAN_INTERVAL_SECONDS)))
         except (TypeError, ValueError):
-            interval = 2.0
+            interval = DEFAULT_SCAN_INTERVAL_SECONDS
+        if not math.isfinite(interval):
+            interval = DEFAULT_SCAN_INTERVAL_SECONDS
         interval = min(86400.0, max(0.25, interval))
         auto_scan = values.get("auto_scan", "1").strip().casefold() not in ("0", "false", "no")
         return {"auto_scan": auto_scan, "interval_seconds": interval}
@@ -2616,6 +2958,7 @@ class DashboardDB:
                     self._dashboard_cache.clear()
                 self._dashboard_cache[key] = self._build_dashboard(
                     days, provider, workspace, model, start_date, end_date, bool(compare))
+                self._dashboard_cache[key]["data_version"] = key[0]
             return self._dashboard_cache[key]
 
     def _build_dashboard(
@@ -2906,6 +3249,7 @@ class DashboardService:
         self.auto_scan = bool(stored_options["auto_scan"])
         self._stop = threading.Event()
         self._wake_scan = threading.Event()
+        self._refresh_requested = threading.Event()
         self._changed = threading.Condition()
         self._version = 0
         self._thread: Optional[threading.Thread] = None
@@ -2974,9 +3318,12 @@ class DashboardService:
             self._wake_scan.clear()
             if self._stop.is_set():
                 break
-            if woke:
+            with self._changed:
+                requested = self._refresh_requested.is_set()
+                self._refresh_requested.clear()
+            if woke and not requested:
                 continue
-            if not self.auto_scan:
+            if not requested and not self.auto_scan:
                 continue
             try:
                 self.refresh()
@@ -2984,6 +3331,12 @@ class DashboardService:
                 # A partially-written JSONL is expected while Codex is active;
                 # keep the poller alive and let the next pass retry it.
                 continue
+
+    def request_refresh(self) -> None:
+        """Queue an immediate background refresh without blocking the UI."""
+        with self._changed:
+            self._refresh_requested.set()
+            self._wake_scan.set()
 
     def set_scan_options(self, auto_scan: Any, interval_seconds: Any) -> Dict[str, Any]:
         options = self.database.set_scan_options(auto_scan, interval_seconds)
@@ -3325,7 +3678,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = service.set_scan_options(body["auto_scan"], body["interval_seconds"])
                 self._write_json(result)
                 return
-            if route == "/api/scan/now":
+            if route in ("/api/scan/now", "/api/refresh"):
                 if body:
                     self._write_json({"error": "invalid_body"}, HTTPStatus.BAD_REQUEST)
                     return

@@ -16,6 +16,13 @@ SELF_TEST_REPORT = {
     "checks": [],
 }
 
+DEPENDENCY_REPORT = {
+    "status": "passed",
+    "frozen": True,
+    "renderer": "edgechromium",
+    "gui_tested": False,
+}
+
 
 class BuildDesktopTests(unittest.TestCase):
     def make_source(self, root):
@@ -83,22 +90,29 @@ class BuildDesktopTests(unittest.TestCase):
                 if "--self-test" in command:
                     report_path = Path(command[command.index("--self-test-report") + 1])
                     report_path.write_text(json.dumps(SELF_TEST_REPORT), encoding="utf-8")
+                if "--probe-desktop-dependencies" in command:
+                    report_path = Path(command[command.index("--probe-report") + 1])
+                    report_path.write_text(json.dumps(DEPENDENCY_REPORT), encoding="utf-8")
 
             with patch.object(builder, "SOURCE_DIR", source), patch.object(builder.sys, "platform", "win32"), patch.object(builder, "run", side_effect=fake_run):
                 archive, manifest_path = builder.build(root / "release")
-            self.assertEqual(len(calls), 4)
+            self.assertEqual(len(calls), 5)
             self.assertTrue(all(cwd != source for _, cwd, _ in calls))
             self.assertIn("unittest", calls[0][0])
             self.assertEqual(calls[1][0][:2], ["node", "--check"])
             self.assertIn("--self-test", calls[3][0])
             self.assertIn("--self-test-report", calls[3][0])
+            self.assertIn("--probe-desktop-dependencies", calls[4][0])
             self.assertNotEqual(calls[0][2]["CODEX_HOME"], str(source))
             self.assertEqual(original_cache.read_bytes(), b"do not touch")
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["source_digest"], builder.source_digest(source))
             self.assertEqual(manifest["self_test"], SELF_TEST_REPORT)
+            self.assertEqual(manifest["desktop_dependencies"], DEPENDENCY_REPORT)
             exe = next(item for item in manifest["files"] if item["path"] == "CodexTokenDesktop.exe")
             self.assertEqual(exe["sha256"], hashlib.sha256(b"fake executable").hexdigest())
+            self.assertEqual(exe["size_bytes"], len(b"fake executable"))
+            self.assertEqual(manifest["payload_size_bytes"], sum(item.get("size_bytes", 0) for item in manifest["files"]))
             with zipfile.ZipFile(archive) as package:
                 self.assertIn("CodexTokenDesktop/build-manifest.json", package.namelist())
                 self.assertFalse(any("sqlite" in name for name in package.namelist()))
@@ -154,6 +168,7 @@ class BuildDesktopTests(unittest.TestCase):
             self.assertTrue(archive.is_file())
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["self_test"], SELF_TEST_REPORT)
+            self.assertIsNone(manifest["desktop_dependencies"])
             self.assertEqual(manifest["architecture"], "arm64")
             self.assertEqual(manifest["validation"], "skipped")
             self.assertEqual(manifest["source_digest"], builder.source_digest(source))
@@ -176,6 +191,33 @@ class BuildDesktopTests(unittest.TestCase):
             with patch.object(builder, "SOURCE_DIR", source), patch.object(builder.sys, "platform", "win32"), patch.object(builder, "run", side_effect=fake_run):
                 with self.assertRaisesRegex(RuntimeError, "self-test did not pass"):
                     builder.build(root / "release", skip_tests=True)
+
+    def test_windows_build_rejects_unverified_desktop_dependencies(self):
+        reports = [
+            {**DEPENDENCY_REPORT, "status": "failed"},
+            {**DEPENDENCY_REPORT, "frozen": False},
+            {**DEPENDENCY_REPORT, "renderer": "mshtml"},
+        ]
+        for report in reports:
+            with self.subTest(report=report), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                source = root / "source"
+                self.make_source(source)
+
+                def fake_run(command, cwd, env=None):
+                    if "PyInstaller" in command:
+                        output = Path(command[command.index("--distpath") + 1]) / "CodexTokenDesktop"
+                        output.mkdir(parents=True)
+                        (output / "CodexTokenDesktop.exe").write_bytes(b"fake executable")
+                    elif "--self-test" in command:
+                        Path(command[-1]).write_text(json.dumps(SELF_TEST_REPORT), encoding="utf-8")
+                    elif "--probe-desktop-dependencies" in command:
+                        Path(command[-1]).write_text(json.dumps(report), encoding="utf-8")
+
+                with patch.object(builder, "SOURCE_DIR", source), patch.object(builder.sys, "platform", "win32"), patch.object(builder, "run", side_effect=fake_run):
+                    with self.assertRaisesRegex(RuntimeError, "dependency probe did not pass"):
+                        builder.build(root / "release", skip_tests=True)
+                self.assertFalse(list((root / "release").glob("*.zip")))
 
 
 if __name__ == "__main__":

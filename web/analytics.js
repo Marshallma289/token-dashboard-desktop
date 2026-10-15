@@ -17,7 +17,24 @@
     selectedCatalogModel: null,
     requestPage: 1,
     requestPageSize: 30,
-    queryKey: '',
+    queryKey: null,
+    queryVersion: null,
+    requestLoadId: 0,
+    requestController: null,
+    requestPromise: null,
+    requestPendingKey: '',
+    requestLoadedKey: '',
+    requestsLoading: false,
+    requestsError: '',
+    taskLoadId: 0,
+    taskController: null,
+    taskPromise: null,
+    taskPendingKey: '',
+    taskLoadedKey: '',
+    tasksLoading: false,
+    tasksError: '',
+    detailLoadId: 0,
+    detailController: null,
     preview: null,
     loadingPricing: false,
     requestsContext: ''
@@ -69,8 +86,8 @@
   const currentCostKey = () => window.CodexDashboard && window.CodexDashboard.getCostMode() === 'before' ? 'costBefore' : 'costAfter';
   const currentCostLabel = () => currentCostKey() === 'costBefore' ? '折扣前' : '折扣后';
 
-  async function readJson(url) {
-    const response = await fetch(url, { headers: { Accept: 'application/json' }, cache: 'no-store' });
+  async function readJson(url, options = {}) {
+    const response = await fetch(url, { headers: { Accept: 'application/json' }, cache: 'no-store', ...options });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     return response.json();
   }
@@ -233,10 +250,51 @@
   }
 
   const exclusionLabels = {
+    missing_thread_id: '缺少线程标识', missing_turn_id: '缺少轮次标识',
+    mixed_attribution: '轮内归属发生变化', missing_request_id: '缺少稳定请求标识',
+    missing_or_invalid_duration: '轮次尚未完成或缺少有效耗时',
+    inconsistent_turn_output: '轮次输出用量无法核对', outside_sample_day: '已归入轮次结束日期',
     incomplete_turn: '轮次未完成', missing_timing: '缺少计时信息', missing_output: '缺少输出 Token',
     ambiguous_model: '轮内模型归属不明确', mixed_models: '轮内切换模型', missing_model: '缺少模型信息',
     invalid_timing: '计时值无效', incomplete: '轮次未完成', no_timing: '缺少计时信息'
   };
+
+  const requestSpeedNote = '输出 Token ÷ 日志估算的请求耗时（秒），包含首字等待；输出至少 200 Token 且耗时至少 1 秒时显示。';
+  const requestSpeedExclusionLabels = {
+    missing_start: '缺少请求开始边界', missing_model_output: '缺少模型输出边界',
+    missing_timestamp: '缺少有效时间戳', invalid_duration: '请求估算耗时无效',
+    unmatched_token_count: '未找到匹配的用量记录', usage_signature_mismatch: '用量记录不匹配',
+    ambiguous_usage_match: '存在多个用量匹配候选', compaction: '上下文压缩记录缺少可靠边界',
+    missing_cumulative_baseline: '缺少累计用量基线', interrupted_request: '请求计时被轮次或线程切换中断', output_below_200: '输出不足 200 Token',
+    duration_below_1000ms: '估算耗时不足 1 秒'
+  };
+  const requestTimingSourceLabels = {
+    token_usage_record: '日志用量记录与 Token 快照匹配',
+    last_model_output: '日志中最后一次模型输出边界',
+    token_count: '日志 Token 用量快照边界'
+  };
+
+  function requestSpeedInfo(row) {
+    const durationRaw = get(row, 'request_duration_estimate_ms');
+    const rateRaw = get(row, 'request_output_tokens_per_second_estimate');
+    const output = numeric(get(row, 'output_tokens', 'output'));
+    const duration = durationRaw === undefined ? null : Number(durationRaw);
+    const rate = rateRaw === undefined ? null : Number(rateRaw);
+    const reason = get(row, 'request_speed_exclusion_reason');
+    const valid = !reason && output >= 200 && duration !== null && duration >= 1000 && Number.isFinite(duration)
+      && rate !== null && rate > 0 && Number.isFinite(rate);
+    const missingReason = reason ? (requestSpeedExclusionLabels[reason] || String(reason))
+      : output < 200 ? requestSpeedExclusionLabels.output_below_200
+        : duration === null ? '日志未提供可靠的请求计时'
+          : !Number.isFinite(duration) || duration <= 0 ? requestSpeedExclusionLabels.invalid_duration
+            : duration < 1000 ? requestSpeedExclusionLabels.duration_below_1000ms
+              : '日志未提供可用的请求速度估算';
+    return {
+      text: valid ? `≈ ${rate.toFixed(1)} tok/s` : '—',
+      reason: valid ? '' : missingReason,
+      title: valid ? requestSpeedNote : `${missingReason}。${requestSpeedNote}`
+    };
+  }
 
   function renderTtft(data) {
     const summary = data && data.summary || {};
@@ -326,7 +384,7 @@
     $('#trendMetricNote').textContent = metric === 'cost' ? `费用趋势按${currentCostLabel()}显示；未计价记录不计入费用。` : metric === 'cache' ? '缓存趋势按可用的缓存读取 Token 汇总。' : metric === 'cache_savings' ? `缓存节省按${currentCostLabel()}显示，并依赖缓存单价配置。` : `当前显示每日${metricName}。`;
   }
 
-  function showMissingCache(row, field, availableField, aliases) {
+  function showMissingCache(row, availableField, aliases) {
     const explicit = get(row, availableField);
     const value = get(row, ...aliases);
     if (explicit !== true || value === undefined) return '未提供';
@@ -338,69 +396,138 @@
     const snapshot = window.CodexDashboard.getState();
     state.snapshot = snapshot;
     const key = queryKey(snapshot);
-    if (!force && key === state.queryKey) return;
+    const revision = state.dashboard ? state.dashboard.dataVersion ?? state.dashboard.generatedAt ?? '' : '';
+    const version = `${revision}|${state.dashboard && state.dashboard.localDate || ''}`;
+    const filterChanged = key !== state.queryKey;
+    const versionChanged = version !== state.queryVersion;
+    if (!force && !filterChanged && !versionChanged && !state.requestsError && !state.tasksError) return;
     state.queryKey = key;
-    state.requestPage = 1;
-    const requestsPromise = readJson(fullQuery('/api/requests', { page: state.requestPage, page_size: state.requestPageSize, sort: $('#requestSort').value, cost_mode: requestCostMode() }));
-    const tasksPromise = readJson(fullQuery('/api/tasks'));
-    const [requestsResult, tasksResult] = await Promise.allSettled([requestsPromise, tasksPromise]);
-    if (key !== state.queryKey) return;
-    if (requestsResult.status === 'fulfilled') {
-      state.requests = requestsResult.value || { data: [], total: 0, page: 1, page_size: state.requestPageSize };
-      state.requests.data = Array.isArray(state.requests.data) ? state.requests.data : [];
-      renderRequests();
-    } else {
+    state.queryVersion = version;
+    if (filterChanged) {
+      state.requestPage = 1;
       state.requests = { data: [], total: 0, page: 1, page_size: state.requestPageSize };
-      renderRequests(requestsResult.reason && requestsResult.reason.message);
-    }
-    if (tasksResult.status === 'fulfilled') {
-      const payload = tasksResult.value || {};
-      state.tasks = Array.isArray(payload.data) ? payload.data : [];
-      renderTasks();
-    } else {
       state.tasks = [];
-      renderTasks(tasksResult.reason && tasksResult.reason.message);
+      state.requestLoadedKey = '';
+      state.taskLoadedKey = '';
     }
+    // Each loader commits as soon as its own response arrives. A slow task
+    // aggregation must not delay a fresh page of request records.
+    await Promise.allSettled([loadRequestPage({ force }), loadTasks({ force })]);
   }
 
-  async function loadRequestPage() {
+  function loadRequestPage(options = {}) {
     const url = fullQuery('/api/requests', { page: state.requestPage, page_size: state.requestPageSize, sort: $('#requestSort').value, cost_mode: requestCostMode() });
-    try {
-      const result = await readJson(url);
-      state.requests = result || { data: [], total: 0, page: state.requestPage, page_size: state.requestPageSize };
-      state.requests.data = Array.isArray(state.requests.data) ? state.requests.data : [];
-      renderRequests();
-    } catch (error) { renderRequests(error.message); }
+    const key = `${state.queryVersion}|${url}`;
+    if (state.requestPromise && key === state.requestPendingKey) return state.requestPromise;
+    if (!options.force && !state.requestPromise && key === state.requestLoadedKey && !state.requestsError) return Promise.resolve();
+    if (state.requestController) state.requestController.abort();
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const loadId = ++state.requestLoadId;
+    const page = state.requestPage;
+    state.requestController = controller;
+    state.requestPendingKey = key;
+    state.requestsLoading = true;
+    state.requestsError = '';
+    renderRequests();
+    const current = () => loadId === state.requestLoadId && state.requestController === controller;
+    state.requestPromise = (async () => {
+      try {
+        const result = await readJson(url, { signal: controller ? controller.signal : undefined });
+        if (!current()) return;
+        const payload = result || { data: [], total: 0, page, page_size: state.requestPageSize };
+        const totalPages = Math.max(1, Math.ceil(numeric(payload.total) / Math.max(1, numeric(payload.page_size) || state.requestPageSize)));
+        if (page > totalPages) {
+          state.requestPage = totalPages;
+          return loadRequestPage({ force: true });
+        }
+        state.requests = { ...payload, data: Array.isArray(payload.data) ? payload.data : [] };
+        state.requestPage = numeric(payload.page) || page;
+        state.requestLoadedKey = key;
+      } catch (error) {
+        if (!current() || error && error.name === 'AbortError') return;
+        state.requestsError = error && error.message || '网络请求失败';
+        state.requestPage = numeric(state.requests.page) || 1;
+      } finally {
+        if (current()) {
+          state.requestsLoading = false;
+          state.requestController = null;
+          state.requestPromise = null;
+          state.requestPendingKey = '';
+          renderRequests();
+        }
+      }
+    })();
+    return state.requestPromise;
   }
 
-  function renderRequests(error = '') {
+  function loadTasks(options = {}) {
+    const url = fullQuery('/api/tasks');
+    const key = `${state.queryVersion}|${url}`;
+    if (state.taskPromise && key === state.taskPendingKey) return state.taskPromise;
+    if (!options.force && !state.taskPromise && key === state.taskLoadedKey && !state.tasksError) return Promise.resolve();
+    if (state.taskController) state.taskController.abort();
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const loadId = ++state.taskLoadId;
+    state.taskController = controller;
+    state.taskPendingKey = key;
+    state.tasksLoading = true;
+    state.tasksError = '';
+    renderTasks();
+    const current = () => loadId === state.taskLoadId && state.taskController === controller;
+    state.taskPromise = (async () => {
+      try {
+        const payload = await readJson(url, { signal: controller ? controller.signal : undefined });
+        if (!current()) return;
+        state.tasks = payload && Array.isArray(payload.data) ? payload.data : [];
+        state.taskLoadedKey = key;
+      } catch (error) {
+        if (!current() || error && error.name === 'AbortError') return;
+        state.tasksError = error && error.message || '网络请求失败';
+      } finally {
+        if (current()) {
+          state.tasksLoading = false;
+          state.taskController = null;
+          state.taskPromise = null;
+          state.taskPendingKey = '';
+          renderTasks();
+        }
+      }
+    })();
+    return state.taskPromise;
+  }
+
+  function renderRequests(error = state.requestsError) {
     const body = $('#requestsTable tbody');
     const rows = state.requests.data || [];
     $('#requestsEmpty').hidden = rows.length > 0;
     if (error) $('#requestsEmpty').textContent = `请求明细暂不可用（${error}）。`;
-    else $('#requestsEmpty').textContent = '当前筛选范围没有请求明细。';
+    else $('#requestsEmpty').textContent = state.requestsLoading ? '正在读取请求明细…' : '当前筛选范围没有请求明细。';
+    $('#requestsPanel').setAttribute('aria-busy', String(state.requestsLoading));
     const mode = currentCostKey();
     body.innerHTML = rows.map(row => {
       const id = str(get(row, 'request_id', 'id', 'requestId'));
       const pricing = str(get(row, 'pricing_status', 'pricingStatus'), 'priced');
       const price = get(row, mode === 'costBefore' ? 'cost_before_discount_usd' : 'cost_after_discount_usd', mode === 'costBefore' ? 'costBeforeDiscountUsd' : 'costAfterDiscountUsd', 'estimated_cost_usd');
       const fee = pricing === 'unpriced' ? '未计价' : price === undefined ? '—' : currency(price);
-      const cacheRead = showMissingCache(row, 'cache_read_tokens', 'cache_read_available', ['cache_read_tokens', 'cached_input_tokens', 'cache']);
-      const cacheWrite = showMissingCache(row, 'cache_write_tokens', 'cache_write_available', ['cache_write_tokens', 'cache_write_input_tokens', 'cache_write']);
+      const cacheRead = showMissingCache(row, 'cache_read_available', ['cache_read_tokens', 'cached_input_tokens', 'cache']);
+      const cacheWrite = showMissingCache(row, 'cache_write_available', ['cache_write_tokens', 'cache_write_input_tokens', 'cache_write']);
+      const speed = requestSpeedInfo(row);
       const detailAttrs = id ? `data-request-id="${esc(id)}"` : '';
-      return `<tr class="request-row" tabindex="0" role="button" aria-label="打开请求统计详情" ${detailAttrs}><td>${esc(timestamp(get(row, 'timestamp', 'time', 'created_at')))}</td><td>${esc(get(row, 'provider_label', 'provider', 'provider_id'))}</td><td>${esc(get(row, 'workspace', 'workspace_id'))}</td><td>${esc(get(row, 'model', 'model_name'))}</td><td class="num">${esc(number(get(row, 'input_tokens', 'input')))}</td><td class="num">${esc(get(row, 'fresh_input_tokens') === undefined ? '未提供' : number(row.fresh_input_tokens))}</td><td class="num">${esc(cacheRead)}</td><td class="num">${esc(cacheWrite)}</td><td class="num">${esc(number(get(row, 'output_tokens', 'output')))}</td><td class="num" title="${esc(currentCostLabel())}">${esc(fee)}</td><td><span class="provider-pill" title="${esc(get(row, 'pricing_note', 'pricingNote'))}">${esc(pricingStatusLabel(pricing))}</span></td></tr>`;
+      return `<tr class="request-row" tabindex="0" role="button" aria-label="打开请求统计详情" ${detailAttrs}><td>${esc(timestamp(get(row, 'timestamp', 'time', 'created_at')))}</td><td>${esc(get(row, 'provider_label', 'provider', 'provider_id'))}</td><td>${esc(get(row, 'workspace', 'workspace_id'))}</td><td>${esc(get(row, 'model', 'model_name'))}</td><td class="num">${esc(number(get(row, 'input_tokens', 'input')))}</td><td class="num">${esc(get(row, 'fresh_input_tokens') === undefined ? '未提供' : number(row.fresh_input_tokens))}</td><td class="num">${esc(cacheRead)}</td><td class="num">${esc(cacheWrite)}</td><td class="num">${esc(number(get(row, 'output_tokens', 'output')))}</td><td class="num" title="${esc(speed.title)}">${esc(speed.text)}</td><td class="num" title="${esc(currentCostLabel())}">${esc(fee)}</td><td><span class="provider-pill" title="${esc(get(row, 'pricing_note', 'pricingNote'))}">${esc(pricingStatusLabel(pricing))}</span></td></tr>`;
     }).join('');
     const total = numeric(state.requests.total), page = numeric(state.requests.page) || state.requestPage;
     const pageSize = numeric(state.requests.page_size) || state.requestPageSize;
     const totalPages = Math.max(1, Math.ceil(total / Math.max(1, pageSize)));
-    $('#requestsPageSummary').textContent = total ? `共 ${number(total)} 条 · 第 ${page} / ${totalPages} 页` : error ? '接口暂不可用' : '当前范围无请求';
-    $('#requestsPrev').disabled = !total || page <= 1;
-    $('#requestsNext').disabled = !total || page >= totalPages;
-    $('#requestsContext').textContent = state.requestsContext || '点击每日汇总行，可定位对应日期和模型的请求。';
-    $('#exportRequests').disabled = !rows.length;
+    const summary = total ? `共 ${number(total)} 条 · 第 ${page} / ${totalPages} 页` : error ? '接口暂不可用' : '当前范围无请求';
+    $('#requestsPageSummary').textContent = state.requestsLoading ? `${total ? summary : '请求明细'} · 更新中…` : summary;
+    $('#requestsPrev').disabled = state.requestsLoading || !total || page <= 1;
+    $('#requestsNext').disabled = state.requestsLoading || !total || page >= totalPages;
+    const context = state.requestsContext || '点击每日汇总行，可定位对应日期和模型的请求。';
+    showStatus($('#requestsContext'), error ? `请求明细更新失败（${error}）。${rows.length ? '仍显示上次读取的记录。' : context}` : context, Boolean(error));
+    $('#exportRequests').disabled = state.requestsLoading || !rows.length;
   }
 
-  function cacheStateText(row, field, availability, aliases) {
+  function cacheStateText(row, availability, aliases) {
     const provided = get(row, availability);
     const value = get(row, ...aliases);
     if (provided !== true || value === undefined) return '未提供';
@@ -411,11 +538,12 @@
     return numeric(get(summary, 'total', 'total_tokens', 'tokens'));
   }
 
-  function renderTasks(error = '') {
+  function renderTasks(error = state.tasksError) {
     const body = $('#tasksTable tbody');
     const tasks = state.tasks || [];
     $('#tasksEmpty').hidden = tasks.length > 0;
-    $('#tasksEmpty').textContent = error ? `任务统计暂不可用（${error}）。` : '当前筛选范围没有任务归属数据。';
+    $('#tasksEmpty').textContent = error ? `任务统计暂不可用（${error}）。` : state.tasksLoading ? '正在读取任务统计…' : '当前筛选范围没有任务归属数据。';
+    $('#tasksTable').setAttribute('aria-busy', String(state.tasksLoading));
     const summary = state.dashboard && state.dashboard.summary || {};
     const totalCost = selectedCost(summary);
     const mode = currentCostKey();
@@ -439,19 +567,34 @@
       const id = str(get(task, 'task_id', 'id'), `task-${index + 1}`);
       return `<tr><td title="${esc(id)}"><strong>${esc(id.length > 34 ? `${id.slice(0, 33)}…` : id)}</strong></td><td>${esc(get(task, 'workspace'))}</td><td class="num">${esc(number(requests))}</td><td class="num">${esc(compact(tokens))}</td><td class="num">${esc(currency(cost))}</td><td class="num">${esc(share)}</td><td>${detail}</td></tr>`;
     }).join('');
-    $('#tasksMeta').textContent = tasks.length ? `${number(tasks.length)} 个任务 · 费用${currentCostLabel()}` : '当前筛选范围';
+    const meta = tasks.length ? `${number(tasks.length)} 个任务 · 费用${currentCostLabel()}` : '当前筛选范围';
+    $('#tasksMeta').textContent = state.tasksLoading ? `${meta} · 更新中…` : error ? `${meta} · 更新失败` : meta;
   }
 
   async function openRequestDetail(requestId) {
     if (!requestId) return;
+    if (state.detailController) state.detailController.abort();
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const loadId = ++state.detailLoadId;
+    state.detailController = controller;
+    const dialog = $('#requestDetailDialog');
+    $('#requestDetailFacts').innerHTML = '<div><dt>请求详情</dt><dd>正在读取…</dd></div>';
+    dialog.setAttribute('aria-busy', 'true');
+    if (!dialog.open) dialog.showModal();
     try {
       const query = new URLSearchParams({ id: requestId });
-      const payload = await readJson(`/api/request?${query.toString()}`);
+      const payload = await readJson(`/api/request?${query.toString()}`, { signal: controller ? controller.signal : undefined });
+      if (loadId !== state.detailLoadId) return;
       const request = payload && payload.request || {};
       renderRequestDetail(request);
-      $('#requestDetailDialog').showModal();
     } catch (error) {
-      showStatus($('#requestsContext'), `无法读取请求详情：${error.message}`, true);
+      if (loadId !== state.detailLoadId || error && error.name === 'AbortError') return;
+      $('#requestDetailFacts').innerHTML = `<div><dt>请求详情读取失败</dt><dd>${esc(error.message)}</dd></div>`;
+    } finally {
+      if (loadId === state.detailLoadId) {
+        state.detailController = null;
+        dialog.setAttribute('aria-busy', 'false');
+      }
     }
   }
 
@@ -467,16 +610,24 @@
     const detailCache = get(request, 'cache_read_tokens', 'cached_input_tokens', 'cache');
     const detailRate = cacheMetrics.calculateRate({ cachedTokens: detailCache, inputTokens: detailInput, available: get(request, 'cache_read_available') === true });
     const detailCacheRate = cachePercent(detailRate, detailRate !== null && get(request, 'cache_read_available') === true);
+    const speed = requestSpeedInfo(request);
+    const duration = get(request, 'request_duration_estimate_ms');
+    const timingSource = get(request, 'request_timing_source');
     const rows = [
       ['时间', timestamp(get(request, 'timestamp', 'time'))], ['供应商', get(request, 'provider_label', 'provider')],
       ['工作空间', get(request, 'workspace')], ['模型', get(request, 'model')], ['任务', get(request, 'task_id')],
       ['代理角色', ({ main: '主代理', subagent: '子代理', unknown: '未提供' })[get(request, 'agent_role')] || get(request, 'agent_role')], ['输入 Token', number(get(request, 'input_tokens', 'input'))],
       ['未缓存输入 Token', get(request, 'fresh_input_tokens') === undefined ? '未提供' : number(request.fresh_input_tokens)],
-      ['缓存读取 Token', cacheStateText(request, 'cache_read_tokens', 'cache_read_available', ['cache_read_tokens', 'cached_input_tokens', 'cache'])],
+      ['缓存读取 Token', cacheStateText(request, 'cache_read_available', ['cache_read_tokens', 'cached_input_tokens', 'cache'])],
       ['缓存占比', detailCacheRate],
-      ['缓存写入 Token', cacheStateText(request, 'cache_write_tokens', 'cache_write_available', ['cache_write_tokens', 'cache_write_input_tokens', 'cache_write'])],
+      ['缓存写入 Token', cacheStateText(request, 'cache_write_available', ['cache_write_tokens', 'cache_write_input_tokens', 'cache_write'])],
       ['输出 Token', number(get(request, 'output_tokens', 'output'))], ['Reasoning Token', number(get(request, 'reasoning_output_tokens', 'reasoning_tokens', 'reasoning'))],
       ['总 Token', number(get(request, 'total_tokens', 'total'))], [`费用（当前显示：${currentCostLabel()}）`, currentCost === undefined ? '—' : currencyExact(currentCost)],
+      ['单次请求速度（日志估算）', speed.text],
+      ['请求估算耗时（含首字等待）', duration === undefined ? '—' : `≈ ${(numeric(duration) / 1000).toFixed(3)} 秒`],
+      ['请求计时来源', timingSource ? requestTimingSourceLabels[timingSource] || timingSource : '—'],
+      ['请求速度说明', requestSpeedNote],
+      ['请求速度缺失原因', speed.reason || undefined],
       ['费用（折扣前）', before === undefined ? '—' : currencyExact(before)],
       ['费用（折扣后）', after === undefined ? '—' : currencyExact(after)], ['计价状态', pricingStatusLabel(get(request, 'pricing_status', 'pricingStatus'))],
       ['计价模型', get(request, 'pricing_model', 'pricingModel', 'model')],
@@ -524,7 +675,7 @@
   }
 
   function exportRequestPage() {
-    const fields = ['request_id', 'timestamp', 'provider', 'workspace', 'model', 'input_tokens', 'fresh_input_tokens', 'cache_read_tokens', 'cache_read_input_tokens', 'cache_hit_rate', 'cache_write_input_tokens', 'output_tokens', 'reasoning_tokens', 'total_tokens', 'cost_display_mode', 'displayed_cost_usd', 'estimated_cost_usd', 'cost_before_discount_usd', 'cost_after_discount_usd', 'pricing_status', 'task_id', 'agent_role'];
+    const fields = ['request_id', 'timestamp', 'provider', 'workspace', 'model', 'input_tokens', 'fresh_input_tokens', 'cache_read_tokens', 'cache_read_input_tokens', 'cache_hit_rate', 'cache_write_input_tokens', 'output_tokens', 'reasoning_tokens', 'total_tokens', 'request_duration_estimate_ms', 'request_output_tokens_per_second_estimate', 'request_timing_source', 'request_speed_exclusion_reason', 'cost_display_mode', 'displayed_cost_usd', 'estimated_cost_usd', 'cost_before_discount_usd', 'cost_after_discount_usd', 'pricing_status', 'task_id', 'agent_role'];
     const rows = (state.requests.data || []).map(row => ({
       request_id: get(row, 'request_id', 'id'), timestamp: get(row, 'timestamp', 'time'), provider: get(row, 'provider'), workspace: get(row, 'workspace'), model: get(row, 'model'),
       input_tokens: get(row, 'input_tokens', 'input'), fresh_input_tokens: get(row, 'fresh_input_tokens'), cache_read_tokens: get(row, 'cache_read_available') === true ? get(row, 'cache_read_tokens', 'cached_input_tokens', 'cache') : '未提供',
@@ -532,6 +683,9 @@
       cache_hit_rate: get(row, 'cache_read_available') === true && numeric(get(row, 'input_tokens', 'input')) > 0 ? (numeric(get(row, 'cache_read_tokens', 'cached_input_tokens', 'cache')) / numeric(get(row, 'input_tokens', 'input'))).toFixed(6) : '',
       cache_write_input_tokens: get(row, 'cache_write_available') === true ? get(row, 'cache_write_tokens', 'cache_write_input_tokens', 'cache_write') : '未提供',
       output_tokens: get(row, 'output_tokens', 'output'), reasoning_tokens: get(row, 'reasoning_output_tokens', 'reasoning_tokens', 'reasoning'), total_tokens: totalOf(row),
+      request_duration_estimate_ms: get(row, 'request_duration_estimate_ms'),
+      request_output_tokens_per_second_estimate: get(row, 'request_output_tokens_per_second_estimate'),
+      request_timing_source: get(row, 'request_timing_source'), request_speed_exclusion_reason: get(row, 'request_speed_exclusion_reason'),
       cost_display_mode: currentCostLabel(), displayed_cost_usd: costFor(row), estimated_cost_usd: costFor(row), cost_before_discount_usd: get(row, 'cost_before_discount_usd'), cost_after_discount_usd: get(row, 'cost_after_discount_usd'),
       pricing_status: get(row, 'pricing_status'), task_id: get(row, 'task_id'), agent_role: get(row, 'agent_role')
     }));
@@ -829,9 +983,8 @@
       $('#repricePreview').hidden = true;
       state.preview = null;
       showStatus($('#pricingStatus'), `已重算 ${number(result.updated_count)} 条请求。${result.backup_path ? `备份：${result.backup_path}` : ''}`);
-      if (window.CodexDashboard) window.CodexDashboard.refresh();
-      state.queryKey = '';
-      await loadQueryData(true);
+      if (window.CodexDashboard) await window.CodexDashboard.refresh();
+      else await loadQueryData(true);
     } catch (error) { showStatus($('#pricingStatus'), `重算失败：${error.message}`, true); }
     finally { button.disabled = false; }
   }
@@ -854,8 +1007,7 @@
     button.disabled = true; button.textContent = '同步中…';
     try {
       await writeJson('/api/scan/now', {});
-      await Promise.all([fetchDiagnostics(), loadQueryData(true)]);
-      if (window.CodexDashboard) window.CodexDashboard.refresh();
+      await Promise.all([fetchDiagnostics(), window.CodexDashboard ? window.CodexDashboard.refresh() : loadQueryData(true)]);
       showStatus($('#pricingStatus'), '扫描已完成。');
     } catch (error) { showStatus($('#pricingStatus'), `立即同步失败：${error.message}`, true); }
     finally { button.disabled = false; button.textContent = '立即同步'; }
@@ -918,12 +1070,22 @@
     $('#confirmReprice').addEventListener('click', confirmReprice);
     $$('[data-close-dialog]').forEach(button => button.addEventListener('click', () => { const dialog = document.getElementById(button.dataset.closeDialog); if (dialog && dialog.open) dialog.close(); }));
     [$('#requestDetailDialog'), $('#pricingRuleDialog')].forEach(dialog => dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); }));
+    $('#requestDetailDialog').addEventListener('close', () => {
+      state.detailLoadId += 1;
+      if (state.detailController) state.detailController.abort();
+      state.detailController = null;
+      $('#requestDetailDialog').setAttribute('aria-busy', 'false');
+    });
+    window.addEventListener('codex-dashboard:loading', event => {
+      const snapshot = event.detail && event.detail.state;
+      if (snapshot && queryKey(snapshot) !== state.queryKey) loadQueryData();
+    });
     window.addEventListener('codex-dashboard:render', event => {
       state.dashboard = event.detail && event.detail.data || null;
       state.snapshot = event.detail && event.detail.state || (window.CodexDashboard && window.CodexDashboard.getState());
       if (!$('#pricingRuleDialog').open) refreshPricingProviderOptions();
       bindCostMode(); updateDateInputs(state.snapshot); renderComparison(state.dashboard); renderCacheMetrics(state.dashboard); renderTtft(state.dashboard); renderTrend(); renderTasks();
-      loadQueryData();
+      loadQueryData(Boolean(event.detail && event.detail.refreshQueries));
     });
     window.addEventListener('codex-dashboard:cost-mode', () => { bindCostMode(); renderComparison(state.dashboard); renderCacheMetrics(state.dashboard); renderTrend(); renderRequests(); renderTasks(); if ($('#requestSort').value === 'cost_desc') loadRequestPage(); });
     window.addEventListener('resize', () => { if (state.dashboard) renderTrend(); });

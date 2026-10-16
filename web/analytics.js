@@ -11,6 +11,7 @@
     dashboard: null,
     requests: { data: [], total: 0, page: 1, page_size: 30 },
     tasks: [],
+    sessions: [], sessionPage: 1, sessionThread: '', sessionLoadId: 0, sessionController: null, sessionsError: '', sessionsLoading: false, sessionOmitted: 0,
     diagnostics: null,
     pricingRules: [],
     catalog: {},
@@ -241,9 +242,10 @@
       ['未缓存输入', freshInput === undefined ? '未提供' : compact(freshInput), freshInput === undefined ? '日志未提供拆分' : `${number(input)} 输入 Token`],
       ['缓存读取', !readAvailable ? '未提供' : compact(cacheRead), !readAvailable ? '日志未提供' : `${number(readCount || requestCount)} / ${number(requestCount || readCount)} 条请求提供字段${requestCount > readCount && readCount > 0 ? ' · 部分记录可用' : ''}`],
       ['缓存写入', !writeAvailable ? '未提供' : compact(cacheWrite), !writeAvailable ? '日志未提供' : `${number(writeCount || requestCount)} 条请求提供字段`],
-      ['缓存占比', cachePercent(rate, rate !== null && readAvailable), rate === null ? '缺少可用缓存读取样本或有效输入分母' : '缓存读取 Token ÷ 提供缓存字段样本的输入 Token'],
       [`缓存节省（${currentCostLabel()}）`, selectedSavings === undefined ? '未提供' : currency(selectedSavings), selectedSavings === undefined ? '缺少可用缓存价格' : '按当前价格规则估算']
     ];
+    const validRate = rate !== null && readAvailable && Number.isFinite(rate) && rate >= 0 && rate <= 1;
+    $('#cacheOverview').innerHTML = `<div class="cache-rate"><span>缓存命中率 <small>按输入 Token</small></span><strong>${esc(cachePercent(rate, validRate))}</strong></div><div class="cache-track" ${validRate ? `role="meter" aria-label="缓存命中率，按提供缓存字段样本的输入 Token" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${(rate * 100).toFixed(1)}"` : 'aria-hidden="true"'}><i style="width:${validRate ? rate * 100 : 0}%"></i></div><p class="cache-scale">${validRate ? `<span>命中 ${cachePercent(rate, true)}</span><span>未命中 ${cachePercent(1 - rate, true)}</span>` : '<span>缺少有效样本，暂不显示占用比例</span>'}</p>`;
     $('#cacheMetrics').innerHTML = items.map(item => `<article class="analytics-metric"><span>${esc(item[0])}</span><strong>${esc(item[1])}</strong><small>${esc(item[2])}</small></article>`).join('');
     const partial = requestCount && readCount > 0 && readCount < requestCount ? `缓存占比按 ${number(readCount)} / ${number(requestCount)} 条请求中提供缓存字段的样本统计，未将其余记录按缓存为 0 计入。` : '缓存字段未提供时会显示“未提供”，与实际为 0 区分。';
     $('#cacheNote').textContent = partial;
@@ -323,10 +325,11 @@
     (data && data.dailyModelUsage || []).forEach(row => {
       const date = String(row.date || '');
       if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return;
-      if (!grouped.has(date)) grouped.set(date, { date, total: 0, requests: 0, costBefore: 0, costAfter: 0, cacheSavingsBefore: 0, cacheSavingsAfter: 0, cache: 0, input: 0, cacheInput: 0, cacheReadAvailableCount: 0, cacheInputKnown: false, cacheAvailable: false });
+      if (!grouped.has(date)) grouped.set(date, { date, total: 0, requests: 0, costBefore: 0, costAfter: 0, cacheSavingsBefore: 0, cacheSavingsAfter: 0, cache: 0, input: 0, cacheInput: 0, cacheReadAvailableCount: 0, cacheInputKnown: false, cacheAvailable: false, costAvailable: false });
       const item = grouped.get(date);
       item.total += numeric(row.total);
       item.requests += numeric(row.requests);
+      item.costAvailable = item.costAvailable || row.pricingStatus !== 'unpriced';
       item.costBefore += numeric(row.costBefore);
       item.costAfter += numeric(row.costAfter);
       item.cacheSavingsBefore += numeric(row.cacheSavingsBefore);
@@ -355,23 +358,35 @@
   function renderTrend() {
     const host = $('#analyticsTrendChart');
     const rows = dailyRows(state.dashboard);
-    if (!rows.length) { host.innerHTML = '<div class="chart-empty"><div><strong>暂无趋势数据</strong><p>当前日期范围内没有按日统计。</p></div></div>'; return; }
+    if (!rows.length) { $('#trendSummary').innerHTML = ''; host.innerHTML = '<div class="chart-empty"><div><strong>暂无趋势数据</strong><p>当前日期范围内没有按日统计。</p></div></div>'; return; }
     const metric = $('#trendMetric').value;
     const before = currentCostKey() === 'costBefore';
     const metricName = { tokens: 'Token', requests: '请求数', cost: `费用（${currentCostLabel()}）`, cache: '缓存读取 Token', cache_savings: `缓存节省（${currentCostLabel()}）` }[metric] || 'Token';
     const monetaryMetric = metric === 'cost' || metric === 'cache_savings';
     const value = row => metric === 'requests' ? row.requests : metric === 'cost' ? (before ? row.costBefore : row.costAfter) : metric === 'cache_savings' ? (before ? row.cacheSavingsBefore : row.cacheSavingsAfter) : metric === 'cache' ? row.cache : row.total;
-    const values = rows.map(value);
-    const max = Math.max(...values, 1);
-    const width = Math.max(host.clientWidth || 680, 360), height = 195, left = 50, right = 13, top = 13, bottom = 31;
+    const available = row => !monetaryMetric || row.costAvailable;
+    if (monetaryMetric && !rows.some(available)) {
+      $('#trendSummary').innerHTML = '';
+      host.innerHTML = '<div class="chart-empty"><div><strong>当前范围暂无可计价数据</strong><p>请在“价格与数据”中核对价格规则，或切换 Token 指标查看用量。</p></div></div>';
+      $('#trendMetricNote').textContent = '未计价记录不按零费用绘制。';
+      return;
+    }
+    const values = rows.map(row => available(row) ? value(row) : null);
+    const max = Math.max(...values, monetaryMetric ? .000001 : 1);
+    const width = Math.max(host.clientWidth || 680, 280), height = 240, left = monetaryMetric ? 72 : 52, right = 24, top = 18, bottom = 34;
     const plotWidth = width - left - right, plotHeight = height - top - bottom;
     const x = index => rows.length === 1 ? left + plotWidth / 2 : left + index * plotWidth / (rows.length - 1);
     const y = amount => top + plotHeight - amount / max * plotHeight;
     let svg = `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img" aria-label="每日${esc(metricName)}趋势"><title>每日${esc(metricName)}趋势</title>`;
     [0, .5, 1].forEach(ratio => { const yy = y(max * ratio); svg += `<line class="chart-grid-line" x1="${left}" y1="${yy}" x2="${width - right}" y2="${yy}"/><text class="chart-axis-label" x="${left - 7}" y="${yy + 3}" text-anchor="end">${esc(monetaryMetric ? currency(max * ratio) : compact(max * ratio))}</text>`; });
-    const points = rows.map((row, index) => `${x(index).toFixed(1)},${y(value(row)).toFixed(1)}`).join(' ');
-    svg += `<polyline points="${points}" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>`;
+    const points = rows.filter(available).map((row) => { const index = rows.indexOf(row); return `${x(index).toFixed(1)},${y(value(row)).toFixed(1)}`; }).join(' ');
+    if (rows.every(available)) svg += `<polygon points="${left},${top + plotHeight} ${points} ${x(rows.length - 1)},${top + plotHeight}" fill="var(--accent)" opacity=".08"/>`;
+    const segments = []; let segment = [];
+    rows.forEach((row, index) => { if (available(row)) segment.push(`${x(index)},${y(value(row))}`); else if (segment.length) { segments.push(segment.join(' ')); segment = []; } });
+    if (segment.length) segments.push(segment.join(' '));
+    segments.forEach(line => { svg += `<polyline points="${line}" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>`; });
     rows.forEach((row, index) => {
+      if (!available(row)) return;
       const amount = value(row);
       const cacheRate = cacheMetrics.calculateRate({ cachedTokens: row.cache, cacheReadInputTokens: row.cacheInput, denominatorProvided: row.cacheInputKnown });
       const tip = `${dateLabel(row.date)} · ${metricName}: ${monetaryMetric ? currency(amount) : number(amount)}${cacheRate === null ? '' : ` · 缓存占比 ${cachePercent(cacheRate, true)}`}`;
@@ -380,7 +395,13 @@
       if (index % step === 0 || index === rows.length - 1) svg += `<text class="chart-axis-label" x="${x(index)}" y="${height - 8}" text-anchor="middle">${esc(row.date.slice(5))}</text>`;
     });
     svg += '</svg>';
-    host.innerHTML = svg;
+    const formatValue = amount => monetaryMetric ? currency(amount) : number(amount);
+    const sum = values.reduce((a, b) => a + (b || 0), 0);
+    const peak = Math.max(...values);
+    const peakRow = rows[values.indexOf(peak)];
+    $('#trendSummary').innerHTML = `<div><span>区间合计 · ${esc(metricName)}</span><strong>${esc(formatValue(sum))}</strong></div><div><span>单日峰值 · ${esc(peakRow.date)}</span><strong>${esc(formatValue(peak))}</strong></div><div><span>有记录的日期</span><strong>${number(rows.length)} <small>天</small></strong></div>`;
+    host.innerHTML = svg + `<details class="chart-data"><summary>查看每日数据</summary><div class="table-wrap"><table><caption class="sr-only">每日${esc(metricName)}趋势数据</caption><thead><tr><th scope="col">日期</th><th scope="col" class="num">${esc(metricName)}</th></tr></thead><tbody>${rows.map(row => `<tr><td>${esc(row.date)}</td><td class="num">${esc((available(row) ? formatValue(value(row)) : '未计价'))}</td></tr>`).join('')}</tbody></table></div></details>`;
+    if (window.CodexDashboard && window.CodexDashboard.enhanceChartTooltips) window.CodexDashboard.enhanceChartTooltips();
     $('#trendMetricNote').textContent = metric === 'cost' ? `费用趋势按${currentCostLabel()}显示；未计价记录不计入费用。` : metric === 'cache' ? '缓存趋势按可用的缓存读取 Token 汇总。' : metric === 'cache_savings' ? `缓存节省按${currentCostLabel()}显示，并依赖缓存单价配置。` : `当前显示每日${metricName}。`;
   }
 
@@ -400,11 +421,12 @@
     const version = `${revision}|${state.dashboard && state.dashboard.localDate || ''}`;
     const filterChanged = key !== state.queryKey;
     const versionChanged = version !== state.queryVersion;
-    if (!force && !filterChanged && !versionChanged && !state.requestsError && !state.tasksError) return;
+    if (!force && !filterChanged && !versionChanged && !state.requestsError && !state.tasksError && !state.sessionsError) return;
     state.queryKey = key;
     state.queryVersion = version;
     if (filterChanged) {
       state.requestPage = 1;
+      state.sessionThread = ''; state.requestsContext = ''; state.sessionPage = 1; state.sessions = [];
       state.requests = { data: [], total: 0, page: 1, page_size: state.requestPageSize };
       state.tasks = [];
       state.requestLoadedKey = '';
@@ -412,11 +434,11 @@
     }
     // Each loader commits as soon as its own response arrives. A slow task
     // aggregation must not delay a fresh page of request records.
-    await Promise.allSettled([loadRequestPage({ force }), loadTasks({ force })]);
+    await Promise.allSettled([loadRequestPage({ force }), loadTasks({ force }), loadSessions()]);
   }
 
   function loadRequestPage(options = {}) {
-    const url = fullQuery('/api/requests', { page: state.requestPage, page_size: state.requestPageSize, sort: $('#requestSort').value, cost_mode: requestCostMode() });
+    const url = fullQuery('/api/requests', { page: state.requestPage, page_size: state.requestPageSize, sort: $('#requestSort').value, ...(state.sessionThread ? { thread_key: state.sessionThread } : {}), cost_mode: requestCostMode() });
     const key = `${state.queryVersion}|${url}`;
     if (state.requestPromise && key === state.requestPendingKey) return state.requestPromise;
     if (!options.force && !state.requestPromise && key === state.requestLoadedKey && !state.requestsError) return Promise.resolve();
@@ -496,6 +518,50 @@
     return state.taskPromise;
   }
 
+  async function loadSessions() {
+    if (state.sessionController) state.sessionController.abort();
+    const controller = new AbortController();
+    const id = ++state.sessionLoadId;
+    state.sessionController = controller;
+    state.sessionsLoading = true;
+    state.sessionsError = '';
+    renderSessions();
+    try {
+      const payload = await readJson(fullQuery('/api/sessions'), { signal: controller.signal });
+      if (id !== state.sessionLoadId) return;
+      state.sessions = Array.isArray(payload.data) ? payload.data : [];
+      state.sessionOmitted = numeric(payload.omitted_request_count);
+    } catch (error) {
+      if (id !== state.sessionLoadId || error.name === 'AbortError') return;
+      state.sessionsError = error.message || '网络请求失败';
+    } finally {
+      if (id === state.sessionLoadId) {
+        state.sessionsLoading = false;
+        state.sessionController = null;
+        renderSessions();
+      }
+    }
+  }
+
+  function renderSessions() {
+    const rows = state.sessions;
+    const pageCount = Math.max(1, Math.ceil(rows.length / 20));
+    state.sessionPage = Math.min(state.sessionPage, pageCount);
+    const start = (state.sessionPage - 1) * 20;
+    $('#sessionsTable tbody').innerHTML = rows.slice(start, start + 20).map(row => {
+      const key = str(row.thread_key);
+      const unknownCost = numeric(row.unpriced_request_count) >= numeric(row.request_count);
+      const cost = currentCostKey() === 'costBefore' ? row.cost_before_discount_usd : row.cost_after_discount_usd;
+      return `<tr><td><strong title="${esc(key)}">${esc(key.slice(0, 12))}…</strong><small class="session-workspace">${esc(row.workspace || '工作空间未提供')}</small></td><td>${(row.models || []).map(esc).join('<br>')}</td><td class="num">${number(row.request_count)}</td><td class="num" title="${number(row.total_tokens)}">${compact(row.total_tokens)}</td><td class="num">${unknownCost ? '未计价' : esc(currency(cost))}${!unknownCost && row.unpriced_request_count ? '<small class="session-workspace">部分未计价</small>' : ''}</td><td>${esc(timestamp(row.last_seen))}</td><td><button class="reset-button" type="button" data-session-thread="${esc(key)}" aria-label="查看会话 ${esc(key.slice(0, 12))} 的请求">查看请求</button></td></tr>`;
+    }).join('');
+    $('#sessionsPanel').setAttribute('aria-busy', String(state.sessionsLoading));
+    $('#sessionsMeta').textContent = `${number(rows.length)} 个会话`;
+    $('#sessionsStatus').textContent = state.sessionsError ? `会话读取失败：${state.sessionsError}。${rows.length ? '仍显示上次读取的记录。' : '请点击顶部刷新重试。'}` : state.sessionsLoading ? '正在更新会话…' : !rows.length ? '当前筛选范围没有可关联的会话。' : state.sessionOmitted ? `${number(state.sessionOmitted)} 条请求缺少会话标识，未合并到会话中。` : '仅显示统计元数据，不包含对话正文。';
+    $('#sessionsPageSummary').textContent = `第 ${state.sessionPage} / ${pageCount} 页 · 每页 20 个会话`;
+    $('#sessionsPrev').disabled = state.sessionPage <= 1 || state.sessionsLoading;
+    $('#sessionsNext').disabled = state.sessionPage >= pageCount || state.sessionsLoading;
+  }
+
   function renderRequests(error = state.requestsError) {
     const body = $('#requestsTable tbody');
     const rows = state.requests.data || [];
@@ -524,6 +590,7 @@
     $('#requestsNext').disabled = state.requestsLoading || !total || page >= totalPages;
     const context = state.requestsContext || '点击每日汇总行，可定位对应日期和模型的请求。';
     showStatus($('#requestsContext'), error ? `请求明细更新失败（${error}）。${rows.length ? '仍显示上次读取的记录。' : context}` : context, Boolean(error));
+    $('#clearSessionFilter').hidden = !state.sessionThread;
     $('#exportRequests').disabled = state.requestsLoading || !rows.length;
   }
 
@@ -578,6 +645,7 @@
     const loadId = ++state.detailLoadId;
     state.detailController = controller;
     const dialog = $('#requestDetailDialog');
+    $('#requestContextWindow').innerHTML = '';
     $('#requestDetailFacts').innerHTML = '<div><dt>请求详情</dt><dd>正在读取…</dd></div>';
     dialog.setAttribute('aria-busy', 'true');
     if (!dialog.open) dialog.showModal();
@@ -652,7 +720,21 @@
     return rows.filter(([, value]) => value !== undefined && value !== null && String(value) !== '');
   }
 
+  function renderContextWindow(request) {
+    const capacityRaw = get(request, 'context_window_tokens');
+    const inputRaw = get(request, 'context_input_tokens');
+    const knownInput = inputRaw !== undefined && inputRaw !== null && Number.isFinite(Number(inputRaw)) && Number(inputRaw) >= 0;
+    const capacity = Number(capacityRaw);
+    const knownCapacity = capacityRaw != null && Number.isFinite(capacity) && capacity > 0;
+    const input = Number(inputRaw);
+    const ratio = knownInput && knownCapacity ? input / capacity : null;
+    const label = ratio === null ? '占用比例未知' : `${(ratio * 100).toFixed(1)}%`;
+    const observed = get(request, 'context_observed_at');
+    $('#requestContextWindow').innerHTML = `<div class="context-heading"><h3>上下文窗口</h3><span>${ratio !== null && ratio >= .9 ? '接近窗口上限' : '请求日志快照'}</span></div><div class="context-value"><strong>${esc(knownInput ? compact(input) : '—')}</strong><span>/ ${esc(knownCapacity ? compact(capacity) + ' Token' : '窗口上限未提供')}</span><b>${esc(label)}</b></div><div class="context-track${ratio !== null && ratio >= .9 ? ' is-near-limit' : ''}" ${ratio === null ? 'aria-hidden="true"' : `role="meter" aria-label="上下文窗口输入占用" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.min(100, ratio * 100).toFixed(1)}" aria-valuetext="${esc(label)}，${number(input)} / ${number(capacity)} Token"`}><i style="width:${ratio === null ? 0 : Math.min(100, ratio * 100)}%"></i></div><p>${knownInput ? '使用日志中最近一次输入快照，包含缓存输入；不含本次输出。' : '这条请求没有可靠关联的输入快照，暂不计算占用。'}${knownCapacity ? '' : '日志未提供窗口容量，不推测模型上限。'}${observed ? ` 快照时间：${esc(timestamp(observed))}。` : ''}</p>`;
+  }
+
   function renderRequestDetail(request) {
+    renderContextWindow(request);
     $('#requestDetailFacts').innerHTML = detailRows(request).map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`).join('');
   }
 
@@ -929,7 +1011,7 @@
       $('#pricingRuleDialog').close();
       showStatus($('#pricingStatus'), '价格规则已保存。历史记录沿用原规则；需要时可预览重算。');
       if (window.CodexDashboard) window.CodexDashboard.refresh();
-      renderTrend(); renderTasks();
+      renderTrend(); renderTasks(); renderSessions();
     } catch (error) { showStatus($('#pricingFormError'), `保存失败：${error.message}`, true); }
     finally { submit.disabled = false; }
   }
@@ -1026,6 +1108,21 @@
       if (window.CodexDashboard) window.CodexDashboard.setCostMode(button.dataset.costMode);
     }));
     $('#trendMetric').addEventListener('change', renderTrend);
+    $('#sessionsTable').addEventListener('click', event => {
+      const button = event.target.closest('[data-session-thread]');
+      if (!button) return;
+      state.sessionThread = button.dataset.sessionThread;
+      state.requestsContext = `当前定位会话：${state.sessionThread.slice(0, 12)}…，保持全局日期与筛选。`;
+      state.requestPage = 1;
+      if (window.CodexDashboardLayout) window.CodexDashboardLayout.showView('usage', 'requests');
+      loadRequestPage({ force: true });
+    });
+    $('#sessionsPrev').addEventListener('click', () => { state.sessionPage -= 1; renderSessions(); });
+    $('#sessionsNext').addEventListener('click', () => { state.sessionPage += 1; renderSessions(); });
+    $('#clearSessionFilter').addEventListener('click', () => {
+      state.sessionThread = ''; state.requestsContext = ''; state.requestPage = 1;
+      loadRequestPage({ force: true });
+    });
     $('#requestSort').addEventListener('change', () => { state.requestPage = 1; loadRequestPage(); });
     $('#requestsPrev').addEventListener('click', () => { if (state.requestPage > 1) { state.requestPage -= 1; loadRequestPage(); } });
     $('#requestsNext').addEventListener('click', () => { state.requestPage += 1; loadRequestPage(); });
@@ -1041,6 +1138,7 @@
     $('#dailyUsageTable tbody').addEventListener('click', event => {
       const row = event.target.closest('tr.usage-summary-row');
       if (!row || !window.CodexDashboard) return;
+      state.sessionThread = '';
       state.requestsContext = `当前定位：${dateLabel(row.dataset.date)} · ${row.dataset.model} · ${row.dataset.provider}。`;
       if (window.CodexDashboardLayout) window.CodexDashboardLayout.showView('usage', 'requests');
       window.CodexDashboard.setFilters({ provider: row.dataset.provider, model: row.dataset.model, workspace: row.dataset.workspace || 'all', startDate: row.dataset.date, endDate: row.dataset.date });
@@ -1080,15 +1178,20 @@
       const snapshot = event.detail && event.detail.state;
       if (snapshot && queryKey(snapshot) !== state.queryKey) loadQueryData();
     });
+    window.addEventListener('codex-dashboard:revalidate', () => {
+      if (state.requestsError || state.tasksError || state.sessionsError) loadQueryData();
+    });
     window.addEventListener('codex-dashboard:render', event => {
       state.dashboard = event.detail && event.detail.data || null;
       state.snapshot = event.detail && event.detail.state || (window.CodexDashboard && window.CodexDashboard.getState());
       if (!$('#pricingRuleDialog').open) refreshPricingProviderOptions();
-      bindCostMode(); updateDateInputs(state.snapshot); renderComparison(state.dashboard); renderCacheMetrics(state.dashboard); renderTtft(state.dashboard); renderTrend(); renderTasks();
+      bindCostMode(); updateDateInputs(state.snapshot); renderComparison(state.dashboard); renderCacheMetrics(state.dashboard); renderTtft(state.dashboard); renderTrend(); renderTasks(); renderSessions();
       loadQueryData(Boolean(event.detail && event.detail.refreshQueries));
     });
-    window.addEventListener('codex-dashboard:cost-mode', () => { bindCostMode(); renderComparison(state.dashboard); renderCacheMetrics(state.dashboard); renderTrend(); renderRequests(); renderTasks(); if ($('#requestSort').value === 'cost_desc') loadRequestPage(); });
-    window.addEventListener('resize', () => { if (state.dashboard) renderTrend(); });
+    window.addEventListener('codex-dashboard:cost-mode', () => { bindCostMode(); renderComparison(state.dashboard); renderCacheMetrics(state.dashboard); renderTrend(); renderRequests(); renderTasks(); renderSessions(); if ($('#requestSort').value === 'cost_desc') loadRequestPage(); });
+    window.addEventListener('codex-dashboard:resize-charts', () => {
+      if (state.dashboard && !$('#view-overview').hidden) renderTrend();
+    });
   }
 
   function initialize() {

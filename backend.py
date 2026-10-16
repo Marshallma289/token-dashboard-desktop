@@ -44,7 +44,7 @@ def local_data_dir() -> Path:
 
 DEFAULT_DB = local_data_dir() / "usage.sqlite3"
 DEFAULT_PROVIDER_CONFIG = APP_DIR / "providers.json"
-PARSER_SCHEMA_VERSION = 7
+PARSER_SCHEMA_VERSION = 8
 DEFAULT_SCAN_INTERVAL_SECONDS = 60.0
 APP_VERSION = (Path(__file__).resolve().parent / "VERSION").read_text(encoding="utf-8").strip()
 
@@ -87,6 +87,23 @@ def _as_int(value: Any) -> Optional[int]:
             return max(0, int(float(value.strip())))
         except (TypeError, ValueError):
             return None
+    return None
+
+
+def _nonnegative_integer(value: Any) -> Optional[int]:
+    """Parse a context token count without turning invalid values into zero."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        return int(value) if math.isfinite(value) and value >= 0 and value.is_integer() else None
+    if isinstance(value, str):
+        try:
+            parsed = int(value.strip())
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed >= 0 else None
     return None
 
 
@@ -307,6 +324,9 @@ class ParsedRecord:
     request_output_tokens_per_second_estimate: Optional[float] = None
     request_timing_source: Optional[str] = None
     request_speed_exclusion_reason: Optional[str] = "unmatched_token_count"
+    context_window_tokens: Optional[int] = None
+    context_input_tokens: Optional[int] = None
+    context_observed_at: Optional[str] = None
 
 
 class _RequestTimer:
@@ -327,6 +347,7 @@ class _RequestTimer:
         self.responses: Dict[Tuple[str, str], Tuple[Any, ...]] = {}
         self.totals: Dict[str, Usage] = {}
         self.last_snapshot: Dict[str, str] = {}
+        self.contexts: Dict[int, Dict[str, Any]] = {}
 
     def _window(self, owner: str) -> Dict[str, Any]:
         return self.windows.setdefault(owner, {
@@ -482,10 +503,31 @@ class _RequestTimer:
 
     def _finish(self, line: int, at: Optional[float], payload: Mapping[str, Any]) -> None:
         info = _as_dict(payload.get("info"))
-        usage = parse_usage(info.get("last_token_usage")) or parse_usage(info.get("usage"))
+        last_usage_value = info.get("last_token_usage")
+        last_usage = parse_usage(last_usage_value)
+        usage = last_usage or parse_usage(info.get("usage"))
         total = parse_usage(info.get("total_token_usage"))
         if usage is None and total is None:
             return
+        # Context values are useful only when this event includes the
+        # per-request usage snapshot. A cumulative fallback cannot identify
+        # which request occupied the window.
+        context_snapshot = None
+        context_input = _nonnegative_integer(_as_dict(last_usage_value).get("input_tokens"))
+        context_window = _nonnegative_integer(info.get("model_context_window"))
+        if last_usage is not None and context_input is not None:
+            observed_at = None
+            if at is not None:
+                try:
+                    observed_at = _dt.datetime.fromtimestamp(
+                        at / 1000, tz=_dt.timezone.utc).isoformat()
+                except (OverflowError, OSError, ValueError):
+                    pass
+            context_snapshot = {
+                "context_window_tokens": context_window,
+                "context_input_tokens": context_input,
+                "context_observed_at": observed_at,
+            }
         owner = str(_first(payload, "thread_id", "threadId") or self.owner)
         window = self._window(owner)
         # Identical cumulative snapshots are telemetry duplicates, not requests.
@@ -515,6 +557,8 @@ class _RequestTimer:
             self.matched[identity] = timing
             for usage_line in candidate["lines"]:
                 self.timings[usage_line] = timing
+                if context_snapshot is not None:
+                    self.contexts[usage_line] = context_snapshot
             del self.pending[identity]
         for identity, candidate in self.pending.items():
             if identity[0] != owner:
@@ -525,6 +569,8 @@ class _RequestTimer:
             for usage_line in candidate["lines"]:
                 self.timings[usage_line] = self._excluded(exclusion)
         if not self.modern:
+            if context_snapshot is not None:
+                self.contexts[line] = context_snapshot
             source = "last_model_output" if window["tool_after"] is not None else "token_count"
             end = window["last_output"] if window["tool_after"] is not None else at
             self.timings[line] = self._estimate(
@@ -972,8 +1018,10 @@ class RolloutParser:
                 )
         for index, record in enumerate(records):
             timing = request_timer.timings.get(record.source_line)
-            if timing:
-                records[index] = replace(record, **timing)
+            updates = dict(timing or {})
+            updates.update(request_timer.contexts.get(record.source_line, {}))
+            if updates:
+                records[index] = replace(record, **updates)
         # A whole turn includes waits and tools. Never invent API-request or
         # streaming timings from adjacent usage timestamps. Carry the same
         # sample on its requests; aggregation deduplicates the hashed turn id.
@@ -1732,6 +1780,8 @@ class DashboardDB:
                     request_duration_estimate_ms REAL,
                     request_output_tokens_per_second_estimate REAL,
                     request_timing_source TEXT, request_speed_exclusion_reason TEXT,
+                    context_window_tokens INTEGER, context_input_tokens INTEGER,
+                    context_observed_at TEXT,
                     cache_read_available INTEGER NOT NULL DEFAULT 0,
                     cache_write_available INTEGER NOT NULL DEFAULT 0,
                     ttft_ms REAL, thread_key TEXT, parent_thread_key TEXT, task_id TEXT,
@@ -1776,6 +1826,7 @@ class DashboardDB:
                         s.speed_group_key, s.speed_output_tokens, s.speed_duration_ms,
                         s.request_duration_estimate_ms, s.request_output_tokens_per_second_estimate,
                         s.request_timing_source, s.request_speed_exclusion_reason,
+                        s.context_window_tokens, s.context_input_tokens, s.context_observed_at,
                         s.cache_read_available, s.cache_write_available, s.ttft_ms,
                         s.thread_key, s.parent_thread_key, s.task_id, s.agent_role,
                         s.speed_exclusion_reason, s.pricing_status,
@@ -1796,6 +1847,9 @@ class DashboardDB:
             if "history_snapshots" in tables:
                 migrations = {
                     **request_timing_columns,
+                    "context_window_tokens": "INTEGER",
+                    "context_input_tokens": "INTEGER",
+                    "context_observed_at": "TEXT",
                     "cache_read_available": "INTEGER NOT NULL DEFAULT 0",
                     "cache_write_available": "INTEGER NOT NULL DEFAULT 0",
                     "ttft_ms": "REAL",
@@ -1951,6 +2005,9 @@ class DashboardDB:
                 bool(row["speed_group_key"]) if "speed_group_key" in row.keys() else False,
                 row["request_duration_estimate_ms"] is not None
                     if "request_duration_estimate_ms" in row.keys() else False,
+                sum(row[key] is not None for key in
+                    ("context_window_tokens", "context_input_tokens", "context_observed_at")
+                    if key in row.keys()),
                 row["timestamp"],
                 row["source_line"] if "source_line" in row.keys() else 0,
                 row["source_path"] if "source_path" in row.keys() else "")
@@ -1968,6 +2025,8 @@ class DashboardDB:
         request_timing = tuple(row[name] if name in columns else None for name in (
             "request_duration_estimate_ms", "request_output_tokens_per_second_estimate",
             "request_timing_source", "request_speed_exclusion_reason"))
+        context_fields = tuple(row[name] if name in columns else None for name in (
+            "context_window_tokens", "context_input_tokens", "context_observed_at"))
         raw_thread = row["thread_id"] if "thread_id" in columns else None
         raw_parent = row["parent_thread_id"] if "parent_thread_id" in columns else None
         thread_key = row["thread_key"] if "thread_key" in columns else None
@@ -2017,7 +2076,7 @@ class DashboardDB:
         fingerprint = hashlib.sha256(key + json.dumps(
             [*context, row["timestamp"], *tokens, *([*speed] if speed[0] else []),
              cache_read_available, cache_write_available, ttft_ms, thread_key, parent_thread_key,
-             task_id, agent_role, exclusion, *request_timing, *pricing_fields], ensure_ascii=False, sort_keys=True,
+             task_id, agent_role, exclusion, *request_timing, *context_fields, *pricing_fields], ensure_ascii=False, sort_keys=True,
              separators=(",", ":")).encode("utf-8")).digest()
         _, day, hour = _parse_timestamp(row["timestamp"], timezone=self.timezone)
         self._connection.execute("""INSERT OR IGNORE INTO history_snapshots
@@ -2029,12 +2088,13 @@ class DashboardDB:
              cost_before_discount_usd,cost_after_discount_usd,cost_breakdown_before_discount,
              cache_savings_before_discount_usd,cache_savings_after_discount_usd,
              request_duration_estimate_ms,request_output_tokens_per_second_estimate,
-             request_timing_source,request_speed_exclusion_reason)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             request_timing_source,request_speed_exclusion_reason,
+             context_window_tokens,context_input_tokens,context_observed_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (fingerprint, context_id, row["timestamp"], day, hour, *tokens, *speed,
              cache_read_available, cache_write_available, ttft_ms, thread_key, parent_thread_key,
              task_id, agent_role, exclusion, pricing_fields[0], "{}", rate_snapshot_id,
-             *pricing_fields[2:], *request_timing))
+             *pricing_fields[2:], *request_timing, *context_fields))
         return self._connection.execute(
             "SELECT id FROM history_snapshots WHERE fingerprint=?", (fingerprint,)).fetchone()[0]
 
@@ -2354,7 +2414,7 @@ class DashboardDB:
 
     def _filter_sql(
         self, *, days=0, provider=None, workspace=None, model=None,
-        start_date=None, end_date=None, task_id=None,
+        start_date=None, end_date=None, task_id=None, thread_key=None,
     ) -> Tuple[str, List[Any]]:
         where: List[str] = []
         params: List[Any] = []
@@ -2381,6 +2441,10 @@ class DashboardDB:
         if model:
             where.append("canonical_model(model) = ?")
             params.append(canonical_model(model))
+        if thread_key is not None:
+            thread_key = self._validate_thread_key(thread_key)
+            where.append("thread_key = ?")
+            params.append(thread_key)
         if task_id:
             relations = self._thread_relationship_map()
             task_root = str(task_id)
@@ -2394,6 +2458,13 @@ class DashboardDB:
                 where.append("0=1")
         predicate = (" WHERE " + " AND ".join(where)) if where else ""
         return predicate, params
+
+    @staticmethod
+    def _validate_thread_key(value: Any) -> str:
+        if (not isinstance(value, str) or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)):
+            raise ValueError("thread_key must be an existing de-identified thread key")
+        return value
 
     def _query_filtered_rows(
         self, *, days=0, provider=None, workspace=None, model=None,
@@ -2459,11 +2530,17 @@ class DashboardDB:
                 row["request_output_tokens_per_second_estimate"]),
             "request_timing_source": row["request_timing_source"],
             "request_speed_exclusion_reason": row["request_speed_exclusion_reason"],
+            "context_window_tokens": (int(row["context_window_tokens"])
+                                      if row["context_window_tokens"] is not None else None),
+            "context_input_tokens": (int(row["context_input_tokens"])
+                                     if row["context_input_tokens"] is not None else None),
+            "context_observed_at": row["context_observed_at"],
         }
 
     def requests(
         self, *, days=30, provider=None, workspace=None, model=None, start_date=None,
         end_date=None, page=1, page_size=50, sort="time_desc", task_id=None, cost_mode="after",
+        thread_key=None,
     ) -> Dict[str, Any]:
         if type(page) is not int or page < 1:
             raise ValueError("page must be a positive integer")
@@ -2476,7 +2553,7 @@ class DashboardDB:
         offset = (page - 1) * page_size
         predicate, params = self._filter_sql(
             days=days, provider=provider, workspace=workspace, model=model,
-            start_date=start_date, end_date=end_date, task_id=task_id)
+            start_date=start_date, end_date=end_date, task_id=task_id, thread_key=thread_key)
         order = {
             "time_desc": "timestamp DESC, request_id DESC",
             "token_desc": "total_tokens DESC, timestamp DESC, request_id DESC",
@@ -2567,6 +2644,57 @@ class DashboardDB:
             output.append(task)
         output.sort(key=lambda item: (-item["summary"]["total_tokens"], item["task_id"]))
         return {"data": output}
+
+    def sessions(
+        self, *, days=30, provider=None, workspace=None, model=None,
+        start_date=None, end_date=None,
+    ) -> Dict[str, Any]:
+        rows = self._query_filtered_rows(days=days, provider=provider, workspace=workspace,
+                                         model=model, start_date=start_date, end_date=end_date)
+        self.catalog.reload()
+        grouped: Dict[str, Dict[str, Any]] = {}
+        omitted_request_count = 0
+        for row in rows:
+            thread_key = row["thread_key"]
+            if not thread_key:
+                omitted_request_count += 1
+                continue
+            timestamp = str(row["timestamp"])
+            session = grouped.setdefault(str(thread_key), {
+                "thread_key": str(thread_key), "workspace": str(row["workspace"]),
+                "models": set(), "request_count": 0, "input_tokens": 0,
+                "output_tokens": 0, "total_tokens": 0,
+                "cost_before_discount_usd": 0.0, "cost_after_discount_usd": 0.0,
+                "unpriced_request_count": 0, "first_seen": timestamp,
+                "last_seen": timestamp, "agent_role": str(row["agent_role"] or "unknown"),
+            })
+            session["models"].add(str(row["model"]))
+            session["request_count"] += 1
+            session["input_tokens"] += int(row["input_tokens"] or 0)
+            session["output_tokens"] += int(row["output_tokens"] or 0)
+            session["total_tokens"] += int(row["total_tokens"] or 0)
+            if timestamp < session["first_seen"]:
+                session["first_seen"] = timestamp
+            if timestamp >= session["last_seen"]:
+                session["last_seen"] = timestamp
+                session["workspace"] = str(row["workspace"])
+                session["agent_role"] = str(row["agent_role"] or "unknown")
+            quote = self._stored_quote(row)
+            if quote["is_priced"]:
+                session["cost_before_discount_usd"] += float(quote["cost_before_discount_usd"] or 0)
+                session["cost_after_discount_usd"] += float(quote["cost_after_discount_usd"] or 0)
+            else:
+                session["unpriced_request_count"] += 1
+
+        data = []
+        for session in grouped.values():
+            session["models"] = sorted(session["models"])
+            session["cost_before_discount_usd"] = round(session["cost_before_discount_usd"], 8)
+            session["cost_after_discount_usd"] = round(session["cost_after_discount_usd"], 8)
+            data.append(session)
+        data.sort(key=lambda item: (item["last_seen"], item["thread_key"]), reverse=True)
+        return {"data": data, "total": len(data),
+                "omitted_request_count": omitted_request_count}
 
     def scan_options(self) -> Dict[str, Any]:
         with self._lock:
@@ -3533,6 +3661,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                          "/cache-metrics.js": "cache-metrics.js",
                          "/layout.js": "layout.js",
                          "/analytics.js": "analytics.js", "/data-settings.js": "data-settings.js",
+                         "/dashboard.css": "dashboard.css",
                          "/styles.css": "styles.css"}
         if route in static_routes:
             self._write_static(static_routes[route])
@@ -3569,7 +3698,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     start_date=query.get("start_date"), end_date=query.get("end_date"),
                     page=int(query.get("page", "1")), page_size=int(query.get("page_size", "50")),
                     sort=query.get("sort", "time_desc"), task_id=query.get("task_id"),
-                    cost_mode=query.get("cost_mode", "after"))
+                    cost_mode=query.get("cost_mode", "after"), thread_key=query.get("thread_key"))
                 self._write_json(value)
             except ValueError:
                 self._write_json({"error": "invalid_filters"}, HTTPStatus.BAD_REQUEST)
@@ -3595,6 +3724,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._write_json({"error": "invalid_filters"}, HTTPStatus.BAD_REQUEST)
             except Exception:
                 self._write_json({"error": "tasks_unavailable"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        if route == "/api/sessions":
+            query = self._query()
+            try:
+                value = service.database.sessions(
+                    days=int(query.get("days", "30")), provider=query.get("provider"),
+                    workspace=query.get("workspace"), model=query.get("model"),
+                    start_date=query.get("start_date"), end_date=query.get("end_date"))
+                self._write_json(value)
+            except ValueError:
+                self._write_json({"error": "invalid_filters"}, HTTPStatus.BAD_REQUEST)
+            except Exception:
+                self._write_json({"error": "sessions_unavailable"}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
         if route == "/api/diagnostics":
             try:

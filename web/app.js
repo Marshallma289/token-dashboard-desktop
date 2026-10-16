@@ -5,6 +5,8 @@
   const EVENTS_URL = '/api/events';
   const HEALTH_URL = '/api/health';
   const HEALTH_REFRESH_MS = 15000;
+  const DASHBOARD_REFRESH_MS = 30000;
+  const DASHBOARD_TIMEOUT_MS = 20000;
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
   const cacheMetrics = window.CodexCacheMetrics;
@@ -28,10 +30,14 @@
     dashboardPromise: null,
     dashboardUrl: '',
     dashboardEventVersion: null,
+    appliedEventVersion: null,
+    dashboardFailed: false,
+    renderedDashboardUrl: '',
     latestEventVersion: null,
     manualRefreshPromise: null,
     healthController: null,
     pollTimer: null,
+    refreshListenersBound: false,
     refreshTimer: null,
     healthTimer: null,
     tablePage: 1,
@@ -380,9 +386,9 @@
       cacheReadAvailable: cacheReadAvailability == null
         ? (pick(item, 'cache_read_available_count', 'cacheReadAvailableCount') !== undefined
           ? toNumber(pick(item, 'cache_read_available_count', 'cacheReadAvailableCount')) > 0
-          : ['cache', 'cache_read_tokens', 'cached_input_tokens', 'cached_tokens', 'prompt_cache_hit_tokens'].some(key => item[key] !== undefined))
+          : ['cache', 'cache_read_tokens', 'cached_input_tokens', 'cached_tokens', 'prompt_cache_hit_tokens'].some(key => item[key] != null && Number.isFinite(Number(item[key]))))
         : Boolean(cacheReadAvailability),
-      cacheWriteAvailable: cacheWriteAvailability == null ? ['cache_write', 'cache_write_tokens', 'cache_write_input_tokens', 'cache_creation_input_tokens'].some(key => item[key] !== undefined) : Boolean(cacheWriteAvailability),
+      cacheWriteAvailable: cacheWriteAvailability == null ? ['cache_write', 'cache_write_tokens', 'cache_write_input_tokens', 'cache_creation_input_tokens'].some(key => item[key] != null && Number.isFinite(Number(item[key]))) : Boolean(cacheWriteAvailability),
       cacheReadAvailableCount: pick(item, 'cache_read_available_count', 'cacheReadAvailableCount'),
       cacheWriteAvailableCount: pick(item, 'cache_write_available_count', 'cacheWriteAvailableCount'),
       cacheReadInputProvided: Object.prototype.hasOwnProperty.call(item, 'cache_read_input_tokens') || Object.prototype.hasOwnProperty.call(item, 'cacheReadInputTokens'),
@@ -395,7 +401,7 @@
       ttftSampleCount: pick(item, 'ttft_sample_count', 'ttftSampleCount'),
       ttftCoverage: pick(item, 'ttft_coverage', 'ttftCoverage'),
       reasoning,
-      total: totalValue || input + output,
+      total: pick(item, 'total', 'total_tokens', 'totalTokens', 'tokens') == null ? input + output : totalValue,
       requests: metricFrom(item, ['requests', 'request_count', 'requestCount', 'calls', 'count']),
       speedOutputTokens: metricFrom(item, ['speed_output_tokens']),
       speedDurationMs: metricFrom(item, ['speed_duration_ms']),
@@ -755,18 +761,28 @@
       : '计价覆盖率 — · 暂无用量';
     const activeCost = state.costMode === 'before' ? m.costBefore : m.costAfter;
     const cards = [
-      [`预估费用 USD · ${state.costMode === 'before' ? '折扣前' : '折扣后'}`, formatCurrency(activeCost), costSub, '$', activeCost, costDetails],
-      ['总 Token', formatCompact(m.total), 'Input + Output（Reasoning 为子集）', '◈', m.total],
-      ['今日 Token', formatCompact(today), todayRows.length ? `${todayRows.length} 条模型记录` : '今日暂无记录', '◷', today],
-      ['请求数', formatCompact(m.requests), '当前筛选范围', '↗', m.requests],
-      ['活跃工作空间', formatNumber(m.active), '有请求记录的空间', '⌘', m.active],
-      ['模型 / 供应商', formatNumber(m.models), '去重后的组合数', '✦', m.models],
-      ['缓存占比', m.cacheRateText, m.cacheAvailable ? `${formatCompact(m.cache)} cache tokens · ${m.cacheCoverageText}` : m.cacheCoverageText, '▣', m.cacheRate],
-      ['轮次平均输出速度', formatSpeed(m), m.speedSampleCount > 0 ? `${formatNumber(m.speedSampleCount)} 个完整轮次样本` : '暂无完整计时轮次', '⏱', formatSpeed(m)]
+      [`预估费用 USD · ${state.costMode === 'before' ? '折扣前' : '折扣后'}`, m.total > 0 && m.coverage === 0 ? '未计价' : formatCurrency(activeCost), costSub, activeCost, costDetails],
+      ['总 Token', formatCompact(m.total), 'Input + Output（Reasoning 为子集）', m.total],
+      ['今日 Token', formatCompact(today), todayRows.length ? `${todayRows.length} 条模型记录` : '今日暂无记录', today],
+      ['请求数', formatCompact(m.requests), '当前筛选范围', m.requests],
+      ['活跃工作空间', formatNumber(m.active), '有请求记录的空间', m.active],
+      ['模型 / 供应商', formatNumber(m.models), '去重后的组合数', m.models],
+      ['缓存占比', m.cacheRateText, m.cacheAvailable ? `${formatCompact(m.cache)} cache tokens · ${m.cacheCoverageText}` : m.cacheCoverageText, m.cacheRate],
+      ['轮次平均输出速度', formatSpeed(m), m.speedSampleCount > 0 ? `${formatNumber(m.speedSampleCount)} 个完整轮次样本` : '暂无完整计时轮次', formatSpeed(m)]
     ];
-    $('#kpiGrid').innerHTML = cards.map(card => {
-      const title = card[0].startsWith('预估费用') ? formatCurrencyDetailed(card[4]) : card[0].includes('率') || card[0].includes('占比') ? card[1] : typeof card[4] === 'number' ? formatNumber(card[4]) : card[1];
-      return `<article class="kpi-card"><div class="kpi-label"><span>${htmlEscape(card[0])}</span><span class="kpi-icon" aria-hidden="true">${card[3]}</span></div><div class="kpi-value" title="${htmlEscape(title)}">${htmlEscape(card[1])}</div><div class="kpi-sub" title="${htmlEscape(card[5] || card[2])}">${htmlEscape(card[2])}</div></article>`;
+    const iconPaths = [
+      'M12 3v18M16 7H10a3 3 0 0 0 0 6h4a3 3 0 0 1 0 6H7',
+      'M12 3 3 8l9 5 9-5-9-5ZM3 12l9 5 9-5M3 16l9 5 9-5',
+      'M4 6h16v15H4zM8 3v6M16 3v6M4 11h16',
+      'M4 16V8m0 8h8M4 16 20 4M14 4h6v6',
+      'M3 7h7l2 3h9v11H3zM3 7V4h7l2 3',
+      'M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z',
+      'M20 7H7a4 4 0 0 0 0 8h13M16 3l4 4-4 4M8 11l-4 4 4 4',
+      'M5 18a9 9 0 1 1 14 0M12 13l5-5M8 20h8'
+    ];
+    $('#kpiGrid').innerHTML = cards.map((card, index) => {
+      const title = card[1] === '未计价' ? '当前范围暂无可计价的 Token' : card[0].startsWith('预估费用') ? formatCurrencyDetailed(card[3]) : card[0].includes('率') || card[0].includes('占比') ? card[1] : typeof card[3] === 'number' ? formatNumber(card[3]) : card[1];
+      return `<article class="kpi-card" data-metric="${index}"><div class="kpi-label"><span>${htmlEscape(card[0])}</span><span class="kpi-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="${iconPaths[index]}"/></svg></span></div><div class="kpi-value" title="${htmlEscape(title)}">${htmlEscape(card[1])}</div><div class="kpi-sub" title="${htmlEscape(card[4] || card[2])}">${htmlEscape(card[2])}</div></article>`;
     }).join('');
   }
 
@@ -936,6 +952,12 @@
   }
 
   function modelKey(row) { return `${row.model}|||${row.provider}`; }
+  function modelColor(key) {
+    let hash = 0;
+    for (const char of key) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+    return palette[hash % palette.length];
+  }
+
   function modelLabel(key) { const [model, provider] = key.split('|||'); return provider && provider !== '未知供应商' ? `${model} · ${provider}` : model; }
 
   function renderModelUsage(data) {
@@ -950,7 +972,7 @@
     const hasOther = keys.length > displayKeys.length;
     if (hasOther) displayKeys.push('__other__');
     const seriesName = key => key === '__other__' ? '其他模型 / 供应商' : modelLabel(key);
-    const color = key => key === '__other__' ? 'var(--chart-muted)' : palette[Math.max(0, keys.indexOf(key)) % palette.length];
+    const color = key => key === '__other__' ? 'var(--chart-muted)' : modelColor(key);
     $('#modelLegend').innerHTML = displayKeys.map(key => `<span class="legend-item"><i class="legend-swatch" style="background:${color(key)}"></i><span>${htmlEscape(seriesName(key))}</span></span>`).join('');
     const grouped = new Map(dates.map(date => [date, new Map()]));
     rows.forEach(row => {
@@ -1028,7 +1050,8 @@
       const costLabel = row.pricingStatus === 'unpriced'
         ? '未计价'
         : `预估 ${formatCurrency(row.cost)}${row.pricingStatus === 'partial' ? ' *' : ''}`;
-      return `<article class="model-stat"><div class="model-stat-heading"><strong>${htmlEscape(row.model)}</strong><span class="provider-pill">${htmlEscape(row.provider)}</span></div><div class="model-stat-value" title="${formatNumber(row.total)} Token">${formatCompact(row.total)} <small>Token</small></div><div class="model-stat-bar"><i style="width:${total ? row.total / total * 100 : 0}%;background:${palette[index % palette.length]}"></i></div><div class="model-stat-meta">${formatPercent(total ? row.total / total : 0)} · ${formatNumber(row.requests)} 次请求 · ${htmlEscape(costLabel)}</div><div class="model-stat-meta">输入 ${formatNumber(row.input)} · 输出 ${formatNumber(row.output)}</div><div class="model-stat-meta">轮次平均输出速度 ${htmlEscape(formatSpeed(row))} · ${formatNumber(row.speedSampleCount)} 个完整轮次样本</div></article>`;
+      const share = total ? row.total / total : 0;
+      return `<article class="model-stat"><div class="model-stat-heading"><strong>${htmlEscape(row.model)}</strong><span class="provider-pill">${htmlEscape(row.provider)}</span><span class="model-stat-meta">输入 ${formatCompact(row.input)} · 输出 ${formatCompact(row.output)}</span></div><div class="model-stat-volume"><div class="model-stat-value" title="${formatNumber(row.total)} Token">${formatCompact(row.total)} <small>${formatPercent(share)}</small></div><div class="model-stat-bar" aria-hidden="true"><i style="width:${share * 100}%;background:${modelColor(modelKey(row))}"></i></div></div><div class="model-stat-requests"><span class="mobile-column-label">请求</span>${formatNumber(row.requests)}</div><div class="model-stat-cost"><span class="mobile-column-label">预估费用</span>${htmlEscape(costLabel)}</div><div class="model-stat-speed">轮次平均输出速度 ${htmlEscape(formatSpeed(row))} · ${formatNumber(row.speedSampleCount)} 个完整轮次样本</div></article>`;
     }).join('') : '<div class="empty-state">当前组合暂无模型用量，可直接切换任一筛选项。</div>';
     enhanceChartTooltips();
     window.dispatchEvent(new CustomEvent('codex-dashboard:render', { detail: { data, state: dashboardSnapshot(), refreshQueries: Boolean(options.refreshQueries) } }));
@@ -1071,6 +1094,11 @@
     state.dashboardUrl = url;
     state.dashboardEventVersion = eventVersion;
     const requestId = ++state.requestId;
+    let timedOut = false;
+    const deadline = controller ? setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, DASHBOARD_TIMEOUT_MS) : null;
     state.loading = true;
     if (!options.silent) setConnection('connecting', '读取数据');
     window.dispatchEvent(new CustomEvent('codex-dashboard:loading', { detail: { state: dashboardSnapshot() } }));
@@ -1084,24 +1112,35 @@
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const payload = await response.json();
         if (requestId !== state.requestId || state.dashboardController !== controller) return;
-        state.data = normalize(payload);
-        renderAll(state.data, options);
+        const next = normalize(payload);
+        const unchanged = options.silent && !options.refreshQueries && !state.dashboardFailed
+          && state.data && next.dataVersion != null && next.dataVersion === state.data.dataVersion
+          && next.localDate === state.data.localDate && state.renderedDashboardUrl === url;
+        state.data = next;
+        state.appliedEventVersion = eventVersion;
+        state.dashboardFailed = false;
+        state.renderedDashboardUrl = url;
+        if (!unchanged) renderAll(state.data, options);
+        else window.dispatchEvent(new CustomEvent('codex-dashboard:revalidate'));
         updateUpdated(state.data.generatedAt);
         showError('');
         if (!state.eventSource || state.eventSource.readyState === EventSource.OPEN) setConnection('online', '实时连接');
         return state.data;
       } catch (error) {
-        if (error && error.name === 'AbortError') return;
+        if (error && error.name === 'AbortError' && !timedOut) return;
         if (requestId !== state.requestId || state.dashboardController !== controller) return;
-        const message = error && error.message ? error.message : '网络请求失败';
+        state.dashboardFailed = true;
+        const message = timedOut ? '读取超时，将自动重试' : error && error.message ? error.message : '网络请求失败';
         showError(`无法读取看板数据（${message}）。请确认服务已启动后重试。`);
         if (!state.data) renderEmptyDashboard();
         setConnection('offline', '暂时离线');
       } finally {
+        if (deadline) clearTimeout(deadline);
         if (requestId === state.requestId && state.dashboardController === controller) {
           state.loading = false;
           state.dashboardController = null;
           state.dashboardPromise = null;
+          if (!state.manualRefreshPromise && state.latestEventVersion !== eventVersion) scheduleRefresh();
         }
       }
     })();
@@ -1111,6 +1150,7 @@
   function refreshNow() {
     if (state.manualRefreshPromise) return state.manualRefreshPromise;
     clearTimeout(state.refreshTimer);
+    state.refreshTimer = null;
     const button = $('#refreshButton');
     button.disabled = true;
     button.setAttribute('aria-busy', 'true');
@@ -1138,7 +1178,7 @@
         state.manualRefreshPromise = null;
         // Events received after the dashboard GET began may describe data
         // newer than that response. Replay that version with a GET only.
-        if (state.latestEventVersion !== state.dashboardEventVersion) scheduleRefresh();
+        if (state.latestEventVersion !== state.appliedEventVersion) scheduleRefresh();
       }
     })();
     return state.manualRefreshPromise;
@@ -1160,38 +1200,57 @@
       } catch (_) { /* Other event payloads are still refresh signals. */ }
     }
     if (version !== null) {
-      if (version === state.latestEventVersion) return;
+      // Receiving a notification is not proof that its GET succeeded.
+      if (version === state.latestEventVersion
+          && ((!state.dashboardFailed && version === state.appliedEventVersion)
+              || (state.dashboardPromise && state.dashboardEventVersion === version)
+              || state.refreshTimer)) return;
       state.latestEventVersion = version;
     }
     // A manual scan fetches once after it finishes. Its own SSE notification
     // does not need to start a second scan or race that fetch.
     if (state.manualRefreshPromise) return;
+    if (state.dashboardPromise && state.dashboardUrl === buildUrl()) return;
     clearTimeout(state.refreshTimer);
-    state.refreshTimer = setTimeout(() => fetchDashboard({ silent: true, eventVersion: state.latestEventVersion }), 150);
+    state.refreshTimer = setTimeout(() => {
+      state.refreshTimer = null;
+      fetchDashboard({ silent: true, eventVersion: state.latestEventVersion });
+    }, 150);
+  }
+
+  function pollDashboard() {
+    if (document.visibilityState === 'hidden' || state.manualRefreshPromise || state.dashboardPromise || state.refreshTimer) return;
+    return fetchDashboard({ silent: true });
   }
 
   function connectEvents() {
+    // Keep an independent watchdog even when EventSource reports OPEN: a lost
+    // notification must not leave the page stale until a manual scan.
+    if (!state.pollTimer) state.pollTimer = window.setInterval(pollDashboard, DASHBOARD_REFRESH_MS);
+    if (!state.refreshListenersBound) {
+      window.addEventListener('focus', pollDashboard);
+      document.addEventListener('visibilitychange', pollDashboard);
+      state.refreshListenersBound = true;
+    }
+    if (state.eventSource) return;
     if (!window.EventSource) {
       setConnection('reconnecting', '轮询更新');
-      state.pollTimer = window.setInterval(() => fetchDashboard({ silent: true }), 30000);
       return;
     }
     try {
       const source = new EventSource(EVENTS_URL);
       state.eventSource = source;
-      source.onopen = () => { setConnection('online', '实时连接'); };
+      source.onopen = () => { setConnection('online', '实时连接'); pollDashboard(); };
       source.onmessage = event => {
         if (!event.data) return;
         scheduleRefresh(event);
       };
-      ['dashboard', 'dashboard_updated', 'dashboard-update', 'usage.updated', 'update', 'refresh'].forEach(eventName => source.addEventListener(eventName, scheduleRefresh));
+      source.addEventListener('dashboard', scheduleRefresh);
       source.onerror = () => {
         setConnection('reconnecting', '重连中');
-        if (!state.pollTimer) state.pollTimer = window.setInterval(() => { if (!source || source.readyState !== EventSource.OPEN) fetchDashboard({ silent: true }); }, 30000);
       };
     } catch (_) {
       setConnection('offline', '事件流不可用');
-      state.pollTimer = window.setInterval(() => fetchDashboard({ silent: true }), 30000);
     }
   }
 
@@ -1225,7 +1284,20 @@
       renderDailyTable(state.data);
       $('.table-wrap').scrollTop = 0;
     });
-    window.addEventListener('resize', () => { if (!state.data) return; clearTimeout(window.__codexResize); window.__codexResize = setTimeout(() => renderAll(state.data), 130); });
+    window.addEventListener('resize', () => {
+      if (!state.data) return;
+      clearTimeout(window.__codexResize);
+      window.__codexResize = setTimeout(() => {
+        if (!$('#view-trends').hidden) {
+          renderWorkspace(state.data);
+          renderActivity(state.data);
+          renderRequestDistribution(state.data);
+          renderModelUsage(state.data);
+          enhanceChartTooltips();
+        }
+        window.dispatchEvent(new CustomEvent('codex-dashboard:resize-charts'));
+      }, 130);
+    });
     window.addEventListener('codex-dashboard:set-cost-mode', event => setCostMode(event.detail && event.detail.mode));
     window.addEventListener('codex-dashboard:set-date-range', event => {
       const detail = event.detail || {};
@@ -1324,6 +1396,8 @@
     }
   }
 
+  const tooltipBound = new WeakSet();
+  const chartNavigationBound = new WeakSet();
   function enhanceChartTooltips() {
     const tooltip = $('#chartTooltip');
     tooltip.hidden = true;
@@ -1336,12 +1410,14 @@
       title.remove();
     });
     $$('.heat-cell').forEach(cell => {
-      cell.dataset.tooltip = cell.title;
+      if (cell.title) cell.dataset.tooltip = cell.title;
       cell.removeAttribute('title');
       cell.setAttribute('tabindex', '0');
       cell.setAttribute('aria-label', cell.dataset.tooltip);
     });
     $$('[data-tooltip]').forEach(target => {
+      if (tooltipBound.has(target)) return;
+      tooltipBound.add(target);
       const show = event => {
         const bounds = target.getBoundingClientRect();
         tooltip.textContent = target.dataset.tooltip;
@@ -1355,6 +1431,26 @@
       target.addEventListener('focus', show);
       target.addEventListener('pointerleave', () => { tooltip.hidden = true; });
       target.addEventListener('blur', () => { tooltip.hidden = true; });
+      target.addEventListener('keydown', event => { if (event.key === 'Escape') tooltip.hidden = true; });
+    });
+    $$('.chart-host, .hourly-heatmap').forEach(host => {
+      const points = $$('[data-tooltip]', host);
+      if (!points.length) return;
+      host.setAttribute('role', 'group');
+      points.forEach((point, index) => point.setAttribute('tabindex', index === 0 ? '0' : '-1'));
+      $$('svg', host).forEach(svg => svg.setAttribute('role', 'group'));
+      if (chartNavigationBound.has(host)) return;
+      chartNavigationBound.add(host);
+      host.addEventListener('keydown', event => {
+        if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
+        const items = $$('[data-tooltip]', host);
+        const index = items.indexOf(event.target);
+        if (index < 0) return;
+        event.preventDefault();
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 : (index + (['ArrowLeft', 'ArrowUp'].includes(event.key) ? -1 : 1) + items.length) % items.length;
+        items.forEach((point, i) => point.setAttribute('tabindex', i === next ? '0' : '-1'));
+        items[next].focus();
+      });
     });
   }
 
@@ -1387,6 +1483,7 @@
     setFilters: filters => window.dispatchEvent(new CustomEvent('codex-dashboard:set-filters', { detail: filters || {} })),
     refresh: () => fetchDashboard({ refreshQueries: true }),
     exportCsv: () => exportCsv(),
+    enhanceChartTooltips,
     formatCurrency,
     formatCurrencyDetailed,
     formatNumber,

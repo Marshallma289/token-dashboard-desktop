@@ -21,6 +21,7 @@
     usage: [
       { id: 'usage-daily', span: 12, label: '每日模型用量明细' },
       { id: 'usage-requests', span: 12, label: '单次请求明细' },
+      { id: 'usage-sessions', span: 12, label: '会话明细' },
       { id: 'usage-tasks', span: 12, label: '任务与代理消耗' }
     ],
     pricing: [
@@ -35,7 +36,7 @@
     ['usage', 'viewTabUsage'], ['pricing', 'viewTabPricing']
   ]);
   const subviewTabs = {
-    usage: { daily: 'usageTabDaily', requests: 'usageTabRequests', tasks: 'usageTabTasks', all: 'usageTabAll' },
+    usage: { daily: 'usageTabDaily', requests: 'usageTabRequests', sessions: 'usageTabSessions', tasks: 'usageTabTasks', all: 'usageTabAll' },
     pricing: { rules: 'pricingTabRules', diagnostics: 'pricingTabDiagnostics', all: 'pricingTabAll' }
   };
   const isRecord = value => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -194,6 +195,9 @@
     if (bridgeLoaded && bridgeSaver) {
       announce('正在保存布局…');
       bridgeSaver.enqueue(layout);
+    } else if (window.pywebview && window.pywebview.api) {
+      announce('正在读取已保存布局；读取成功前不会覆盖本机设置。');
+      connectBridge();
     } else if (!localStorageAvailable) {
       announce('当前存储不可用，布局仅在本次窗口内保留。');
     } else {
@@ -202,7 +206,7 @@
   }
   async function connectBridge() {
     const api = window.pywebview && window.pywebview.api;
-    if (!initialized || bridgeConnecting || !api || typeof api.load_layout !== 'function' || typeof api.save_layout !== 'function') return;
+    if (!initialized || bridgeConnecting || bridgeLoaded || !api || typeof api.load_layout !== 'function' || typeof api.save_layout !== 'function') return;
     bridgeConnecting = true;
     const loadRevision = revision;
     let loadedSuccessfully = false;
@@ -211,14 +215,21 @@
     });
     try {
       const result = await api.load_layout();
-      loadedSuccessfully = Boolean(result && result.ok);
       const saved = result && result.ok ? normalizeLayout(result.layout) : null;
+      // A non-empty layout that this version cannot read is not a first run.
+      // Preserve it on disk instead of replacing it with this build's defaults.
+      loadedSuccessfully = Boolean(result && result.ok && (result.layout == null || saved));
       completeNativeLoad(saved, loadedSuccessfully, loadRevision);
       return;
     } catch (_) { /* Local browser preferences remain usable when the bridge fails. */ }
     completeNativeLoad(null, false, loadRevision);
   }
   function completeNativeLoad(saved, loadedSuccessfully, loadRevision) {
+    if (!loadedSuccessfully) {
+      bridgeConnecting = false;
+      announce('暂时无法读取本机布局，已保留原设置；再次调整或回到窗口时重试。');
+      return;
+    }
     // Reparenting a module during pointer capture would interrupt a live gesture.
     if (saved && interaction) {
       pendingNativeLoad = { saved, loadedSuccessfully, loadRevision };
@@ -230,10 +241,10 @@
       renderState(null);
     }
     bridgeLoaded = true;
+    bridgeConnecting = false;
     navigationEdits.clear();
     layoutEdits.length = 0;
-    if (loadedSuccessfully || revision !== loadRevision) saveState();
-    else announce('暂时无法读取本机布局；当前布局可用，下一次调整时会重试保存。');
+    saveState();
   }
   function setTabState(tab, selected) {
     if (!tab) return;
@@ -634,6 +645,7 @@
     isEditing: () => editing
   });
   window.addEventListener('pywebviewready', connectBridge);
+  window.addEventListener('focus', connectBridge);
   document.addEventListener('DOMContentLoaded', () => {
     document.querySelectorAll('[data-layout-id]').forEach(module => {
       const info = moduleInfo(module.dataset.layoutId);

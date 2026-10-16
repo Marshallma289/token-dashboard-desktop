@@ -7,13 +7,14 @@
   <title>Codex Token 实时看板</title>
   <link rel="icon" type="image/png" href="app-icon.png">
   <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="dashboard.css">
 </head>
 <body data-theme="light">
   <a class="skip-link" href="#main">跳到主要内容</a>
   <div class="app-shell">
     <header class="topbar">
       <div class="brand-block">
-        <div class="brand-mark" aria-hidden="true">⌁</div>
+        <div class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3-5 4 10 3-5h4"/></svg></div>
         <div>
           <h1>Codex Token <span>实时看板</span></h1>
           <p>每一次调用，都清晰可见。</p>
@@ -48,7 +49,7 @@
     </header>
 
     <main id="main" tabindex="-1">
-      <div class="overview-heading"><div><p class="eyebrow">本机 Token 使用情况</p><h2>用量看板<span class="version-tag" id="appVersion">—</span></h2><p>统一查看消耗、趋势、明细和价格规则。</p></div><a class="detail-link" href="#detailTitle">查看用量明细 <span aria-hidden="true">↗</span></a></div>
+      <div class="overview-heading"><div><h2>用量看板<span class="version-tag" id="appVersion">—</span></h2><p>统一查看消耗、趋势、明细和价格规则。</p></div><a class="detail-link" href="#detailTitle">查看用量明细 <span aria-hidden="true">↗</span></a></div>
 
       <section class="control-panel global-filter-panel" aria-label="全局筛选">
         <div class="filter-row filter-row-main">
@@ -110,56 +111,59 @@
         <section id="kpiGrid" class="kpi-grid" aria-label="关键指标"></section>
         </section>
         <section class="panel analytics-panel analytics-trend-panel layout-module" data-layout-id="overview-trend" aria-labelledby="analyticsTrendTitle">
-          <div class="panel-heading"><div><p class="eyebrow">每日趋势</p><h2 id="analyticsTrendTitle">每日费用与 Token 趋势</h2></div><label class="inline-select" for="trendMetric">趋势指标<select id="trendMetric"><option value="tokens">Token</option><option value="requests">请求数</option><option value="cost">费用</option><option value="cache">缓存读取</option><option value="cache_savings">缓存节省</option></select></label></div>
+          <div class="panel-heading"><div><h2 id="analyticsTrendTitle">每日费用与 Token 趋势</h2></div><label class="inline-select" for="trendMetric">趋势指标<select id="trendMetric"><option value="tokens">Token</option><option value="requests">请求数</option><option value="cost" selected>费用</option><option value="cache">缓存读取</option><option value="cache_savings">缓存节省</option></select></label></div>
           <p id="trendMetricNote" class="panel-description">费用按当前折扣显示模式统计。</p>
-          <div id="analyticsTrendChart" class="chart-host chart-host-trend" role="img" aria-label="每日统计趋势"></div>
+          <div id="trendSummary" class="trend-summary"></div>
+          <div id="analyticsTrendChart" class="chart-host chart-host-trend" aria-label="每日统计趋势"></div>
         </section>
           <section class="panel analytics-panel layout-module" data-layout-id="overview-comparison" aria-labelledby="comparisonTitle">
-            <div class="panel-heading"><div><p class="eyebrow">期间对比</p><h2 id="comparisonTitle">与上一等长期间对比</h2></div><span id="comparisonMeta" class="panel-meta">等待数据</span></div>
+            <div class="panel-heading"><div><h2 id="comparisonTitle">与上一等长期间对比</h2></div><span id="comparisonMeta" class="panel-meta">等待数据</span></div>
             <div id="comparisonMetrics" class="analytics-metric-grid"></div>
           </section>
           <section class="panel analytics-panel layout-module" data-layout-id="overview-cache" aria-labelledby="cacheTitle">
-            <div class="panel-heading"><div><p class="eyebrow">缓存用量</p><h2 id="cacheTitle">缓存与输入拆分</h2></div><span id="cacheMeta" class="panel-meta">当前筛选范围</span></div>
+            <div class="panel-heading"><div><h2 id="cacheTitle">缓存与输入拆分</h2></div><span id="cacheMeta" class="panel-meta">当前筛选范围</span></div>
+            <div id="cacheOverview" class="cache-overview"></div>
             <div id="cacheMetrics" class="analytics-metric-grid"></div>
             <p id="cacheNote" class="panel-description"></p>
           </section>
           <section class="panel analytics-panel layout-module" data-layout-id="overview-ttft" aria-labelledby="ttftTitle">
-            <div class="panel-heading"><div><p class="eyebrow">首字延迟</p><h2 id="ttftTitle">首字延迟</h2></div><span id="ttftCoverage" class="panel-meta">等待样本</span></div>
+            <div class="panel-heading"><div><h2 id="ttftTitle">首字延迟</h2></div><span id="ttftCoverage" class="panel-meta">等待样本</span></div>
             <div id="ttftMetrics" class="analytics-metric-grid"></div>
             <p class="panel-description">统计日志提供的首字延迟。轮次平均输出速度包含等待、推理与工具执行，不代表模型解码速度。</p>
             <div id="speedExclusions" class="exclusion-list"></div>
           </section>
         <section class="panel model-totals-panel layout-module" data-layout-id="overview-models" aria-labelledby="modelTotalsTitle">
-          <div class="panel-heading"><div><p class="eyebrow">模型统计</p><h2 id="modelTotalsTitle">模型 Token 统计</h2></div><span class="panel-meta">当前筛选范围 · 按用量排序</span></div>
+          <div class="panel-heading"><div><h2 id="modelTotalsTitle">模型 Token 统计</h2></div><span class="panel-meta">当前筛选范围 · 按用量排序</span></div>
           <p class="panel-description">逐个模型查看用量、占比、请求数与参考费用；同名模型按供应商分别统计。完整轮次输出 Token ÷ 总耗时，包含等待与工具执行。</p>
+          <div class="model-compare-heading" aria-hidden="true"><span>模型 / 供应商</span><span>Token / 用量占比</span><span>请求</span><span>预估费用 USD</span></div>
           <div id="modelTotals" class="model-totals"></div>
         </section>
         </div>
       </section>
 
       <section id="view-trends" class="app-view" role="tabpanel" aria-labelledby="viewTabTrends" tabindex="0" data-view-panel="trends" hidden>
-        <div class="view-heading"><div><p class="eyebrow">趋势分析</p><h2>用量分布</h2><p>按工作空间、活跃时间、请求大小和模型查看结构变化。</p></div></div>
+        <div class="view-heading"><div><h2>用量分布</h2><p>按工作空间、活跃时间、请求大小和模型查看结构变化。</p></div></div>
         <div class="trend-dashboard-grid layout-grid" data-layout-grid="trends">
           <section class="panel workspace-panel layout-module" data-layout-id="trends-workspace" aria-labelledby="workspaceTitle">
-            <div class="panel-heading"><div><p class="eyebrow">工作空间</p><h2 id="workspaceTitle">工作空间活跃分布</h2></div><span id="workspaceMeta" class="panel-meta">—</span></div>
+            <div class="panel-heading"><div><h2 id="workspaceTitle">工作空间活跃分布</h2></div><span id="workspaceMeta" class="panel-meta">—</span></div>
             <p class="panel-description">按活跃请求量观察不同工作空间的使用集中度。</p>
             <div id="workspaceChart" class="chart-host chart-host-tall" role="img" aria-label="工作空间活跃分布图"></div>
           </section>
           <section class="panel activity-panel layout-module" data-layout-id="trends-activity" aria-labelledby="activityTitle">
-            <div class="panel-heading"><div><p class="eyebrow">活跃时间</p><h2 id="activityTitle">日活分布</h2></div><span id="activityMeta" class="panel-meta">—</span></div>
+            <div class="panel-heading"><div><h2 id="activityTitle">日活分布</h2></div><span id="activityMeta" class="panel-meta">—</span></div>
             <p class="panel-description">每日趋势与 24 小时活跃时段，帮助识别使用节奏。</p>
             <div id="dailyTrendChart" class="chart-host chart-host-trend" role="img" aria-label="每日活跃趋势图"></div>
             <div class="subchart-heading"><span>24 小时分布</span><span id="hourlyLegend" class="legend-note">颜色越深表示请求越集中</span></div>
             <div id="hourlyHeatmap" class="hourly-heatmap" role="img" aria-label="24小时活跃热力图"></div>
           </section>
           <section class="panel request-panel layout-module" data-layout-id="trends-requests" aria-labelledby="requestTitle">
-            <div class="panel-heading"><div><p class="eyebrow">请求大小</p><h2 id="requestTitle">单次请求 Token 大小分布</h2></div><span id="requestMeta" class="panel-meta">—</span></div>
+            <div class="panel-heading"><div><h2 id="requestTitle">单次请求 Token 大小分布</h2></div><span id="requestMeta" class="panel-meta">—</span></div>
             <p class="panel-description">观察单次请求的规模，竖线分别代表 p50、p90 与 p99。</p>
             <div id="requestStats" class="percentile-grid" aria-label="请求大小分位数"></div>
             <div id="requestChart" class="chart-host chart-host-medium" role="img" aria-label="单次请求Token大小直方图"></div>
           </section>
           <section class="panel model-panel layout-module" data-layout-id="trends-models" aria-labelledby="modelTitle">
-            <div class="panel-heading"><div><p class="eyebrow">模型分布</p><h2 id="modelTitle">模型日使用分布汇总</h2></div><span id="modelMeta" class="panel-meta">—</span></div>
+            <div class="panel-heading"><div><h2 id="modelTitle">模型日使用分布汇总</h2></div><span id="modelMeta" class="panel-meta">—</span></div>
             <p class="panel-description">按日期堆叠展示模型与供应商的 Token 用量。</p>
             <div id="modelLegend" class="model-legend" aria-label="模型与供应商图例"></div>
             <div id="modelUsageChart" class="chart-host chart-host-large" role="img" aria-label="模型每日Token用量堆叠图"></div>
@@ -169,31 +173,39 @@
       </section>
 
       <section id="view-usage" class="app-view" role="tabpanel" aria-labelledby="viewTabUsage" tabindex="0" data-view-panel="usage" hidden>
-        <div class="view-heading"><div><p class="eyebrow">用量明细</p><h2>逐日、逐请求与任务消耗</h2><p>当前筛选会同步作用于以下明细。</p></div></div>
+        <div class="view-heading"><div><h2>逐日、逐请求与任务消耗</h2><p>当前筛选会同步作用于以下明细。</p></div></div>
         <nav class="secondary-tabs" role="tablist" aria-label="用量明细类型">
           <button id="usageTabDaily" class="app-subtab is-selected" type="button" role="tab" aria-selected="true" aria-controls="usage-daily-panel" tabindex="0" data-subview="daily">每日汇总</button>
           <button id="usageTabRequests" class="app-subtab" type="button" role="tab" aria-selected="false" aria-controls="requestsPanel" tabindex="-1" data-subview="requests">单次请求</button>
+          <button id="usageTabSessions" class="app-subtab" type="button" role="tab" aria-selected="false" aria-controls="sessionsPanel" tabindex="-1" data-subview="sessions">会话明细</button>
           <button id="usageTabTasks" class="app-subtab" type="button" role="tab" aria-selected="false" aria-controls="tasksPanel" tabindex="-1" data-subview="tasks">任务代理</button>
           <button id="usageTabAll" class="app-subtab" type="button" role="tab" aria-selected="false" aria-controls="usageLayoutGrid" tabindex="-1" data-subview="all">全部模块</button>
         </nav>
         <div id="usageLayoutGrid" class="layout-grid" data-layout-grid="usage">
         <section id="usage-daily-panel" class="panel detail-panel app-subview-panel layout-module" data-layout-id="usage-daily" role="tabpanel" aria-labelledby="usageTabDaily" tabindex="0" data-subview-panel="daily">
-          <div class="panel-heading"><div><p class="eyebrow">每日汇总</p><h2 id="detailTitle">每日模型用量明细</h2></div><span id="detailMeta" class="panel-meta">—</span></div>
+          <div class="panel-heading"><div><h2 id="detailTitle">每日模型用量明细</h2></div><span id="detailMeta" class="panel-meta">—</span></div>
           <p id="detailDescription" class="panel-description">查看输入、输出、缓存、推理、总量、费用和请求数；未公开独立价格的模型会单独标记。</p>
           <div class="table-wrap"><table id="dailyUsageTable"><caption class="sr-only">每日模型用量与轮次平均输出速度明细表</caption><thead><tr><th scope="col">日期</th><th scope="col">模型</th><th scope="col">供应商</th><th scope="col" class="num">输入</th><th scope="col" class="num">输出</th><th scope="col" class="num">缓存</th><th scope="col" class="num">推理</th><th scope="col" class="num">合计</th><th scope="col" class="num">费用 USD</th><th scope="col" class="num">轮次平均输出速度</th><th scope="col" class="num">完整轮次样本数</th><th scope="col" class="num">请求数</th></tr></thead><tbody></tbody></table></div>
           <div id="tableEmpty" class="empty-state" hidden>当前筛选范围内暂无模型用量。</div>
           <div id="tablePagination" class="table-footer" aria-describedby="detailDescription"><p id="tablePaginationSummary" class="table-pagination-summary">等待数据</p><div class="table-pagination-actions"><button id="prevTablePage" class="pagination-button" type="button" aria-controls="dailyUsageTable" disabled>上一页</button><button id="nextTablePage" class="pagination-button" type="button" aria-controls="dailyUsageTable" disabled>下一页</button></div><p class="table-export-note">导出 CSV 包含当前筛选下的全部记录，不受分页限制。</p></div>
         </section>
         <section id="requestsPanel" class="panel analytics-panel analytics-wide app-subview-panel layout-module" data-layout-id="usage-requests" role="tabpanel" aria-labelledby="usageTabRequests" tabindex="0" data-subview-panel="requests" hidden>
-          <div class="panel-heading"><div><p class="eyebrow">单次请求</p><h2 id="requestsTitle">单次请求明细</h2></div><div class="request-table-tools"><label class="inline-select" for="requestSort">排序<select id="requestSort"><option value="time_desc">最近</option><option value="token_desc">Token 最多</option><option value="cost_desc">费用最高</option></select></label><button id="exportRequests" class="reset-button" type="button">导出本页 CSV</button></div></div>
-          <p id="requestsContext" class="panel-description">点击每日汇总行，可定位对应日期和模型的请求。</p>
+          <div class="panel-heading"><div><h2 id="requestsTitle">单次请求明细</h2></div><div class="request-table-tools"><label class="inline-select" for="requestSort">排序<select id="requestSort"><option value="time_desc">最近</option><option value="token_desc">Token 最多</option><option value="cost_desc">费用最高</option></select></label><button id="exportRequests" class="reset-button" type="button">导出本页 CSV</button></div></div>
+          <button id="clearSessionFilter" class="reset-button" type="button" hidden>清除会话定位</button><p id="requestsContext" class="panel-description">点击每日汇总行，可定位对应日期和模型的请求。</p>
           <p class="panel-description request-speed-note">估算速度含首字等待；仅在至少 200 个输出 Token、耗时至少 1 秒时显示 ≈，不代表模型解码速度。</p>
           <div class="table-wrap analytics-table-wrap"><table id="requestsTable"><thead><tr><th>时间</th><th>供应商</th><th>工作空间</th><th>模型</th><th class="num">输入</th><th class="num">未缓存输入</th><th class="num">缓存读取</th><th class="num">缓存写入</th><th class="num">输出</th><th class="num" title="含首字等待；至少200个输出Token、至少1秒才显示≈Token/s">估算速度</th><th class="num">费用 USD</th><th>计价</th></tr></thead><tbody></tbody></table></div>
           <div id="requestsEmpty" class="empty-state" hidden>当前筛选范围没有请求明细。</div>
           <div class="table-footer"><p id="requestsPageSummary" class="table-pagination-summary">等待数据</p><div class="table-pagination-actions"><button id="requestsPrev" class="pagination-button" type="button" disabled>上一页</button><button id="requestsNext" class="pagination-button" type="button" disabled>下一页</button></div><span class="table-export-note">只显示统计元数据，不保存或展示对话正文。</span></div>
         </section>
+        <section id="sessionsPanel" class="panel analytics-panel app-subview-panel layout-module" data-layout-id="usage-sessions" role="tabpanel" aria-labelledby="usageTabSessions" tabindex="0" data-subview-panel="sessions" hidden>
+          <div class="panel-heading"><h2 id="sessionsTitle">会话明细</h2><span id="sessionsMeta" class="panel-meta"></span></div>
+          <p class="panel-description">每行对应一个日志会话；点击“查看请求”可追溯消耗与上下文窗口快照。统计遵循当前全局筛选。</p>
+          <div class="table-wrap"><table id="sessionsTable"><caption class="sr-only">按会话汇总的请求与用量</caption><thead><tr><th scope="col">会话 / 工作空间</th><th scope="col">模型</th><th scope="col" class="num">请求</th><th scope="col" class="num">Token</th><th scope="col" class="num">费用 USD</th><th scope="col">最近活动</th><th scope="col">操作</th></tr></thead><tbody></tbody></table></div>
+          <p id="sessionsStatus" class="panel-description" role="status"></p>
+          <div class="table-footer"><p id="sessionsPageSummary"></p><div class="table-pagination-actions"><button id="sessionsPrev" class="pagination-button" type="button">上一页</button><button id="sessionsNext" class="pagination-button" type="button">下一页</button></div></div>
+        </section>
         <section id="tasksPanel" class="panel analytics-panel analytics-wide app-subview-panel layout-module" data-layout-id="usage-tasks" role="tabpanel" aria-labelledby="usageTabTasks" tabindex="0" data-subview-panel="tasks" hidden>
-          <div class="panel-heading"><div><p class="eyebrow">任务与代理</p><h2 id="tasksTitle">任务与代理消耗</h2></div><span id="tasksMeta" class="panel-meta">当前筛选范围</span></div>
+          <div class="panel-heading"><div><h2 id="tasksTitle">任务与代理消耗</h2></div><span id="tasksMeta" class="panel-meta">当前筛选范围</span></div>
           <p class="panel-description">任务费用包含主代理及子代理；并行代理的墙钟耗时不相加。</p>
           <div class="table-wrap analytics-table-wrap"><table id="tasksTable"><thead><tr><th>任务</th><th>工作空间</th><th class="num">请求</th><th class="num">Token</th><th class="num">费用 USD</th><th class="num">占当前总费用</th><th>代理明细</th></tr></thead><tbody></tbody></table></div>
           <div id="tasksEmpty" class="empty-state" hidden>当前筛选范围没有任务归属数据。</div>
@@ -202,7 +214,7 @@
       </section>
 
       <section id="view-pricing" class="app-view" role="tabpanel" aria-labelledby="viewTabPricing" tabindex="0" data-view-panel="pricing" hidden>
-        <div class="view-heading"><div><p class="eyebrow">价格与数据</p><h2>价格规则与扫描状态</h2><p>编辑模型价格，检查本地数据扫描情况。</p></div></div>
+        <div class="view-heading"><div><h2>价格规则与扫描状态</h2><p>编辑模型价格，检查本地数据扫描情况。</p></div></div>
         <nav class="secondary-tabs" role="tablist" aria-label="价格与数据页面">
           <button id="pricingTabRules" class="app-subtab is-selected" type="button" role="tab" aria-selected="true" aria-controls="pricingPanel" tabindex="0" data-subview="rules">价格规则</button>
           <button id="pricingTabDiagnostics" class="app-subtab" type="button" role="tab" aria-selected="false" aria-controls="diagnosticsPanel" tabindex="-1" data-subview="diagnostics">扫描诊断</button>
@@ -210,7 +222,7 @@
         </nav>
         <div id="pricingLayoutGrid" class="layout-grid" data-layout-grid="pricing">
         <section id="pricingPanel" class="panel analytics-panel analytics-wide app-subview-panel layout-module" data-layout-id="pricing-rules" role="tabpanel" aria-labelledby="pricingTabRules" tabindex="0" data-subview-panel="rules">
-          <div class="panel-heading"><div><p class="eyebrow">价格规则</p><h2 id="pricingTitle">价格规则</h2></div><button id="addPricingRule" class="export-button" type="button">新增规则</button></div>
+          <div class="panel-heading"><div><h2 id="pricingTitle">价格规则</h2></div><button id="addPricingRule" class="export-button" type="button">新增规则</button></div>
           <p class="panel-description">单价单位为 USD / 百万 Token。倍率 0.8 表示八折；历史记录沿用当时规则。保存规则不会自动改写历史费用。</p>
           <div class="table-wrap analytics-table-wrap"><table id="pricingTable"><thead><tr><th>供应商</th><th>模型</th><th>输入 / 百万</th><th>缓存读取 / 百万</th><th>缓存写入 / 百万</th><th>输出 / 百万</th><th>倍率</th><th>生效时间</th><th>来源 / 备注</th><th>操作</th></tr></thead><tbody></tbody></table></div>
           <div id="pricingEmpty" class="empty-state" hidden>暂无自定义价格规则。</div>
@@ -219,7 +231,7 @@
           <p id="pricingStatus" class="analytics-status" role="status" aria-live="polite"></p>
         </section>
         <section id="diagnosticsPanel" class="panel analytics-panel analytics-wide app-subview-panel layout-module" data-layout-id="pricing-diagnostics" role="tabpanel" aria-labelledby="pricingTabDiagnostics" tabindex="0" data-subview-panel="diagnostics" hidden>
-          <div class="panel-heading"><div><p class="eyebrow">扫描诊断</p><h2 id="diagnosticsTitle">数据来源与扫描诊断</h2></div><button id="diagnosticsRefresh" class="reset-button" type="button">刷新诊断</button></div>
+          <div class="panel-heading"><div><h2 id="diagnosticsTitle">数据来源与扫描诊断</h2></div><button id="diagnosticsRefresh" class="reset-button" type="button">刷新诊断</button></div>
           <div id="diagnosticsFacts" class="diagnostic-facts"></div>
           <div id="diagnosticsRoots" class="diagnostic-roots"></div>
           <div class="scan-options"><label><input id="autoScanEnabled" type="checkbox"> 自动扫描</label><label for="scanInterval">扫描间隔（秒）<input id="scanInterval" type="number" min="10" max="86400" step="1"></label><button id="saveScanOptions" class="reset-button" type="button">保存</button><button id="scanNow" class="export-button" type="button">立即同步</button></div>
@@ -233,7 +245,7 @@
   </div>
   <div id="chartTooltip" class="chart-tooltip" role="tooltip" hidden></div>
   <dialog id="updateDialog" class="update-dialog" aria-labelledby="updateTitle" aria-describedby="updateNotice">
-    <div class="panel-heading"><div><p class="eyebrow">应用更新</p><h2 id="updateTitle">应用更新</h2></div><button id="updateCloseIcon" class="icon-button" type="button" aria-label="关闭更新面板" autofocus>×</button></div>
+    <div class="panel-heading"><div><h2 id="updateTitle">应用更新</h2></div><button id="updateCloseIcon" class="icon-button" type="button" aria-label="关闭更新面板" autofocus>×</button></div>
     <dl class="update-versions"><div><dt>当前版本</dt><dd id="updateCurrentVersion">—</dd></div><div><dt>最新版本</dt><dd id="updateLatestVersion">—</dd></div></dl>
     <p id="updateStatus" class="update-status" role="status" aria-live="polite">等待检查更新</p>
     <div id="updateProgressWrap" class="update-progress-wrap" hidden><progress id="updateProgress" max="100" value="0" aria-label="更新下载进度"></progress><span id="updateProgressText" aria-hidden="true">0%</span></div>
@@ -241,11 +253,11 @@
     <div class="update-actions"><button id="updateCloseButton" class="reset-button" type="button">关闭</button><button id="updateActionButton" class="export-button" type="button">检查更新</button></div>
   </dialog>
   <dialog id="dataSettingsDialog" class="data-settings-dialog" aria-labelledby="dataSettingsTitle" aria-describedby="dataSettingsIntro">
-    <div class="panel-heading data-settings-heading"><div><p class="eyebrow">本机数据</p><h2 id="dataSettingsTitle">数据管理</h2></div><button id="dataSettingsCloseIcon" class="icon-button" type="button" aria-label="关闭数据管理面板" autofocus>×</button></div>
+    <div class="panel-heading data-settings-heading"><div><h2 id="dataSettingsTitle">数据管理</h2></div><button id="dataSettingsCloseIcon" class="icon-button" type="button" aria-label="关闭数据管理面板" autofocus>×</button></div>
     <p id="dataSettingsIntro" class="data-settings-intro">管理本机历史数据的保存位置，或按需清理较早记录。</p>
     <div class="data-settings-grid">
       <section class="data-settings-section" aria-labelledby="dataLocationTitle">
-        <div class="data-settings-section-heading"><div><p class="eyebrow">保存位置</p><h3 id="dataLocationTitle">保存位置</h3></div></div>
+        <div class="data-settings-section-heading"><div><h3 id="dataLocationTitle">保存位置</h3></div></div>
         <p class="data-settings-help">更改后，现有历史会迁移到新目录，旧目录保留备份。</p>
         <div class="data-current-location"><span class="data-settings-label">当前数据目录</span><p id="dataCurrentDirectory" class="data-path">等待读取保存位置</p></div>
         <dl class="data-settings-facts">
@@ -260,7 +272,7 @@
         <p class="data-settings-note">迁移和清理产生的备份会占用额外磁盘空间；确认不再需要时可手动删除。</p>
       </section>
       <section class="data-settings-section" aria-labelledby="dataCleanupTitle">
-        <div class="data-settings-section-heading"><div><p class="eyebrow">手动清理</p><h3 id="dataCleanupTitle">手动清理历史</h3></div></div>
+        <div class="data-settings-section-heading"><div><h3 id="dataCleanupTitle">手动清理历史</h3></div></div>
         <p class="data-settings-help">只会删除早于截止日期的记录；截止日期当天的数据会保留。</p>
         <div class="data-cleanup-controls">
           <label class="data-settings-label" for="cleanupDaysInput">删除多少天前的数据</label>
@@ -283,11 +295,11 @@
     <div class="data-settings-footer"><button id="dataSettingsCloseButton" class="reset-button" type="button">关闭</button></div>
   </dialog>
   <dialog id="requestDetailDialog" class="analytics-dialog" aria-labelledby="requestDetailTitle">
-    <div class="panel-heading"><div><p class="eyebrow">请求详情</p><h2 id="requestDetailTitle">请求统计详情</h2></div><button class="icon-button" type="button" data-close-dialog="requestDetailDialog" aria-label="关闭请求详情">×</button></div>
-    <p class="panel-description">仅含请求时间、模型、Token 和计价信息，不包含对话正文。</p><dl id="requestDetailFacts" class="analytics-detail-grid"></dl>
+    <div class="panel-heading"><div><h2 id="requestDetailTitle">请求统计详情</h2></div><button class="icon-button" type="button" data-close-dialog="requestDetailDialog" aria-label="关闭请求详情">×</button></div>
+    <p class="panel-description">仅含请求时间、模型、Token 和计价信息，不包含对话正文。</p><section id="requestContextWindow" class="context-window" aria-label="上下文窗口"></section><dl id="requestDetailFacts" class="analytics-detail-grid"></dl>
   </dialog>
   <dialog id="pricingRuleDialog" class="analytics-dialog pricing-rule-dialog" aria-labelledby="pricingRuleTitle">
-    <div class="panel-heading"><div><p class="eyebrow">价格规则</p><h2 id="pricingRuleTitle">新增价格规则</h2></div><button class="icon-button" type="button" data-close-dialog="pricingRuleDialog" aria-label="关闭价格规则编辑">×</button></div>
+    <div class="panel-heading"><div><h2 id="pricingRuleTitle">新增价格规则</h2></div><button class="icon-button" type="button" data-close-dialog="pricingRuleDialog" aria-label="关闭价格规则编辑">×</button></div>
     <form id="pricingRuleForm" class="pricing-form">
       <input id="pricingRuleId" type="hidden">
       <label for="pricingProvider">供应商<select id="pricingProvider" required><option value="*">所有供应商（*）</option></select></label>

@@ -70,7 +70,7 @@ def _validated_layout(value: Any) -> Optional[dict[str, Any]]:
         return None
     result: dict[str, Any] = {"version": 1, "pages": {}}
     result["view"] = value.get("view") if value.get("view") in views else "overview"
-    result["usage"] = value.get("usage") if value.get("usage") in ("daily", "requests", "tasks", "all") else "daily"
+    result["usage"] = value.get("usage") if value.get("usage") in ("daily", "requests", "sessions", "tasks", "all") else "daily"
     result["pricing"] = value.get("pricing") if value.get("pricing") in ("rules", "diagnostics", "all") else "rules"
     for view in views:
         items = pages.get(view, [])
@@ -291,7 +291,11 @@ class DesktopBridge:
         """Layout survives private WebView sessions and changing loopback ports."""
         with self._preferences_lock:
             try:
-                return {"ok": True, "layout": _validated_layout(_read_preferences().get("layout"))}
+                stored = _read_preferences().get("layout")
+                layout = _validated_layout(stored)
+                if stored is not None and layout is None:
+                    return {"ok": False, "layout": None, "error": "已保存的布局暂时无法读取，原设置已保留"}
+                return {"ok": True, "layout": layout}
             except (OSError, ValueError):
                 return {"ok": False, "layout": None, "error": "无法读取布局设置"}
 

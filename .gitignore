@@ -16,3 +16,7 @@ Thumbs.db
 release/
 providers.json
 build-info.json
+work/
+outputs/
+TASK-HERMES.md
+TASK-PRICING.md

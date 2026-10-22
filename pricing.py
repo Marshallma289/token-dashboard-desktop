@@ -125,6 +125,8 @@ MODEL_ALIASES = {
     # name they report (for example "deepseek/deepseek-flash"); such names
     # bill at the same reference rates as the bare model.
     "deepseek/deepseek-flash": "deepseek-flash",
+    "deepseek-v4.1-flash": "deepseek-flash",
+    "deepseek/deepseek-v4.1-flash": "deepseek-flash",
     "xiaomi-mimo/mimo-v2.6-pro": "mimo-v2.6-pro",
     "deepseek-v4-flash": "deepseek-flash",
     "deepseek-v4-flash-vision-exp": "deepseek-flash",
@@ -453,6 +455,7 @@ class PricingCatalog:
         cache_write_input_tokens: int = 0,
         output_tokens: int = 0,
         provider: object = None,
+        aggregate: bool = False,
     ) -> Quote:
         pricing_model = canonical_model(model)
 
@@ -500,7 +503,7 @@ class PricingCatalog:
             short_rates, long_rates = openai_prices
             rates = short_rates
             band = "standard"
-            if long_rates is not None and int(input_tokens or 0) > OPENAI_LONG_CONTEXT_THRESHOLD:
+            if not aggregate and long_rates is not None and int(input_tokens or 0) > OPENAI_LONG_CONTEXT_THRESHOLD:
                 rates = long_rates
                 band = "long_context"
             return _priced_quote(

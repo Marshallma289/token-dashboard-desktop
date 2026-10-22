@@ -11,7 +11,7 @@
     dashboard: null,
     requests: { data: [], total: 0, page: 1, page_size: 30 },
     tasks: [],
-    sessions: [], sessionPage: 1, sessionThread: '', sessionLoadId: 0, sessionController: null, sessionsError: '', sessionsLoading: false, sessionOmitted: 0,
+    sessions: [], sessionPage: 1, sessionThread: '', sessionSourceKind: '', sessionSourceIdentity: '', sessionLoadId: 0, sessionController: null, sessionsError: '', sessionsLoading: false, sessionOmitted: 0,
     diagnostics: null,
     pricingRules: [],
     catalog: {},
@@ -112,6 +112,7 @@
       params.set('end_date', snapshot.endDate);
     } else if (snapshot.range === 'all') params.set('days', '0');
     else if (snapshot.range) params.set('days', snapshot.range);
+    if (snapshot.sourceKind && snapshot.sourceKind !== 'all') params.set('source_kind', snapshot.sourceKind);
     if (snapshot.provider && snapshot.provider !== 'all') params.set('provider', snapshot.provider);
     if (snapshot.workspace && snapshot.workspace !== 'all') params.set('workspace', snapshot.workspace);
     if (snapshot.model && snapshot.model !== 'all') params.set('model', snapshot.model);
@@ -277,6 +278,7 @@
   };
 
   function requestSpeedInfo(row) {
+    if (row.source_kind === 'hermes') return { text: '不适用', title: 'Hermes 聚合用量未提供单次请求边界。', reason: 'Hermes 聚合用量未提供单次请求边界。' };
     const durationRaw = get(row, 'request_duration_estimate_ms');
     const rateRaw = get(row, 'request_output_tokens_per_second_estimate');
     const output = numeric(get(row, 'output_tokens', 'output'));
@@ -299,6 +301,13 @@
   }
 
   function renderTtft(data) {
+    const scope = data && data.requestMetrics || {};
+    if (scope.scope === 'not_applicable') {
+      $('#ttftCoverage').textContent = '不适用';
+      $('#ttftMetrics').innerHTML = `<p class="panel-description">${esc(scope.reason)}</p>`;
+      $('#speedExclusions').innerHTML = '';
+      return;
+    }
     const summary = data && data.summary || {};
     const median = get(summary, 'ttft_median_ms', 'ttftMedianMs');
     const p90 = get(summary, 'ttft_p90_ms', 'ttftP90Ms');
@@ -306,7 +315,7 @@
     const requests = numeric(get(summary, 'requests', 'request_count', 'requestCount'));
     const rawCoverage = get(summary, 'ttft_coverage', 'ttftCoverage');
     const coverage = rawCoverage === undefined ? (requests > 0 ? samples / requests : null) : numeric(rawCoverage);
-    $('#ttftCoverage').textContent = `${cachePercent(coverage, coverage !== null)} 覆盖 · ${number(samples)} 个样本`;
+    $('#ttftCoverage').textContent = `${cachePercent(coverage, coverage !== null)} 覆盖 · ${number(samples)} 个样本${scope.reason ? ` · ${scope.reason}` : ''}`;
     const items = [
       ['中位首字延迟', median === undefined || samples <= 0 ? '—' : `${number(median)} ms`, 'P50'],
       ['P90 首字延迟', p90 === undefined || samples <= 0 ? '—' : `${number(p90)} ms`, '90% 样本不超过'],
@@ -426,7 +435,7 @@
     state.queryVersion = version;
     if (filterChanged) {
       state.requestPage = 1;
-      state.sessionThread = ''; state.requestsContext = ''; state.sessionPage = 1; state.sessions = [];
+      state.sessionThread = ''; state.sessionSourceKind = ''; state.sessionSourceIdentity = ''; state.requestsContext = ''; state.sessionPage = 1; state.sessions = [];
       state.requests = { data: [], total: 0, page: 1, page_size: state.requestPageSize };
       state.tasks = [];
       state.requestLoadedKey = '';
@@ -438,7 +447,7 @@
   }
 
   function loadRequestPage(options = {}) {
-    const url = fullQuery('/api/requests', { page: state.requestPage, page_size: state.requestPageSize, sort: $('#requestSort').value, ...(state.sessionThread ? { thread_key: state.sessionThread } : {}), cost_mode: requestCostMode() });
+    const url = fullQuery('/api/requests', { page: state.requestPage, page_size: state.requestPageSize, sort: $('#requestSort').value, ...(state.sessionThread ? { thread_key: state.sessionThread, ...(state.sessionSourceKind ? { source_kind: state.sessionSourceKind } : {}), ...(state.sessionSourceIdentity ? { source_identity: state.sessionSourceIdentity } : {}) } : {}), cost_mode: requestCostMode() });
     const key = `${state.queryVersion}|${url}`;
     if (state.requestPromise && key === state.requestPendingKey) return state.requestPromise;
     if (!options.force && !state.requestPromise && key === state.requestLoadedKey && !state.requestsError) return Promise.resolve();
@@ -552,7 +561,7 @@
       const key = str(row.thread_key);
       const unknownCost = numeric(row.unpriced_request_count) >= numeric(row.request_count);
       const cost = currentCostKey() === 'costBefore' ? row.cost_before_discount_usd : row.cost_after_discount_usd;
-      return `<tr><td><strong title="${esc(key)}">${esc(key.slice(0, 12))}…</strong><small class="session-workspace">${esc(row.workspace || '工作空间未提供')}</small></td><td>${(row.models || []).map(esc).join('<br>')}</td><td class="num">${number(row.request_count)}</td><td class="num" title="${number(row.total_tokens)}">${compact(row.total_tokens)}</td><td class="num">${unknownCost ? '未计价' : esc(currency(cost))}${!unknownCost && row.unpriced_request_count ? '<small class="session-workspace">部分未计价</small>' : ''}</td><td>${esc(timestamp(row.last_seen))}</td><td><button class="reset-button" type="button" data-session-thread="${esc(key)}" aria-label="查看会话 ${esc(key.slice(0, 12))} 的请求">查看请求</button></td></tr>`;
+      return `<tr><td><strong title="${esc(key)}">${esc(key.slice(0, 12))}…</strong><small class="session-workspace">${esc(row.workspace || '工作空间未提供')}</small></td><td>${(row.models || []).map(esc).join('<br>')}</td><td class="num">${number(row.request_count)}</td><td class="num" title="${number(row.total_tokens)}">${compact(row.total_tokens)}</td><td class="num">${unknownCost ? '未计价' : esc(currency(cost))}${!unknownCost && row.unpriced_request_count ? '<small class="session-workspace">部分未计价</small>' : ''}</td><td>${esc(timestamp(row.last_seen))}</td><td><button class="reset-button" type="button" data-session-thread="${esc(key)}" data-session-source="${esc(row.source_kind || '')}" data-session-identity="${esc(row.source_identity || '')}" aria-label="查看会话 ${esc(key.slice(0, 12))} 的请求">查看请求</button></td></tr>`;
     }).join('');
     $('#sessionsPanel').setAttribute('aria-busy', String(state.sessionsLoading));
     $('#sessionsMeta').textContent = `${number(rows.length)} 个会话`;
@@ -563,6 +572,8 @@
   }
 
   function renderRequests(error = state.requestsError) {
+    const includesHermes = (state.requests.data || []).some(row => row.source_kind === 'hermes');
+    $('#requestsTitle').textContent = includesHermes ? '请求与聚合用量明细' : '单次请求明细';
     const body = $('#requestsTable tbody');
     const rows = state.requests.data || [];
     $('#requestsEmpty').hidden = rows.length > 0;
@@ -579,12 +590,12 @@
       const cacheWrite = showMissingCache(row, 'cache_write_available', ['cache_write_tokens', 'cache_write_input_tokens', 'cache_write']);
       const speed = requestSpeedInfo(row);
       const detailAttrs = id ? `data-request-id="${esc(id)}"` : '';
-      return `<tr class="request-row" tabindex="0" role="button" aria-label="打开请求统计详情" ${detailAttrs}><td>${esc(timestamp(get(row, 'timestamp', 'time', 'created_at')))}</td><td>${esc(get(row, 'provider_label', 'provider', 'provider_id'))}</td><td>${esc(get(row, 'workspace', 'workspace_id'))}</td><td>${esc(get(row, 'model', 'model_name'))}</td><td class="num">${esc(number(get(row, 'input_tokens', 'input')))}</td><td class="num">${esc(get(row, 'fresh_input_tokens') === undefined ? '未提供' : number(row.fresh_input_tokens))}</td><td class="num">${esc(cacheRead)}</td><td class="num">${esc(cacheWrite)}</td><td class="num">${esc(number(get(row, 'output_tokens', 'output')))}</td><td class="num" title="${esc(speed.title)}">${esc(speed.text)}</td><td class="num" title="${esc(currentCostLabel())}">${esc(fee)}</td><td><span class="provider-pill" title="${esc(get(row, 'pricing_note', 'pricingNote'))}">${esc(pricingStatusLabel(pricing))}</span></td></tr>`;
+      return `<tr class="request-row" tabindex="0" role="button" aria-label="打开请求统计详情" ${detailAttrs}><td>${esc(timestamp(get(row, 'timestamp', 'time', 'created_at')))}${row.source_kind === 'hermes' ? `<small class="session-workspace">聚合记录 · ${number(row.api_call_count)} 次调用</small>` : ''}</td><td>${esc(get(row, 'provider_label', 'provider', 'provider_id'))}</td><td>${esc(get(row, 'workspace', 'workspace_id'))}</td><td>${esc(get(row, 'model', 'model_name'))}</td><td class="num">${esc(number(get(row, 'input_tokens', 'input')))}</td><td class="num">${esc(get(row, 'fresh_input_tokens') === undefined ? '未提供' : number(row.fresh_input_tokens))}</td><td class="num">${esc(cacheRead)}</td><td class="num">${esc(cacheWrite)}</td><td class="num">${esc(number(get(row, 'output_tokens', 'output')))}</td><td class="num" title="${esc(speed.title)}">${esc(speed.text)}</td><td class="num" title="${esc(currentCostLabel())}">${esc(fee)}</td><td><span class="provider-pill" title="${esc(get(row, 'pricing_note', 'pricingNote'))}">${esc(pricingStatusLabel(pricing))}</span></td></tr>`;
     }).join('');
     const total = numeric(state.requests.total), page = numeric(state.requests.page) || state.requestPage;
     const pageSize = numeric(state.requests.page_size) || state.requestPageSize;
     const totalPages = Math.max(1, Math.ceil(total / Math.max(1, pageSize)));
-    const summary = total ? `共 ${number(total)} 条 · 第 ${page} / ${totalPages} 页` : error ? '接口暂不可用' : '当前范围无请求';
+    const summary = total ? `共 ${number(total)} 条记录${state.requests.request_count != null ? ` · ${number(state.requests.request_count)} 次调用` : ''} · 第 ${page} / ${totalPages} 页` : error ? '接口暂不可用' : '当前范围无请求';
     $('#requestsPageSummary').textContent = state.requestsLoading ? `${total ? summary : '请求明细'} · 更新中…` : summary;
     $('#requestsPrev').disabled = state.requestsLoading || !total || page <= 1;
     $('#requestsNext').disabled = state.requestsLoading || !total || page >= totalPages;
@@ -630,7 +641,7 @@
         const roleName = ({main:'主代理',subagent:'子代理',unknown:'未提供'})[role] || role;
         return `<tr><td>${esc(roleName)}</td><td>${esc(get(agent, 'model'))}</td><td title="${esc(get(agent, 'thread_key'))}">${esc(str(get(agent, 'thread_key'), '—').slice(0, 22))}</td><td class="num">${esc(compact(agentTokens))}</td><td class="num">${esc(currency(agentPrice))}</td><td class="num">${esc(agentShare)}</td></tr>`;
       }).join('');
-      const detail = agents.length ? `<details class="agent-details"><summary>${number(agents.length)} 个代理</summary><div class="table-wrap nested-table"><table><thead><tr><th>角色</th><th>模型</th><th>线程</th><th class="num">Token</th><th class="num">费用 USD</th><th class="num">任务占比</th></tr></thead><tbody>${agentRows}</tbody></table></div></details>` : '—';
+      const detail = task.source_kind === 'hermes' ? 'Hermes 任务分类；父子代理关系未提供' : agents.length ? `<details class="agent-details"><summary>${number(agents.length)} 个代理</summary><div class="table-wrap nested-table"><table><thead><tr><th>角色</th><th>模型</th><th>线程</th><th class="num">Token</th><th class="num">费用 USD</th><th class="num">任务占比</th></tr></thead><tbody>${agentRows}</tbody></table></div></details>` : '—';
       const id = str(get(task, 'task_id', 'id'), `task-${index + 1}`);
       return `<tr><td title="${esc(id)}"><strong>${esc(id.length > 34 ? `${id.slice(0, 33)}…` : id)}</strong></td><td>${esc(get(task, 'workspace'))}</td><td class="num">${esc(number(requests))}</td><td class="num">${esc(compact(tokens))}</td><td class="num">${esc(currency(cost))}</td><td class="num">${esc(share)}</td><td>${detail}</td></tr>`;
     }).join('');
@@ -717,10 +728,28 @@
       const value = breakdown[key];
       if (value !== undefined && value !== null && Number.isFinite(Number(value))) rows.push([`折扣前费用拆分 · ${label}`, currencyExact(value)]);
     });
+    if (request.source_kind === 'hermes') {
+      const origin = rateSnapshot.cost_origin;
+      rows.unshift(['记录类型', `Hermes 聚合记录（${number(request.api_call_count)} 次 API 调用）`],
+        ['工作空间来源', request.workspace_source],
+        ['统计起始', request.first_seen != null ? timestamp(Number(request.first_seen) * 1000) : '未提供'],
+        ['统计结束', request.last_seen != null ? timestamp(Number(request.last_seen) * 1000) : '未提供'],
+        ['当前费用依据', origin === 'hermes_reported' ? 'Hermes 自报' : origin === 'reference_estimate' ? '参考价估算' : '未计价'],
+        ['Hermes 自报估算费用 USD', request.hermes_estimated_cost_usd],
+        ['Hermes 自报实际费用 USD', request.hermes_actual_cost_usd],
+        ['Hermes cost_status', request.cost_status], ['Hermes cost_source', request.cost_source],
+        ['费用说明', rateSnapshot.note], ['请求级指标', '不适用：Hermes 未提供请求边界、TTFT、速度及父子代理关系。']);
+      const unavailable = new Set(['单次请求速度（日志估算）', '请求估算耗时（含首字等待）', '请求计时来源', '首字延迟', '轮次耗时']);
+      rows.forEach(row => { if (unavailable.has(row[0])) row[1] = '不适用'; });
+    }
     return rows.filter(([, value]) => value !== undefined && value !== null && String(value) !== '');
   }
 
   function renderContextWindow(request) {
+    if (request.source_kind === 'hermes') {
+      $('#requestContextWindow').innerHTML = '<p class="panel-description">不适用：Hermes 聚合用量未提供请求上下文窗口。</p>';
+      return;
+    }
     const capacityRaw = get(request, 'context_window_tokens');
     const inputRaw = get(request, 'context_input_tokens');
     const knownInput = inputRaw !== undefined && inputRaw !== null && Number.isFinite(Number(inputRaw)) && Number(inputRaw) >= 0;
@@ -757,8 +786,9 @@
   }
 
   function exportRequestPage() {
-    const fields = ['request_id', 'timestamp', 'provider', 'workspace', 'model', 'input_tokens', 'fresh_input_tokens', 'cache_read_tokens', 'cache_read_input_tokens', 'cache_hit_rate', 'cache_write_input_tokens', 'output_tokens', 'reasoning_tokens', 'total_tokens', 'request_duration_estimate_ms', 'request_output_tokens_per_second_estimate', 'request_timing_source', 'request_speed_exclusion_reason', 'cost_display_mode', 'displayed_cost_usd', 'estimated_cost_usd', 'cost_before_discount_usd', 'cost_after_discount_usd', 'pricing_status', 'task_id', 'agent_role'];
+    const fields = ['source_kind', 'api_call_count', 'record_kind', 'hermes_estimated_cost_usd', 'hermes_actual_cost_usd', 'cost_status', 'cost_source', 'workspace_source', 'request_id', 'timestamp', 'provider', 'workspace', 'model', 'input_tokens', 'fresh_input_tokens', 'cache_read_tokens', 'cache_read_input_tokens', 'cache_hit_rate', 'cache_write_input_tokens', 'output_tokens', 'reasoning_tokens', 'total_tokens', 'request_duration_estimate_ms', 'request_output_tokens_per_second_estimate', 'request_timing_source', 'request_speed_exclusion_reason', 'cost_display_mode', 'displayed_cost_usd', 'estimated_cost_usd', 'cost_before_discount_usd', 'cost_after_discount_usd', 'pricing_status', 'task_id', 'agent_role'];
     const rows = (state.requests.data || []).map(row => ({
+      source_kind: row.source_kind, api_call_count: row.api_call_count, record_kind: row.record_kind, hermes_estimated_cost_usd: row.hermes_estimated_cost_usd, hermes_actual_cost_usd: row.hermes_actual_cost_usd, cost_status: row.cost_status, cost_source: row.cost_source, workspace_source: row.workspace_source,
       request_id: get(row, 'request_id', 'id'), timestamp: get(row, 'timestamp', 'time'), provider: get(row, 'provider'), workspace: get(row, 'workspace'), model: get(row, 'model'),
       input_tokens: get(row, 'input_tokens', 'input'), fresh_input_tokens: get(row, 'fresh_input_tokens'), cache_read_tokens: get(row, 'cache_read_available') === true ? get(row, 'cache_read_tokens', 'cached_input_tokens', 'cache') : '未提供',
       cache_read_input_tokens: get(row, 'cache_read_available') === true ? get(row, 'input_tokens', 'input') : '',
@@ -1112,6 +1142,7 @@
       const button = event.target.closest('[data-session-thread]');
       if (!button) return;
       state.sessionThread = button.dataset.sessionThread;
+      state.sessionSourceKind = button.dataset.sessionSource || ''; state.sessionSourceIdentity = button.dataset.sessionIdentity || '';
       state.requestsContext = `当前定位会话：${state.sessionThread.slice(0, 12)}…，保持全局日期与筛选。`;
       state.requestPage = 1;
       if (window.CodexDashboardLayout) window.CodexDashboardLayout.showView('usage', 'requests');
@@ -1120,7 +1151,7 @@
     $('#sessionsPrev').addEventListener('click', () => { state.sessionPage -= 1; renderSessions(); });
     $('#sessionsNext').addEventListener('click', () => { state.sessionPage += 1; renderSessions(); });
     $('#clearSessionFilter').addEventListener('click', () => {
-      state.sessionThread = ''; state.requestsContext = ''; state.requestPage = 1;
+      state.sessionThread = ''; state.sessionSourceKind = ''; state.sessionSourceIdentity = ''; state.requestsContext = ''; state.requestPage = 1;
       loadRequestPage({ force: true });
     });
     $('#requestSort').addEventListener('change', () => { state.requestPage = 1; loadRequestPage(); });
@@ -1138,10 +1169,10 @@
     $('#dailyUsageTable tbody').addEventListener('click', event => {
       const row = event.target.closest('tr.usage-summary-row');
       if (!row || !window.CodexDashboard) return;
-      state.sessionThread = '';
+      state.sessionThread = ''; state.sessionSourceKind = ''; state.sessionSourceIdentity = '';
       state.requestsContext = `当前定位：${dateLabel(row.dataset.date)} · ${row.dataset.model} · ${row.dataset.provider}。`;
       if (window.CodexDashboardLayout) window.CodexDashboardLayout.showView('usage', 'requests');
-      window.CodexDashboard.setFilters({ provider: row.dataset.provider, model: row.dataset.model, workspace: row.dataset.workspace || 'all', startDate: row.dataset.date, endDate: row.dataset.date });
+      window.CodexDashboard.setFilters({ sourceKind: row.dataset.sourceKind || undefined, provider: row.dataset.provider, model: row.dataset.model, workspace: row.dataset.workspace || 'all', startDate: row.dataset.date, endDate: row.dataset.date });
       window.requestAnimationFrame(() => $('#requestsPanel').scrollIntoView({ behavior: 'smooth', block: 'start' }));
     });
     $('#dailyUsageTable tbody').addEventListener('keydown', event => {

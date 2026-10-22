@@ -139,7 +139,40 @@ Windows 与 Mac 共用 `backend.py`、`desktop.py`、`pricing.py` 和 `web/`，�
 
 ## 数据、历史与隐私
 
-### 日志来源
+### Hermes 数据源
+
+桌面版和浏览器模式同时支持 Codex JSONL 与 Hermes SQLite 聚合用量，顶部“数据源”可选择全部、Codex 或 Hermes，保留现有四页签。
+
+- 路径优先级：`--hermes-db` → `$HERMES_HOME/state.db` → Windows 的 `%LOCALAPPDATA%` 同级常见位置 `~/Hermes/state.db`，其他系统的 `~/.hermes/state.db`（安装位置不同时请用 `--hermes-db` 或 `HERMES_HOME` 指定）。主库同目录的 `profiles/*/state.db` 也会扫描。桌面入口同样支持 `--hermes-db`。
+- 源库不交给 SQLite 建立共享内存：用普通只读文件句柄将 DB 与存在的 WAL 复制到临时目录，确认复制前后的大小与修改时间稳定后，再用 `sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)` 查询临时快照。临时快照关闭后删除；不会在 Hermes 源目录写入、checkpoint、VACUUM，或创建、更新 `-wal` / `-shm`。活跃 WAL 中已提交的数据会被读取，不使用忽略 WAL 的 `immutable` 模式。
+- 每个库以 `MAX(last_seen)` 与行数保存 watermark，并额外比对 DB/WAL 的大小、mtime 签名；水位与签名均未变化时跳过行转换和重新计价。水位变化时以新累计快照替换旧值，不把累计用量再次相加。即使较旧会话的更新未超过全库最大时间，文件签名变化也会触发刷新，避免漏读。
+- 一行是 session × model × provider × task 的累计记录，`api_call_count` 是请求数；不拆成伪请求。总览、趋势、分组、会话、计价计数和导出按调用数加权；明细分页按实际记录行数分页，同时显示累计调用数。多个 profile 的身份独立，Codex 旧库记录默认 `source_kind=codex`、`api_call_count=1`。
+- 日期与小时取 `last_seen` 转本地时区的结果，整个聚合区间的用量归入结束日，不推测逐次请求分布。总 Token 为 input + output，缓存和 reasoning 不重复相加。保留源库原始数值；若缓存读取量超过输入量、无法作为输入的子集解释，则缓存占比显示未知，不显示超过 100% 的比例。workspace 优先 `sessions.cwd`，为空时使用 `sessions.source`，详情标明来源。
+- 优先使用已有模型参考价／自定义价格规则估算，聚合行使用普通档参考价，并标注“无法判断是否触发长上下文阶梯价”。未命中参考价时，仅在 `cost_status` 为 estimated、actual、known、confirmed、reported、priced 且自报金额大于零时采用 Hermes 自报值，优先实际金额；否则仍为未计价。详情保留自报金额、`cost_status`、`cost_source` 和费用依据；0 不被当作已知免费账单。
+- Hermes 没有单次请求速度、TTFT、上下文窗口、请求大小分布或父子代理关系。Hermes 视图显示“不适用／未提供”；“全部”视图的请求级图表仅使用 Codex 样本，并标注“仅含 Codex；Hermes 未提供”。Hermes 的任务字段仅作任务分类，不代表真实子代理关系。
+- 源库缺失或暂时不可读时保留已采集历史并跳过该源；不创建空 Hermes 库。源读取和历史统计库写入严格分离。直接构造 `DashboardDB` 的库调用者以 `hermes_db=...` 显式启用 Hermes，方便使用独立测试数据。
+
+#### Hermes 模型别名与费用口径
+
+`deepseek-v4.1-flash` 和 `deepseek/deepseek-v4.1-flash` 均映射到 `deepseek-flash`，使用 [DeepSeek 官方参考价](https://api-docs.deepseek.com/quick_start/pricing/)。低谷时输入 cache miss、cache hit、输出分别为 0.15、0.003、0.60 USD / 百万 Token，高峰时为两倍；缓存写入沿用普通输入单价。高峰按记录的 `last_seen` 时间判断，累计记录无法还原每次调用所在时段；中国法定节假日例外仍需人工核对。
+
+Hermes 的 `input_tokens`、`cache_read_tokens`、`cache_write_tokens` 是并列独立量。计价前将三者之和作为价格引擎的输入总量，再分别按普通输入、缓存读取、缓存写入单价计算；输出单独计价，推理 Token 不重复相加。保留源计数与 Codex 原有 input 包含缓存的口径。例如低谷时 input=1,000、cache_read=20,000、cache_write=50、output=100，费用为 `(1000×0.15 + 20000×0.003 + 50×0.15 + 100×0.60) / 1,000,000 = 0.0002775 USD`。
+
+`billing_provider=custom` 或中转地址（例如 `https://example-relay.invalid/v1`）不代表使用官方渠道。未配置自定义规则时，这些模型按 DeepSeek 官方参考价估算；中转站实际扣费可能因折扣或倍率不同而有差异，软件不猜测折扣。要使用中转站实际价格，在“价格规则”中为供应商 `custom`、模型 `deepseek-v4.1-flash` 设置单价、倍率与生效时间；匹配的自定义规则优先于内置参考价，两个别名共享规则。
+
+已有历史费用快照保留原值。升级后若已采集的 Hermes 记录仍显示“未计价”或需要修正旧输入口径，请在顶部筛选 Hermes 后使用“历史重新计价”，先预览再应用；不会修改 Hermes 源库。
+
+示例（统计库可使用任意独立可写路径，`--root` 指定 Codex 来源）：
+
+```powershell
+python backend.py scan --db work/hermes-usage.sqlite3 --root work/empty-codex --hermes-db D:/path/to/Hermes\state.db
+python backend.py summary --db work/hermes-usage.sqlite3 --root work/empty-codex --hermes-db D:/path/to/Hermes\state.db --source-kind hermes --days 0
+python backend.py serve --db work/hermes-usage.sqlite3 --root work/empty-codex --hermes-db D:/path/to/Hermes\state.db --no-open
+```
+
+升级前的历史库会保存在 `.pre-hermes.bak`；升级不会清空历史。
+
+### Codex 日志来源
 
 默认扫描：
 
@@ -387,6 +420,7 @@ sh build-macos.sh
 
 | 版本 | 主要变化 |
 | --- | --- |
+| 1.8.0 | 支持 Hermes 用量数据源与来源筛选、累计调用数加权；补全 DeepSeek 模型价格别名及 Hermes 独立缓存桶计价 |
 | 1.7.1 | 自动刷新兜底与失败重试；更新后保留自定义布局；缓存命中率、会话与上下文窗口可视化；仪表盘视觉优化 |
 | 1.7.0 | 单次请求速度、自动扫描与自定义模块布局 |
 | 1.6.1 | 总览、趋势、用量明细及价格数据分栏整理 |

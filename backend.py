@@ -61,6 +61,10 @@ def safe_csv_row(row):
             for key, value in row.items()}
 
 
+def _request_weight(row) -> int:
+    return int(row['api_call_count']) if 'api_call_count' in row.keys() else 1
+
+
 def _now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat()
 
@@ -188,9 +192,32 @@ def _as_float(value: Any) -> Optional[float]:
     return number if math.isfinite(number) and number >= 0 else None
 
 
-def _fresh_input_tokens(input_tokens: Any, cached_input_tokens: Any, cache_write_input_tokens: Any) -> int:
-    """Estimate uncached input without letting counters subtract below zero."""
+def _input_includes_cache(row: Mapping[str, Any]) -> bool:
+    """该行记录的 input_tokens 是否已包含 cache_read 部分。
+
+    Codex 的 rollout 语义是「Input 已包含缓存读取」，Hermes 的
+    session_model_usage 则是 input_tokens 与 cache_read_tokens 两个并列独立量。
+    取错这个前提会把缓存命中率、未缓存输入和缓存省费一起算歪。
+    """
+    try:
+        keys = row.keys()
+    except AttributeError:
+        keys = ()
+    if 'source_kind' in keys:
+        return row['source_kind'] != 'hermes'
+    return True
+
+
+def _fresh_input_tokens(input_tokens: Any, cached_input_tokens: Any, cache_write_input_tokens: Any,
+                        input_includes_cache: bool = True) -> int:
+    """Estimate uncached input without letting counters subtract below zero.
+
+    ``input_includes_cache=False`` (Hermes) 时 input_tokens 本身就是未缓存输入，
+    缓存量不再从中扣除。
+    """
     total = max(0, int(input_tokens or 0))
+    if not input_includes_cache:
+        return total
     cached = min(total, max(0, int(cached_input_tokens or 0)))
     cache_write = min(total - cached, max(0, int(cache_write_input_tokens or 0)))
     return total - cached - cache_write
@@ -594,6 +621,8 @@ class ScanResult:
     parse_errors: int = 0
     incomplete_files: int = 0
     unavailable_roots: int = 0
+    hermes_rows_read: int = 0
+    hermes_unavailable: int = 0
 
     def as_dict(self) -> Dict[str, int]:
         return {
@@ -606,6 +635,8 @@ class ScanResult:
             "parse_errors": self.parse_errors,
             "incomplete_files": self.incomplete_files,
             "unavailable_roots": self.unavailable_roots,
+            "hermes_rows_read": self.hermes_rows_read,
+            "hermes_unavailable": self.hermes_unavailable,
         }
 
 
@@ -1143,6 +1174,7 @@ class DashboardDB:
         providers_path: Optional[Path | str] = None,
         timezone_name: Optional[str] = None,
         clock: Optional[Callable[[], _dt.datetime]] = None,
+        hermes_db: Optional[Path | str] = None,
     ) -> None:
         self.db_path = Path(db_path).expanduser().resolve()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1152,6 +1184,8 @@ class DashboardDB:
         self._clock = clock or (lambda: _dt.datetime.now(self.timezone))
         self.catalog = ProviderCatalog(Path(providers_path).expanduser() if providers_path else None)
         self.parser = RolloutParser(self.catalog, self.timezone)
+        # Direct library callers opt in; executable entry points resolve defaults.
+        self.hermes_db = Path(hermes_db) if hermes_db is not None else None
         self.pricing = PricingCatalog()
         self.database_recovery: Optional[Dict[str, Any]] = None
         self.database_migration: Optional[Dict[str, Any]] = None
@@ -1248,6 +1282,7 @@ class DashboardDB:
         input_tokens: int, cached_input_tokens: int,
         cache_write_input_tokens: int, output_tokens: int,
         rate_snapshot: Optional[Mapping[str, Any]] = None,
+        aggregate=False, hermes_metadata=None,
     ) -> Dict[str, Any]:
         usage = {
             "timestamp": timestamp,
@@ -1258,10 +1293,19 @@ class DashboardDB:
             "provider": provider,
         }
         quote = None
+        if aggregate:
+            # Hermes reports disjoint input/read/write buckets; the pricing
+            # catalog expects input inclusive of both cache buckets. Convert
+            # only at this boundary, including when replaying frozen rates.
+            usage['input_tokens'] = sum(max(0, usage[key]) for key in (
+                'input_tokens', 'cached_input_tokens', 'cache_write_input_tokens'))
+            usage['aggregate'] = True
+            if rate_snapshot and rate_snapshot.get('cost_origin') == 'hermes_reported':
+                rate_snapshot = None
         if rate_snapshot:
             frozen = getattr(self.pricing, "quote_from_snapshot", None)
             if callable(frozen):
-                quote = frozen(dict(rate_snapshot), model=model, **usage)
+                quote = frozen(dict(rate_snapshot), model=model, **{k: v for k, v in usage.items() if k != 'aggregate'})
         if quote is None:
             try:
                 quote = self.pricing.quote(model, **usage)
@@ -1301,7 +1345,7 @@ class DashboardDB:
             breakdown = {}
         saving_before = getattr(quote, "cache_savings_before_discount_usd", None)
         saving_after = getattr(quote, "cache_savings_after_discount_usd", None)
-        return {
+        result = {
             "pricing_status": snapshot_status if is_priced else "unpriced",
             "rate_snapshot": dict(rate),
             "cost_multiplier": multiplier,
@@ -1311,6 +1355,24 @@ class DashboardDB:
             "cache_savings_before_discount_usd": _as_float(saving_before),
             "cache_savings_after_discount_usd": _as_float(saving_after),
         }
+        if aggregate:
+            metadata = hermes_metadata or {}
+            rate = result['rate_snapshot']
+            rate['cost_origin'] = 'reference_estimate' if is_priced else 'unpriced'
+            limitation = 'Hermes 聚合用量按普通档参考价估算；无法判断是否触发长上下文阶梯价。'
+            if limitation not in str(rate.get('note') or ''):
+                rate['note'] = ((str(rate.get('note') or '') + ' ') if rate.get('note') else '') + limitation
+            if not is_priced and str(metadata.get('cost_status')).lower() in (
+                    'estimated', 'actual', 'known', 'confirmed', 'reported', 'priced'):
+                amount = _as_float(metadata.get('hermes_actual_cost_usd'))
+                if amount is None or amount <= 0:
+                    amount = _as_float(metadata.get('hermes_estimated_cost_usd'))
+                if amount is not None and amount > 0:
+                    result.update(pricing_status='priced', cost_before_discount_usd=amount,
+                                  cost_after_discount_usd=amount, cost_multiplier=1.0)
+                    rate.update(status='priced', cost_origin='hermes_reported',
+                                source=metadata.get('cost_source'), note='Hermes 自报费用；未找到模型参考价。')
+        return result
 
     def _backfill_pricing_snapshots(self) -> None:
         with self._lock:
@@ -1389,7 +1451,7 @@ class DashboardDB:
 
     def _data_settings_locked(self) -> Dict[str, Any]:
         cleanup_days, cleanup_before = self._cleanup_meta_locked()
-        row = self._connection.execute("""SELECT COUNT(*) AS request_count,
+        row = self._connection.execute("""SELECT COALESCE(SUM(s.api_call_count),0) AS request_count,
                 MIN(s.day) AS earliest_day, MAX(s.day) AS latest_day
             FROM history_requests r JOIN history_snapshots s ON s.id=r.snapshot_id""").fetchone()
         return {
@@ -1418,7 +1480,8 @@ class DashboardDB:
                     WHERE retained_snapshot_id IS NOT NULL
                 UNION SELECT logical_key, snapshot_id FROM history_sources
             )
-            SELECT COUNT(*) FROM history_requests r
+            SELECT COALESCE(SUM(current.api_call_count),0) FROM history_requests r
+            JOIN history_snapshots current ON current.id=r.snapshot_id
             WHERE EXISTS (
                 SELECT 1 FROM candidates c JOIN history_snapshots s ON s.id=c.snapshot_id
                 WHERE c.logical_key=r.logical_key AND s.day < ?
@@ -1493,7 +1556,7 @@ class DashboardDB:
                 # change.  If copying/checking fails, the live DB is untouched.
                 backup_path = self._cleanup_backup_locked()
                 before_requests = int(self._connection.execute(
-                    "SELECT COUNT(*) FROM history_requests").fetchone()[0])
+                    "SELECT COALESCE(SUM(s.api_call_count),0) FROM history_requests r JOIN history_snapshots s ON s.id=r.snapshot_id").fetchone()[0])
                 before_snapshots = int(self._connection.execute(
                     "SELECT COUNT(*) FROM history_snapshots WHERE day < ?", (cutoff_day,)
                 ).fetchone()[0])
@@ -1550,7 +1613,7 @@ class DashboardDB:
                 except sqlite3.DatabaseError:
                     space_reclaimed = False
                 after_requests = int(self._connection.execute(
-                    "SELECT COUNT(*) FROM history_requests").fetchone()[0])
+                    "SELECT COALESCE(SUM(s.api_call_count),0) FROM history_requests r JOIN history_snapshots s ON s.id=r.snapshot_id").fetchone()[0])
                 after_old_snapshots = int(self._connection.execute(
                     "SELECT COUNT(*) FROM history_snapshots WHERE day < ?", (cutoff_day,)
                 ).fetchone()[0])
@@ -1692,6 +1755,19 @@ class DashboardDB:
                           {row[1] for row in self._connection.execute("PRAGMA table_info(history_snapshots)")})
         snapshot_columns = ({row[1] for row in self._connection.execute(
             "PRAGMA table_info(history_snapshots)")} if "history_snapshots" in tables else set())
+        hermes_columns = {
+            "source_kind": "TEXT NOT NULL DEFAULT 'codex'",
+            "api_call_count": "INTEGER NOT NULL DEFAULT 1",
+            "hermes_metadata": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        if snapshot_columns and not set(hermes_columns).issubset(snapshot_columns):
+            hermes_backup = Path(str(self.db_path) + '.pre-hermes.bak')
+            if not hermes_backup.exists():
+                target = sqlite3.connect(str(hermes_backup))
+                try:
+                    self._connection.backup(target)
+                finally:
+                    target.close()
         analytics_columns = {
             "cache_read_available", "cache_write_available", "ttft_ms", "thread_key",
             "parent_thread_key", "task_id", "agent_role", "speed_exclusion_reason",
@@ -1762,6 +1838,9 @@ class DashboardDB:
                     scanned_at TEXT NOT NULL, record_count INTEGER NOT NULL DEFAULT 0,
                     timezone TEXT NOT NULL DEFAULT '', parser_version INTEGER NOT NULL DEFAULT 0,
                     usage_format TEXT NOT NULL DEFAULT '')""",
+                """CREATE TABLE IF NOT EXISTS hermes_sources (
+                    path TEXT PRIMARY KEY, last_seen REAL, row_count INTEGER NOT NULL,
+                    timezone TEXT NOT NULL)""",
                 """CREATE TABLE IF NOT EXISTS history_contexts (
                     id INTEGER PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL,
                     workspace TEXT NOT NULL, UNIQUE(provider, model, workspace))""",
@@ -1775,6 +1854,9 @@ class DashboardDB:
                     input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
                     cached_input_tokens INTEGER NOT NULL, cache_write_input_tokens INTEGER NOT NULL,
                     reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL,
+                    source_kind TEXT NOT NULL DEFAULT 'codex',
+                    api_call_count INTEGER NOT NULL DEFAULT 1,
+                    hermes_metadata TEXT NOT NULL DEFAULT '{}',
                     speed_group_key TEXT, speed_output_tokens INTEGER NOT NULL DEFAULT 0,
                     speed_duration_ms REAL NOT NULL DEFAULT 0,
                     request_duration_estimate_ms REAL,
@@ -1823,6 +1905,7 @@ class DashboardDB:
                         c.provider, c.provider AS provider_label, c.model, c.workspace,
                         s.input_tokens, s.output_tokens, s.cached_input_tokens,
                         s.cache_write_input_tokens, s.reasoning_output_tokens, s.total_tokens,
+                        s.source_kind, s.api_call_count, s.hermes_metadata,
                         s.speed_group_key, s.speed_output_tokens, s.speed_duration_ms,
                         s.request_duration_estimate_ms, s.request_output_tokens_per_second_estimate,
                         s.request_timing_source, s.request_speed_exclusion_reason,
@@ -1846,6 +1929,7 @@ class DashboardDB:
                 self._connection.execute("ALTER TABLE history_snapshots ADD COLUMN speed_duration_ms REAL NOT NULL DEFAULT 0")
             if "history_snapshots" in tables:
                 migrations = {
+                    **hermes_columns,
                     **request_timing_columns,
                     "context_window_tokens": "INTEGER",
                     "context_input_tokens": "INTEGER",
@@ -1998,6 +2082,8 @@ class DashboardDB:
 
     @staticmethod
     def _snapshot_rank(row):
+        if 'source_kind' in row.keys() and row['source_kind'] == 'hermes':
+            return (row['timestamp'], row['id'])
         return (row["total_tokens"], sum(bool(row[key]) for key in
                 ("cached_input_tokens", "cache_write_input_tokens", "reasoning_output_tokens")),
                 sum(row[key] not in (None, "", "unknown", "Unknown") for key in
@@ -2013,6 +2099,8 @@ class DashboardDB:
                 row["source_path"] if "source_path" in row.keys() else "")
 
     def _store_snapshot(self, key, row, force_reprice=False):
+        if 'hermes_metadata' in row.keys() and row['source_kind'] == 'hermes':
+            row = dict(self._json_object(row['hermes_metadata']), **dict(row))
         context = (row["provider"], row["model"], row["workspace"])
         self._connection.execute("INSERT OR IGNORE INTO history_contexts(provider,model,workspace) VALUES (?,?,?)",
                                  context)
@@ -2020,6 +2108,13 @@ class DashboardDB:
             "SELECT id FROM history_contexts WHERE provider=? AND model=? AND workspace=?", context).fetchone()[0]
         tokens = tuple(int(row[name]) for name in self._token_columns())
         columns = set(row.keys())
+        source_kind = row['source_kind'] if 'source_kind' in columns else 'codex'
+        api_call_count = int(row['api_call_count']) if source_kind == 'hermes' else 1
+        hermes_metadata = json.dumps({name: row.get(name) for name in (
+            'session_id', 'task', 'profile_name', 'workspace_source', 'billing_provider',
+            'billing_base_url', 'billing_mode', 'cost_status', 'cost_source',
+            'hermes_estimated_cost_usd', 'hermes_actual_cost_usd', 'first_seen', 'last_seen',
+            'source_identity')}, ensure_ascii=False, sort_keys=True) if source_kind == 'hermes' else '{}'
         speed = (row["speed_group_key"], row["speed_output_tokens"], row["speed_duration_ms"]) \
             if "speed_group_key" in columns else (None, 0, 0.0)
         request_timing = tuple(row[name] if name in columns else None for name in (
@@ -2035,7 +2130,10 @@ class DashboardDB:
             thread_key = hashlib.sha256(str(raw_thread).encode("utf-8")).hexdigest()
         if parent_thread_key is None and raw_parent:
             parent_thread_key = hashlib.sha256(str(raw_parent).encode("utf-8")).hexdigest()
-        if thread_key:
+        if source_kind == 'hermes':
+            agent_role = row['agent_role']
+            task_id = row['task_id']
+        elif thread_key:
             agent_role = "subagent" if parent_thread_key else "main"
             task_id = row["task_id"] if "task_id" in columns and row["task_id"] else (parent_thread_key or thread_key)
             self._connection.execute("""INSERT INTO thread_relationships
@@ -2063,7 +2161,8 @@ class DashboardDB:
             frozen_snapshot = {}
         quote = self._quote_for_usage(
             row["model"], row["provider"], row["timestamp"], tokens[0], tokens[2], tokens[3], tokens[1],
-            rate_snapshot=frozen_snapshot or None)
+            rate_snapshot=frozen_snapshot or None, aggregate=source_kind == 'hermes',
+            hermes_metadata=self._json_object(hermes_metadata))
         pricing_fields = (
             quote["pricing_status"],
             json.dumps(quote["rate_snapshot"], ensure_ascii=False, sort_keys=True, separators=(",", ":")),
@@ -2076,7 +2175,8 @@ class DashboardDB:
         fingerprint = hashlib.sha256(key + json.dumps(
             [*context, row["timestamp"], *tokens, *([*speed] if speed[0] else []),
              cache_read_available, cache_write_available, ttft_ms, thread_key, parent_thread_key,
-             task_id, agent_role, exclusion, *request_timing, *context_fields, *pricing_fields], ensure_ascii=False, sort_keys=True,
+             task_id, agent_role, exclusion, *request_timing, *context_fields, *pricing_fields,
+             source_kind, api_call_count, hermes_metadata], ensure_ascii=False, sort_keys=True,
              separators=(",", ":")).encode("utf-8")).digest()
         _, day, hour = _parse_timestamp(row["timestamp"], timezone=self.timezone)
         self._connection.execute("""INSERT OR IGNORE INTO history_snapshots
@@ -2089,12 +2189,14 @@ class DashboardDB:
              cache_savings_before_discount_usd,cache_savings_after_discount_usd,
              request_duration_estimate_ms,request_output_tokens_per_second_estimate,
              request_timing_source,request_speed_exclusion_reason,
-             context_window_tokens,context_input_tokens,context_observed_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (fingerprint, context_id, row["timestamp"], day, hour, *tokens, *speed,
+             context_window_tokens,context_input_tokens,context_observed_at,
+             source_kind,api_call_count,hermes_metadata)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (fingerprint, context_id, row["timestamp"], day, hour, *tokens, speed[0], speed[1], speed[2] or 0,
              cache_read_available, cache_write_available, ttft_ms, thread_key, parent_thread_key,
              task_id, agent_role, exclusion, pricing_fields[0], "{}", rate_snapshot_id,
-             *pricing_fields[2:], *request_timing, *context_fields))
+             *pricing_fields[2:], *request_timing, *context_fields,
+             source_kind, api_call_count, hermes_metadata))
         return self._connection.execute(
             "SELECT id FROM history_snapshots WHERE fingerprint=?", (fingerprint,)).fetchone()[0]
 
@@ -2214,7 +2316,66 @@ class DashboardDB:
         # Manual refreshes and the poller share parser state and source indexes.
         # Serialize scans, while leaving the database writer free during I/O.
         with self._scan_lock:
-            return self._scan_files()
+            result = self._scan_files()
+            self._scan_hermes(result)
+            return result
+
+    def _scan_hermes(self, result):
+        if self.hermes_db is None:
+            return
+        from hermes_source import HermesSource, resolve_hermes_paths
+        for path in resolve_hermes_paths(self.hermes_db):
+            result.files_seen += 1
+            if not path.is_file():
+                result.hermes_unavailable += 1
+                continue
+            with self._lock:
+                previous = self._connection.execute('SELECT * FROM hermes_sources WHERE path=?', (str(path),)).fetchone()
+                signature_key = 'hermes_signature:' + hashlib.sha256(str(path).encode('utf-8')).hexdigest()
+                previous_signature = self._connection.execute('SELECT value FROM history_meta WHERE key=?', (signature_key,)).fetchone()
+            watermark = ((previous['last_seen'], previous['row_count'])
+                         if previous and previous['timezone'] == self.timezone_name else None)
+            try:
+                source = HermesSource(path, self.timezone)
+                rows, watermark = source.read(watermark, previous_signature[0] if previous_signature else None)
+            except (OSError, sqlite3.Error, ValueError):
+                result.hermes_unavailable += 1
+                continue
+            if rows is None:
+                result.files_unchanged += 1
+                continue
+            with self._lock:
+                try:
+                    self._connection.execute('BEGIN')
+                    self._connection.execute('''INSERT INTO source_files
+                        (path,mtime_ns,size,scanned_at,usage_format) VALUES (?,0,0,?,'hermes')
+                        ON CONFLICT(path) DO UPDATE SET scanned_at=excluded.scanned_at''', (str(path), _now_iso()))
+                    file_id = self._connection.execute('SELECT id FROM source_files WHERE path=?', (str(path),)).fetchone()[0]
+                    affected = self._detach_source(file_id, retire_missing=True)
+                    _, cleanup_before = self._cleanup_meta_locked()
+                    for row in rows:
+                        if cleanup_before and row['day'] < cleanup_before.isoformat():
+                            continue
+                        identity = [str(path), row['session_id'], row['model'], row['billing_provider'], row['task'] or '']
+                        key = hashlib.sha256(('hermes\0' + json.dumps(identity)).encode('utf-8')).digest()
+                        row['source_identity'] = hashlib.sha256(str(path).encode('utf-8')).hexdigest()
+                        self._store_source(file_id, key, self._store_snapshot(key, row), row['source_line'])
+                        affected.add(key)
+                    self._connection.execute('''UPDATE source_files SET record_count=(
+                        SELECT COUNT(*) FROM history_sources WHERE file_id=?) WHERE id=?''', (file_id, file_id))
+                    self._connection.execute('INSERT OR REPLACE INTO hermes_sources VALUES (?,?,?,?)',
+                        (str(path), watermark[0], watermark[1], self.timezone_name))
+                    self._connection.execute('INSERT OR REPLACE INTO history_meta VALUES (?,?)', (signature_key, source.read_signature))
+                    self._rebuild_logical_records(affected)
+                    self._collect_unused_snapshots()
+                    self._connection.commit()
+                    self._data_version += 1
+                except Exception:
+                    self._connection.rollback()
+                    raise
+            result.files_scanned += 1
+            result.hermes_rows_read += len(rows)
+            result.records_added += len(rows)
 
     def _scan_files(self) -> ScanResult:
         result = ScanResult()
@@ -2307,6 +2468,8 @@ class DashboardDB:
                     result.records_added += len(new_keys)
                     result.records_skipped += len(parsed) - len(new_keys)
                 for path, previous in existing.items():
+                    if previous['usage_format'] == 'hermes':
+                        continue
                     if path not in seen and any(_is_within(Path(path), root) for root in complete_roots):
                         affected.update(self._detach_source(previous["id"]))
                         self._connection.execute("DELETE FROM source_files WHERE id=?", (previous["id"],))
@@ -2331,9 +2494,15 @@ class DashboardDB:
         model: Optional[str] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        source_kind=None,
     ) -> List[sqlite3.Row]:
         where: List[str] = []
         params: List[Any] = []
+        if source_kind not in (None, '', 'all', 'codex', 'hermes'):
+            raise ValueError('source_kind must be codex or hermes')
+        if source_kind in ('codex', 'hermes'):
+            where.append('source_kind = ?')
+            params.append(source_kind)
         if start_date is not None or end_date is not None:
             if not start_date or not end_date:
                 raise ValueError("start_date and end_date must be supplied together")
@@ -2414,10 +2583,15 @@ class DashboardDB:
 
     def _filter_sql(
         self, *, days=0, provider=None, workspace=None, model=None,
-        start_date=None, end_date=None, task_id=None, thread_key=None,
+        start_date=None, end_date=None, task_id=None, thread_key=None, source_kind=None, source_identity=None,
     ) -> Tuple[str, List[Any]]:
         where: List[str] = []
         params: List[Any] = []
+        if source_kind not in (None, '', 'all', 'codex', 'hermes'):
+            raise ValueError('source_kind must be codex or hermes')
+        if source_kind in ('codex', 'hermes'):
+            where.append('source_kind = ?')
+            params.append(source_kind)
         if start_date is not None or end_date is not None:
             if not start_date or not end_date:
                 raise ValueError("start_date and end_date must be supplied together")
@@ -2441,11 +2615,22 @@ class DashboardDB:
         if model:
             where.append("canonical_model(model) = ?")
             params.append(canonical_model(model))
+        if source_identity is not None:
+            self._validate_thread_key(source_identity)
+            where.append("json_extract(hermes_metadata, '$.source_identity') = ?")
+            params.append(source_identity)
         if thread_key is not None:
-            thread_key = self._validate_thread_key(thread_key)
+            if source_kind == 'hermes':
+                if not isinstance(thread_key, str) or not thread_key or len(thread_key) > 512:
+                    raise ValueError('invalid Hermes session key')
+            else:
+                thread_key = self._validate_thread_key(thread_key)
             where.append("thread_key = ?")
             params.append(thread_key)
-        if task_id:
+        if task_id and source_kind == 'hermes':
+            where.append('task_id = ?')
+            params.append('' if task_id == '主对话' else task_id)
+        elif task_id:
             relations = self._thread_relationship_map()
             task_root = str(task_id)
             members = {key for key in relations
@@ -2468,10 +2653,10 @@ class DashboardDB:
 
     def _query_filtered_rows(
         self, *, days=0, provider=None, workspace=None, model=None,
-        start_date=None, end_date=None, task_id=None,
+        start_date=None, end_date=None, task_id=None, source_kind=None,
     ) -> List[sqlite3.Row]:
         predicate, params = self._filter_sql(days=days, provider=provider, workspace=workspace,
-            model=model, start_date=start_date, end_date=end_date, task_id=task_id)
+            model=model, start_date=start_date, end_date=end_date, task_id=task_id, source_kind=source_kind)
         reader = sqlite3.connect(str(self.db_path), timeout=5.0)
         try:
             reader.row_factory = sqlite3.Row
@@ -2482,20 +2667,29 @@ class DashboardDB:
         finally:
             reader.close()
 
+    def _provider_label(self, row):
+        if row['source_kind'] == 'hermes' and row['provider'] == 'custom':
+            return 'Hermes 自定义供应商'
+        return self.catalog.label(row['provider'])
+
     def _request_dict(self, row: Mapping[str, Any], relations=None) -> Dict[str, Any]:
         relations = self._thread_relationship_map() if relations is None else relations
         thread_key = row["thread_key"]
         parent_key = row["parent_thread_key"]
-        task_id = self._root_thread_key(thread_key, relations) or row["task_id"]
+        task_id = (row['task_id'] if row['source_kind'] == 'hermes'
+                   else self._root_thread_key(thread_key, relations) or row['task_id'])
         rate_value = (row["effective_rate_snapshot"] if "effective_rate_snapshot" in row.keys()
                       else row["rate_snapshot"])
         rate_snapshot = self._json_object(rate_value)
         breakdown = self._json_object(row["cost_breakdown_before_discount"])
         return {
             "request_id": str(row["request_id"]),
+            "source_kind": row['source_kind'], "api_call_count": _request_weight(row),
+            "record_kind": 'aggregate' if row['source_kind'] == 'hermes' else 'request',
+            **(self._json_object(row['hermes_metadata']) if row['source_kind'] == 'hermes' else {}),
             "timestamp": str(row["timestamp"]),
             "provider": str(row["provider"]),
-            "provider_label": self.catalog.label(row["provider"]),
+            "provider_label": self._provider_label(row),
             "model": str(row["model"]),
             "workspace": str(row["workspace"]),
             "input_tokens": int(row["input_tokens"] or 0),
@@ -2540,7 +2734,7 @@ class DashboardDB:
     def requests(
         self, *, days=30, provider=None, workspace=None, model=None, start_date=None,
         end_date=None, page=1, page_size=50, sort="time_desc", task_id=None, cost_mode="after",
-        thread_key=None,
+        thread_key=None, source_kind=None, source_identity=None,
     ) -> Dict[str, Any]:
         if type(page) is not int or page < 1:
             raise ValueError("page must be a positive integer")
@@ -2553,7 +2747,7 @@ class DashboardDB:
         offset = (page - 1) * page_size
         predicate, params = self._filter_sql(
             days=days, provider=provider, workspace=workspace, model=model,
-            start_date=start_date, end_date=end_date, task_id=task_id, thread_key=thread_key)
+            start_date=start_date, end_date=end_date, task_id=task_id, thread_key=thread_key, source_kind=source_kind, source_identity=source_identity)
         order = {
             "time_desc": "timestamp DESC, request_id DESC",
             "token_desc": "total_tokens DESC, timestamp DESC, request_id DESC",
@@ -2564,7 +2758,8 @@ class DashboardDB:
             reader.row_factory = sqlite3.Row
             reader.create_function("canonical_model", 1, canonical_model)
             reader.execute("BEGIN")
-            total = int(reader.execute("SELECT COUNT(*) FROM usage_records" + predicate, params).fetchone()[0])
+            totals = reader.execute("SELECT COUNT(*),COALESCE(SUM(api_call_count),0) FROM usage_records" + predicate, params).fetchone()
+            total, request_count = int(totals[0]), int(totals[1])
             selected = reader.execute("SELECT * FROM usage_records" + predicate +
                 " ORDER BY " + order + " LIMIT ? OFFSET ?", [*params, page_size, offset]).fetchall()
             relations = self._thread_relationship_map(reader)
@@ -2574,6 +2769,7 @@ class DashboardDB:
         return {
             "data": [self._request_dict(row, relations) for row in selected],
             "total": total,
+            "request_count": request_count,
             "page": page,
             "page_size": page_size,
         }
@@ -2605,26 +2801,28 @@ class DashboardDB:
         return self._request_dict(row, relations)
 
     def tasks(
-        self, *, days=30, provider=None, workspace=None, model=None, start_date=None, end_date=None,
+        self, *, days=30, provider=None, workspace=None, model=None, start_date=None, end_date=None, source_kind=None,
     ) -> Dict[str, Any]:
         rows = self._query_filtered_rows(days=days, provider=provider, workspace=workspace,
-                                         model=model, start_date=start_date, end_date=end_date)
+                                         model=model, start_date=start_date, end_date=end_date, source_kind=source_kind)
         self.catalog.reload()
         relations = self._thread_relationship_map()
         grouped: Dict[str, Dict[str, Any]] = {}
         for row in rows:
             thread_key = row["thread_key"]
-            task_id = self._root_thread_key(thread_key, relations) or row["task_id"]
+            task_id = ((row['task_id'] or '主对话') if row['source_kind'] == 'hermes'
+                   else self._root_thread_key(thread_key, relations) or row['task_id'])
             if not task_id:
                 continue
-            task = grouped.setdefault(str(task_id), {
+            task = grouped.setdefault((row['source_kind'], str(task_id)), {
+                'source_kind': row['source_kind'], 'relationship_available': row['source_kind'] == 'codex',
                 "task_id": str(task_id), "workspace": str(row["workspace"]),
                 "summary": self._empty_metrics(), "agents": {},
             })
             quote = self._stored_quote(row)
             self._add_metrics(task["summary"], row, quote)
             role = str(row["agent_role"] or ("subagent" if row["parent_thread_key"] else "main"))
-            agent_key = (str(thread_key or "unknown"), str(row["model"]))
+            agent_key = (self._json_object(row["hermes_metadata"]).get("source_identity"), str(thread_key or "unknown"), str(row["model"]))
             agent = task["agents"].setdefault(agent_key, {
                 "thread_key": thread_key, "parent_thread_key": row["parent_thread_key"],
                 "agent_role": role, "model": str(row["model"]),
@@ -2647,34 +2845,41 @@ class DashboardDB:
 
     def sessions(
         self, *, days=30, provider=None, workspace=None, model=None,
-        start_date=None, end_date=None,
+        start_date=None, end_date=None, source_kind=None,
     ) -> Dict[str, Any]:
         rows = self._query_filtered_rows(days=days, provider=provider, workspace=workspace,
-                                         model=model, start_date=start_date, end_date=end_date)
+                                         model=model, start_date=start_date, end_date=end_date, source_kind=source_kind)
         self.catalog.reload()
         grouped: Dict[str, Dict[str, Any]] = {}
         omitted_request_count = 0
         for row in rows:
             thread_key = row["thread_key"]
             if not thread_key:
-                omitted_request_count += 1
+                omitted_request_count += _request_weight(row)
                 continue
             timestamp = str(row["timestamp"])
-            session = grouped.setdefault(str(thread_key), {
+            metadata = self._json_object(row['hermes_metadata']) if row['source_kind'] == 'hermes' else {}
+            first_seen = _as_float(metadata.get('first_seen'))
+            start_timestamp = (_dt.datetime.fromtimestamp(first_seen, _dt.timezone.utc).isoformat()
+                               if first_seen is not None else timestamp)
+            session_key = (row['source_kind'], metadata.get('source_identity'), str(thread_key))
+            session = grouped.setdefault(session_key, {
+                'source_kind': row['source_kind'],
+                **metadata,
                 "thread_key": str(thread_key), "workspace": str(row["workspace"]),
                 "models": set(), "request_count": 0, "input_tokens": 0,
                 "output_tokens": 0, "total_tokens": 0,
                 "cost_before_discount_usd": 0.0, "cost_after_discount_usd": 0.0,
-                "unpriced_request_count": 0, "first_seen": timestamp,
+                "unpriced_request_count": 0, "first_seen": start_timestamp,
                 "last_seen": timestamp, "agent_role": str(row["agent_role"] or "unknown"),
             })
             session["models"].add(str(row["model"]))
-            session["request_count"] += 1
+            session["request_count"] += _request_weight(row)
             session["input_tokens"] += int(row["input_tokens"] or 0)
             session["output_tokens"] += int(row["output_tokens"] or 0)
             session["total_tokens"] += int(row["total_tokens"] or 0)
-            if timestamp < session["first_seen"]:
-                session["first_seen"] = timestamp
+            if start_timestamp < session["first_seen"]:
+                session["first_seen"] = start_timestamp
             if timestamp >= session["last_seen"]:
                 session["last_seen"] = timestamp
                 session["workspace"] = str(row["workspace"])
@@ -2684,7 +2889,7 @@ class DashboardDB:
                 session["cost_before_discount_usd"] += float(quote["cost_before_discount_usd"] or 0)
                 session["cost_after_discount_usd"] += float(quote["cost_after_discount_usd"] or 0)
             else:
-                session["unpriced_request_count"] += 1
+                session["unpriced_request_count"] += _request_weight(row)
 
         data = []
         for session in grouped.values():
@@ -2755,6 +2960,7 @@ class DashboardDB:
         for row in sorted(rows, key=lambda item: str(item["request_id"])):
             data.append([
                 row["request_id"], row["timestamp"], row["provider"], row["model"], row["workspace"],
+                row['source_kind'], row['api_call_count'], row['hermes_metadata'],
                 *(int(row[name] or 0) for name in DashboardDB._token_columns()),
                 row["rate_snapshot"], row["cost_before_discount_usd"],
                 row["cost_after_discount_usd"],
@@ -2767,9 +2973,9 @@ class DashboardDB:
         before = 0.0
         after = 0.0
         unpriced = 0
-        for quote in quotes:
+        for row, quote in zip(rows, quotes):
             if quote["pricing_status"] == "unpriced":
-                unpriced += 1
+                unpriced += _request_weight(row)
                 continue
             before += float(quote["cost_before_discount_usd"] or 0)
             after += float(quote["cost_after_discount_usd"] or 0)
@@ -2777,10 +2983,11 @@ class DashboardDB:
 
     def reprice_preview(
         self, *, days=0, provider=None, workspace=None, model=None,
-        start_date=None, end_date=None,
+        start_date=None, end_date=None, source_kind=None,
     ) -> Dict[str, Any]:
         filters = {"days": int(days or 0), "provider": provider, "workspace": workspace,
-                   "model": model, "start_date": start_date, "end_date": end_date}
+                   "model": model, "start_date": start_date, "end_date": end_date,
+                   "source_kind": source_kind}
         # Match scan/dashboard lock order and hold a stable view through quote,
         # data hashing, and preview persistence. A concurrent scan or price edit
         # must invalidate this preview rather than mix two generations.
@@ -2788,7 +2995,8 @@ class DashboardDB:
             rows = self._query_filtered_rows(**filters)
             new_quotes = [self._quote_for_usage(
                 row["model"], row["provider"], row["timestamp"], row["input_tokens"],
-                row["cached_input_tokens"], row["cache_write_input_tokens"], row["output_tokens"])
+                row["cached_input_tokens"], row["cache_write_input_tokens"], row["output_tokens"],
+                aggregate=row["source_kind"] == "hermes", hermes_metadata=self._json_object(row["hermes_metadata"]))
                 for row in rows]
             old_quotes = [self._stored_quote(row) for row in rows]
             old_before, old_after, _old_unpriced = self._quote_totals(rows, old_quotes)
@@ -2806,7 +3014,8 @@ class DashboardDB:
                 rules_hash, data_hash, len(rows), now.isoformat(), expires.isoformat()))
             self._connection.commit()
         return {
-            "request_count": len(rows),
+            "request_count": sum(_request_weight(row) for row in rows),
+            "record_count": len(rows),
             "cost_before_discount_usd": new_before,
             "cost_after_discount_usd": new_after,
             "previous_cost_before_discount_usd": old_before,
@@ -2868,7 +3077,7 @@ class DashboardDB:
                         WHERE logical_key=?""", (new_snapshot, new_snapshot, key))
                     self._connection.execute("UPDATE history_sources SET snapshot_id=? WHERE logical_key=?",
                                              (new_snapshot, key))
-                    updated += 1
+                    updated += _request_weight(row)
                 self._connection.execute("DELETE FROM reprice_previews WHERE token=?", (preview_token,))
                 self._rebuild_logical_records([bytes.fromhex(str(row["request_id"])) for row in rows])
                 self._collect_unused_snapshots()
@@ -2890,6 +3099,7 @@ class DashboardDB:
             "reasoning_output_tokens": 0,
             "total_tokens": 0,
             "request_count": 0,
+            "request_metric_count": 0,
             "estimated_cost_usd": 0.0,
             "cost_before_discount_usd": 0.0,
             "cost_after_discount_usd": 0.0,
@@ -2927,10 +3137,11 @@ class DashboardDB:
             "total_tokens",
         ):
             target[key] += int(row[key] or 0)
-        target["request_count"] += 1
+        target['request_metric_count'] += int(row['source_kind'] == 'codex')
+        target["request_count"] += _request_weight(row)
         speed_key = row["speed_group_key"]
         request_id = str(row["request_id"] if "request_id" in row.keys() else "")
-        candidate_key = str(speed_key or request_id)
+        candidate_key = str(speed_key or request_id) if row['source_kind'] == 'codex' else ''
         if candidate_key:
             target["_speed_candidate_keys"].add(candidate_key)
         if speed_key and speed_key not in target["_speed_keys"] and float(row["speed_duration_ms"] or 0) > 0:
@@ -2949,11 +3160,16 @@ class DashboardDB:
             target["_ttft_values"].append(ttft)
             target["ttft_sample_count"] += 1
         target["fresh_input_tokens"] += _fresh_input_tokens(
-            row["input_tokens"], row["cached_input_tokens"], row["cache_write_input_tokens"])
-        target["cache_read_available_count"] += int(bool(row["cache_read_available"]))
-        target["cache_write_available_count"] += int(bool(row["cache_write_available"]))
+            row["input_tokens"], row["cached_input_tokens"], row["cache_write_input_tokens"],
+            input_includes_cache=_input_includes_cache(row))
+        target["cache_read_available_count"] += _request_weight(row) * int(bool(row["cache_read_available"]))
+        target["cache_write_available_count"] += _request_weight(row) * int(bool(row["cache_write_available"]))
         if bool(row["cache_read_available"]):
-            target["cache_read_input_tokens"] += int(row["input_tokens"] or 0)
+            # Codex: input_tokens 已包含 cache_read，分母就是 input。
+            # Hermes: input_tokens 与 cache_read 并列，分母要两者相加。
+            target["cache_read_input_tokens"] += (
+                int(row["input_tokens"] or 0) + int(row["cached_input_tokens"] or 0)
+                if not _input_includes_cache(row) else int(row["input_tokens"] or 0))
             target["_cache_read_cached_tokens"] += int(row["cached_input_tokens"] or 0)
         if quote["is_priced"]:
             before = float(quote["cost_before_discount_usd"] or 0)
@@ -2964,10 +3180,10 @@ class DashboardDB:
             target["cache_savings_before_discount_usd"] += float(quote["cache_savings_before_discount_usd"] or 0)
             target["cache_savings_after_discount_usd"] += float(quote["cache_savings_after_discount_usd"] or 0)
             target["priced_tokens"] += int(row["total_tokens"] or 0)
-            target["priced_request_count"] += 1
+            target["priced_request_count"] += _request_weight(row)
         else:
             target["unpriced_tokens"] += int(row["total_tokens"] or 0)
-            target["unpriced_request_count"] += 1
+            target["unpriced_request_count"] += _request_weight(row)
 
     def _stored_quote(self, row: Mapping[str, Any]) -> Dict[str, Any]:
         status = str(row["pricing_status"] or "unpriced")
@@ -3023,11 +3239,12 @@ class DashboardDB:
             "cache_savings_after_discount_usd": round(float(metrics.get("cache_savings_after_discount_usd", 0.0)), 8),
             "ttft_median_ms": DashboardDB._percentile_float(metrics.get("_ttft_values", []), 0.50),
             "ttft_p90_ms": DashboardDB._percentile_float(metrics.get("_ttft_values", []), 0.90),
-            "ttft_coverage": (int(metrics.get("ttft_sample_count", 0)) / int(metrics.get("request_count", 0))
-                              if int(metrics.get("request_count", 0)) else 0.0),
+            "ttft_coverage": (int(metrics.get("ttft_sample_count", 0)) / int(metrics.get("request_metric_count", 0))
+                              if int(metrics.get("request_metric_count", 0)) else 0.0),
             "cache_hit_rate": (int(metrics.get("_cache_read_cached_tokens", 0)) /
                                int(metrics.get("cache_read_input_tokens", 0))
-                               if int(metrics.get("cache_read_input_tokens", 0)) else None),
+                               if int(metrics.get("cache_read_input_tokens", 0)) > 0
+                               and 0 <= int(metrics.get('_cache_read_cached_tokens', 0)) <= int(metrics.get('cache_read_input_tokens', 0)) else None),
             "speed_coverage": (int(metrics.get("speed_sample_count", 0)) /
                                (int(metrics.get("speed_sample_count", 0)) + len(metrics.get("_speed_exclusion_keys", set())))
                                if (int(metrics.get("speed_sample_count", 0)) + len(metrics.get("_speed_exclusion_keys", set()))) else 0.0),
@@ -3074,18 +3291,18 @@ class DashboardDB:
         return round(ordered[lower] + (ordered[upper] - ordered[lower]) * fraction, 3)
 
     def dashboard(self, days=30, provider=None, workspace=None, model=None,
-                  start_date=None, end_date=None, compare=False):
+                  start_date=None, end_date=None, compare=False, source_kind=None):
         # Serialize cache population; repeated SSE/filter requests reuse aggregates.
         with self._query_lock:
             self.catalog.reload()
             key = (self._data_version, self._local_now().date().isoformat(),
-                   days, provider, workspace, model, start_date, end_date, bool(compare),
+                   days, provider, workspace, model, start_date, end_date, bool(compare), source_kind,
                    repr(self.catalog.__dict__), repr(getattr(self.pricing, "rules", [])))
             if key not in self._dashboard_cache:
                 if len(self._dashboard_cache) >= 16:
                     self._dashboard_cache.clear()
                 self._dashboard_cache[key] = self._build_dashboard(
-                    days, provider, workspace, model, start_date, end_date, bool(compare))
+                    days, provider, workspace, model, start_date, end_date, bool(compare), source_kind)
                 self._dashboard_cache[key]["data_version"] = key[0]
             return self._dashboard_cache[key]
 
@@ -3098,12 +3315,13 @@ class DashboardDB:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         compare: bool = False,
+        source_kind=None,
     ) -> Dict[str, Any]:
         # Display labels and filter aliases are configuration, not immutable
         # cached data. Reloading here makes provider renames immediately
         # visible for historical rows without rescanning rollout files.
         self.catalog.reload()
-        available = self._fetch_rows(days, None, None, start_date=start_date, end_date=end_date)
+        available = self._fetch_rows(days, None, None, start_date=start_date, end_date=end_date, source_kind=source_kind)
         selected_model = model
         providers = self.catalog.resolve(provider)
         # Relay and provider routers report the same model under different
@@ -3115,7 +3333,7 @@ class DashboardDB:
                 if (not providers or row["provider"] in providers)
                 and (not workspace or row["workspace"] == workspace)
                 and (not model_filter or canonical_model(row["model"]) == model_filter)]
-        available_providers = {row['provider']: self.catalog.label(row['provider']) for row in available}
+        available_providers = {row['provider']: self._provider_label(row) for row in available}
         available_workspaces = sorted({row['workspace'] for row in available})
         summary = self._empty_metrics()
         workspace_groups: Dict[str, Dict[str, Any]] = {}
@@ -3130,7 +3348,8 @@ class DashboardDB:
         for row in rows:
             quote = self._stored_quote(row)
             self._add_metrics(summary, row, quote)
-            request_sizes.append(int(row["total_tokens"] or 0))
+            if row['source_kind'] == 'codex':
+                request_sizes.append(int(row['total_tokens'] or 0))
             workspace_key = str(row["workspace"])
             workspace_groups.setdefault(workspace_key, self._empty_metrics())
             self._add_metrics(workspace_groups[workspace_key], row, quote)
@@ -3144,8 +3363,8 @@ class DashboardDB:
             model_key = (
                 str(row["day"]),
                 str(row["provider"]),
-                self.catalog.label(row["provider"]),
-                canonical,
+                self._provider_label(row),
+                canonical, str(row["source_kind"]),
             )
             model_groups.setdefault(model_key, self._empty_metrics())
             self._add_metrics(model_groups[model_key], row, quote)
@@ -3171,7 +3390,7 @@ class DashboardDB:
                 )
             provider_groups[str(row["provider"])] = {
                 "provider": str(row["provider"]),
-                "provider_label": self.catalog.label(row["provider"]),
+                "provider_label": self._provider_label(row),
             }
 
         workspace_distribution = []
@@ -3188,7 +3407,7 @@ class DashboardDB:
 
         daily_model_distribution = []
         daily_model_usage = []
-        for (day, provider_id, provider_label, model), metrics in sorted(model_groups.items()):
+        for (day, provider_id, provider_label, model, kind), metrics in sorted(model_groups.items()):
             priced_requests = int(metrics["priced_request_count"])
             unpriced_requests = int(metrics["unpriced_request_count"])
             if priced_requests and unpriced_requests:
@@ -3198,16 +3417,17 @@ class DashboardDB:
             else:
                 pricing_status = "unpriced"
             pricing_group = model_pricing_groups.get(
-                (day, provider_id, provider_label, model),
+                (day, provider_id, provider_label, model, kind),
                 {"models": set(), "bands": set(), "sources": set(), "notes": set(), "statuses": set()},
             )
             item = {
                 "date": day,
+                "source_kind": kind,
                 "provider": provider_id,
                 "provider_label": provider_label,
                 "model": model,
                 "source_models": sorted(
-                    model_source_names.get((day, provider_id, provider_label, model), set())
+                    model_source_names.get((day, provider_id, provider_label, model, kind), set())
                 ),
                 **self._metrics_aliases(metrics),
                 "pricing_status": pricing_status,
@@ -3219,6 +3439,7 @@ class DashboardDB:
             daily_model_distribution.append(
                 {
                     "date": day,
+                    "source_kind": kind,
                     "provider": provider_id,
                     "provider_label": provider_label,
                     "model": model,
@@ -3253,9 +3474,9 @@ class DashboardDB:
             )
         request_token_distribution = {
             "histogram": histogram,
-            "p50": self._percentile(request_sizes, 0.50),
-            "p90": self._percentile(request_sizes, 0.90),
-            "p99": self._percentile(request_sizes, 0.99),
+            "p50": self._percentile(request_sizes, 0.50) if request_sizes or not rows else None,
+            "p90": self._percentile(request_sizes, 0.90) if request_sizes or not rows else None,
+            "p99": self._percentile(request_sizes, 0.99) if request_sizes or not rows else None,
             "request_count": len(request_sizes),
         }
 
@@ -3287,7 +3508,7 @@ class DashboardDB:
             previous_end = current_start - _dt.timedelta(days=1)
             previous_start = previous_end - _dt.timedelta(days=period_days - 1)
             previous = self._build_dashboard(
-                0, provider, workspace, model, previous_start.isoformat(), previous_end.isoformat(), False)
+                0, provider, workspace, model, previous_start.isoformat(), previous_end.isoformat(), False, source_kind)
             comparison = {
                 "summary": previous["summary"],
                 "start_date": previous_start.isoformat(),
@@ -3302,12 +3523,22 @@ class DashboardDB:
             "start_date": effective_start,
             "end_date": effective_end,
             "filters": {
+                "source_kind": source_kind,
                 "provider": provider,
                 "workspace": workspace,
                 "providers": sorted(available_providers),
                 "workspaces": available_workspaces,
                 "models": sorted({canonical_model(row['model']) for row in available}),
                 "model": selected_model,
+            },
+            "request_metrics": {
+                'scope': ('not_applicable' if source_kind == 'hermes'
+                          else 'codex_only' if source_kind != 'codex' else 'codex'),
+                'reason': ('不适用：Hermes 聚合用量未提供请求边界、速度、TTFT、上下文窗口及父子代理关系。'
+                           if source_kind == 'hermes'
+                           else '仅含 Codex；Hermes 未提供' if source_kind != 'codex' else ''),
+                'sample_request_count': len(request_sizes),
+                'excluded_request_count': sum(_request_weight(r) for r in rows if r['source_kind'] == 'hermes'),
             },
             "summary": summary_aliases,
             "speed_exclusions": dict(summary_aliases["speed_exclusions"]),
@@ -3681,7 +3912,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     model=query.get("model"),
                     start_date=query.get("start_date"),
                     end_date=query.get("end_date"),
-                    compare=compare,
+                    compare=compare, source_kind=query.get("source_kind"),
                 )
                 self._write_json(value)
             except ValueError:
@@ -3698,7 +3929,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     start_date=query.get("start_date"), end_date=query.get("end_date"),
                     page=int(query.get("page", "1")), page_size=int(query.get("page_size", "50")),
                     sort=query.get("sort", "time_desc"), task_id=query.get("task_id"),
-                    cost_mode=query.get("cost_mode", "after"), thread_key=query.get("thread_key"))
+                    cost_mode=query.get("cost_mode", "after"), thread_key=query.get("thread_key"), source_kind=query.get("source_kind"), source_identity=query.get("source_identity"))
                 self._write_json(value)
             except ValueError:
                 self._write_json({"error": "invalid_filters"}, HTTPStatus.BAD_REQUEST)
@@ -3718,7 +3949,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 value = service.database.tasks(
                     days=int(query.get("days", "30")), provider=query.get("provider"),
                     workspace=query.get("workspace"), model=query.get("model"),
-                    start_date=query.get("start_date"), end_date=query.get("end_date"))
+                    start_date=query.get("start_date"), end_date=query.get("end_date"), source_kind=query.get("source_kind"))
                 self._write_json(value)
             except ValueError:
                 self._write_json({"error": "invalid_filters"}, HTTPStatus.BAD_REQUEST)
@@ -3731,7 +3962,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 value = service.database.sessions(
                     days=int(query.get("days", "30")), provider=query.get("provider"),
                     workspace=query.get("workspace"), model=query.get("model"),
-                    start_date=query.get("start_date"), end_date=query.get("end_date"))
+                    start_date=query.get("start_date"), end_date=query.get("end_date"), source_kind=query.get("source_kind"))
                 self._write_json(value)
             except ValueError:
                 self._write_json({"error": "invalid_filters"}, HTTPStatus.BAD_REQUEST)
@@ -3798,7 +4029,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._write_json(result)
                 return
             if route == "/api/reprice/preview":
-                allowed = {"days", "provider", "workspace", "model", "start_date", "end_date"}
+                allowed = {"days", "provider", "workspace", "model", "start_date", "end_date", "source_kind"}
                 if set(body).difference(allowed):
                     self._write_json({"error": "invalid_filters"}, HTTPStatus.BAD_REQUEST)
                     return
@@ -3889,6 +4120,7 @@ def create_server(service: DashboardService, host: str = "127.0.0.1", port: int 
 
 def _common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--db", type=Path, default=DEFAULT_DB, help="SQLite cache file")
+    parser.add_argument("--hermes-db", type=Path, help="Hermes state.db (read only)")
     parser.add_argument("--root", type=Path, action="append", help="Codex session root; may be repeated")
     parser.add_argument("--providers", type=Path, default=None, help="provider aliases JSON")
     parser.add_argument("--timezone", default=None, help="IANA timezone, default: system local timezone")
@@ -3896,7 +4128,9 @@ def _common_options(parser: argparse.ArgumentParser) -> None:
 
 def _database_from_args(args: argparse.Namespace) -> DashboardDB:
     roots = args.root if args.root else None
-    return DashboardDB(args.db, roots=roots, providers_path=args.providers, timezone_name=args.timezone)
+    from hermes_source import resolve_hermes_paths
+    return DashboardDB(args.db, roots=roots, providers_path=args.providers, timezone_name=args.timezone,
+                       hermes_db=resolve_hermes_paths(args.hermes_db)[0])
 
 
 def _print_json(value: Any) -> None:
@@ -3935,6 +4169,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     export_parser.add_argument("--output", type=Path)
     export_parser.add_argument("--cost-mode", choices=("before", "after"), default="after")
     for filter_parser in (summary_parser, export_parser):
+        filter_parser.add_argument("--source-kind", choices=("all", "codex", "hermes"))
         filter_parser.add_argument("--model")
         filter_parser.add_argument("--start-date")
         filter_parser.add_argument("--end-date")
@@ -3949,7 +4184,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.command == "summary":
             db.scan()
             _print_json(db.dashboard(args.days, args.provider, args.workspace, args.model,
-                                     start_date=args.start_date, end_date=args.end_date, compare=args.compare))
+                                     start_date=args.start_date, end_date=args.end_date, compare=args.compare, source_kind=args.source_kind))
             return 0
         if args.command == "doctor":
             roots = []
@@ -3967,7 +4202,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.command == "export":
             db.scan()
             dashboard = db.dashboard(args.days, args.provider, args.workspace, args.model,
-                                     start_date=args.start_date, end_date=args.end_date, compare=args.compare)
+                                     start_date=args.start_date, end_date=args.end_date, compare=args.compare, source_kind=args.source_kind)
             if args.format == "json":
                 output = json.dumps(dashboard, ensure_ascii=False, indent=2, sort_keys=True)
             else:
@@ -3977,6 +4212,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         for row in dashboard["daily_model_usage"]]
                 columns = [
                     "date",
+                    "source_kind",
                     "provider",
                     "provider_label",
                     "model",

@@ -20,6 +20,7 @@
   const state = {
     range: '30',
     provider: 'all',
+    sourceKind: 'all',
     workspace: 'all',
     model: 'all',
     data: null,
@@ -373,6 +374,7 @@
     const providerId = text(pick(item, 'provider_id', 'providerId', 'provider', 'vendor_id'));
     const providerLabel = text(pick(item, 'provider_label', 'providerLabel', 'provider_name', 'providerName', 'vendor'), providerId || '未知供应商');
     return {
+      sourceKind: text(item.source_kind),
       date: dateKey(pick(item, 'date', 'day', 'date_key', 'timestamp')) || fallbackDate,
       model: text(pick(item, 'model', 'model_name', 'modelName', 'model_id', 'modelId', 'name'), '未知模型'),
       provider: providerLabel,
@@ -445,8 +447,8 @@
   function summarizeRows(rows) {
     const grouped = new Map();
     rows.forEach(row => {
-      const key = `${row.model}|||${row.provider}`;
-      if (!grouped.has(key)) grouped.set(key, { model: row.model, provider: row.provider, providerId: row.providerId || row.provider, input: 0, output: 0, cache: 0, cacheWrite: 0, freshInput: 0, reasoning: 0, total: 0, requests: 0, cost: 0, costBefore: 0, costAfter: 0, speedOutputTokens: 0, speedDurationMs: 0, speedSampleCount: 0, pricingStatuses: new Set() });
+      const key = `${row.sourceKind || "codex"}|||${row.model}|||${row.provider}`;
+      if (!grouped.has(key)) grouped.set(key, { sourceKind: row.sourceKind, model: row.model, provider: row.provider, providerId: row.providerId || row.provider, input: 0, output: 0, cache: 0, cacheWrite: 0, freshInput: 0, reasoning: 0, total: 0, requests: 0, cost: 0, costBefore: 0, costAfter: 0, speedOutputTokens: 0, speedDurationMs: 0, speedSampleCount: 0, pricingStatuses: new Set() });
       const result = grouped.get(key);
       ['input', 'output', 'cache', 'cacheWrite', 'freshInput', 'reasoning', 'total', 'requests', 'costBefore', 'costAfter', 'speedOutputTokens', 'speedDurationMs', 'speedSampleCount'].forEach(metric => { result[metric] += toNumber(row[metric]); });
       result.cost = state.costMode === 'before' ? result.costBefore : result.costAfter;
@@ -528,6 +530,7 @@
     if (body.workspaces !== undefined) filterPayload.workspaces = body.workspaces;
     return {
       summary,
+      requestMetrics: body.request_metrics || {},
       filters: normalizeFilters(filterPayload, source),
       pricing: body.pricing && typeof body.pricing === 'object' ? body.pricing : {},
       comparison: body.comparison && typeof body.comparison === 'object' ? body.comparison : {},
@@ -764,11 +767,11 @@
       [`预估费用 USD · ${state.costMode === 'before' ? '折扣前' : '折扣后'}`, m.total > 0 && m.coverage === 0 ? '未计价' : formatCurrency(activeCost), costSub, activeCost, costDetails],
       ['总 Token', formatCompact(m.total), 'Input + Output（Reasoning 为子集）', m.total],
       ['今日 Token', formatCompact(today), todayRows.length ? `${todayRows.length} 条模型记录` : '今日暂无记录', today],
-      ['请求数', formatCompact(m.requests), '当前筛选范围', m.requests],
+      ['请求数', formatCompact(m.requests), 'Hermes 按 API 调用次数计数', m.requests],
       ['活跃工作空间', formatNumber(m.active), '有请求记录的空间', m.active],
       ['模型 / 供应商', formatNumber(m.models), '去重后的组合数', m.models],
       ['缓存占比', m.cacheRateText, m.cacheAvailable ? `${formatCompact(m.cache)} cache tokens · ${m.cacheCoverageText}` : m.cacheCoverageText, m.cacheRate],
-      ['轮次平均输出速度', formatSpeed(m), m.speedSampleCount > 0 ? `${formatNumber(m.speedSampleCount)} 个完整轮次样本` : '暂无完整计时轮次', formatSpeed(m)]
+      ['轮次平均输出速度', data.requestMetrics && data.requestMetrics.scope === 'not_applicable' ? '不适用' : formatSpeed(m), data.requestMetrics && data.requestMetrics.reason ? data.requestMetrics.reason : m.speedSampleCount > 0 ? `${formatNumber(m.speedSampleCount)} 个完整轮次样本` : '暂无完整计时轮次', formatSpeed(m)]
     ];
     const iconPaths = [
       'M12 3v18M16 7H10a3 3 0 0 0 0 6h4a3 3 0 0 1 0 6H7',
@@ -887,6 +890,13 @@
   }
 
   function renderRequestDistribution(data) {
+    const scope = data.requestMetrics || {};
+    if (scope.scope === 'not_applicable' || (scope.scope === 'codex_only' && !scope.sample_request_count)) {
+      $('#requestMeta').textContent = scope.scope === 'not_applicable' ? '不适用' : '暂无 Codex 请求样本';
+      $('#requestStats').innerHTML = `<p class="panel-description">${htmlEscape(scope.reason)}</p>`;
+      $('#requestChart').innerHTML = '';
+      return;
+    }
     const distribution = data.requestDistribution;
     const rows = distribution.bins;
     const allValues = rows.flatMap(row => [row.min, row.max]).filter(value => value > 0);
@@ -894,7 +904,7 @@
     const fallbackPercentile = inferred.length ? inferred[Math.floor(inferred.length / 2)] : 0;
     const percentiles = { p50: distribution.p50 || fallbackPercentile, p90: distribution.p90 || fallbackPercentile, p99: distribution.p99 || fallbackPercentile };
     $('#requestStats').innerHTML = [['p50', percentiles.p50, '中位请求'], ['p90', percentiles.p90, '90% 请求不超过'], ['p99', percentiles.p99, '极端请求上界']].map(item => `<div class="percentile-card ${item[0]}"><span>${item[0].toUpperCase()} · ${item[2]}</span><strong title="${htmlEscape(formatNumber(item[1]))}">${htmlEscape(formatCompact(item[1]))}</strong></div>`).join('');
-    $('#requestMeta').textContent = rows.length ? `${formatNumber(rows.reduce((sum, row) => sum + row.count, 0))} 次请求` : '暂无分布';
+    $('#requestMeta').textContent = (rows.length ? `${formatNumber(rows.reduce((sum, row) => sum + row.count, 0))} 次请求` : '暂无分布') + (scope.reason ? ` · ${scope.reason}` : '');
     const host = $('#requestChart');
     if (!rows.length) { emptyChart(host, '暂无直方图', percentiles.p50 ? '接口返回了分位数，但还没有直方图分桶。' : '当前筛选范围内没有请求数据。'); return; }
     const width = Math.max(host.clientWidth || 620, 360), height = 246, left = 41, right = 12, top = 44, bottom = 34;
@@ -1026,7 +1036,7 @@
       const pricingTitle = row.pricingStatus === 'unpriced'
         ? (row.pricingNote || '未计价')
         : `${row.pricingModel || row.model}${row.pricingRateBand ? ` · ${row.pricingRateBand}` : ''}`;
-      return `<tr class="usage-summary-row" tabindex="0" role="button" aria-label="查看 ${htmlEscape(row.date)} ${htmlEscape(row.model)} ${htmlEscape(row.provider)} 的请求明细" data-date="${htmlEscape(row.date)}" data-model="${htmlEscape(row.model)}" data-provider="${htmlEscape(row.providerId || row.provider)}" data-workspace="${htmlEscape(row.workspace || '')}"><td>${htmlEscape(dateLabel(row.date, true))}</td><td><strong title="${htmlEscape(row.model)}">${htmlEscape(row.model)}</strong></td><td><span class="provider-pill" title="${htmlEscape(row.provider)}">${htmlEscape(row.provider)}</span></td><td class="num">${htmlEscape(formatCompact(row.input))}</td><td class="num">${htmlEscape(formatCompact(row.output))}</td><td class="num">${htmlEscape(formatCompact(row.cache))}</td><td class="num">${htmlEscape(formatCompact(row.reasoning))}</td><td class="num"><strong title="${htmlEscape(formatNumber(row.total))}">${htmlEscape(formatCompact(row.total))}</strong></td><td class="num" title="${htmlEscape(pricingTitle)}">${cost}</td><td class="num">${htmlEscape(formatSpeed(row))}</td><td class="num">${htmlEscape(formatNumber(row.speedSampleCount))}</td><td class="num">${htmlEscape(formatCompact(row.requests))}</td></tr>`;
+      return `<tr class="usage-summary-row" tabindex="0" role="button" aria-label="查看 ${htmlEscape(row.date)} ${htmlEscape(row.model)} ${htmlEscape(row.provider)} 的请求明细" data-source-kind="${htmlEscape(row.sourceKind || '')}" data-date="${htmlEscape(row.date)}" data-model="${htmlEscape(row.model)}" data-provider="${htmlEscape(row.providerId || row.provider)}" data-workspace="${htmlEscape(row.workspace || '')}"><td>${htmlEscape(dateLabel(row.date, true))}</td><td><strong title="${htmlEscape(row.model)}">${htmlEscape(row.model)}</strong></td><td><span class="provider-pill" title="${htmlEscape(row.provider)}">${htmlEscape(row.provider)}</span></td><td class="num">${htmlEscape(formatCompact(row.input))}</td><td class="num">${htmlEscape(formatCompact(row.output))}</td><td class="num">${htmlEscape(formatCompact(row.cache))}</td><td class="num">${htmlEscape(formatCompact(row.reasoning))}</td><td class="num"><strong title="${htmlEscape(formatNumber(row.total))}">${htmlEscape(formatCompact(row.total))}</strong></td><td class="num" title="${htmlEscape(pricingTitle)}">${cost}</td><td class="num">${htmlEscape(row.sourceKind === 'hermes' ? '不适用' : formatSpeed(row))}</td><td class="num">${htmlEscape(row.sourceKind === 'hermes' ? '不适用' : formatNumber(row.speedSampleCount))}</td><td class="num">${htmlEscape(formatCompact(row.requests))}</td></tr>`;
     }).join('');
     $('#tablePaginationSummary').textContent = rows.length
       ? `共 ${formatNumber(rows.length)} 条，每页 ${state.tablePageSize} 条 · 第 ${state.tablePage} / ${totalPages} 页`
@@ -1036,6 +1046,11 @@
   }
 
   function renderAll(data, options = {}) {
+    const apiHint = $('#apiHint');
+    if (apiHint) apiHint.textContent = data.dailyModelUsage.some(row => row.sourceKind === 'hermes' && /^(?:models\/)?(?:deepseek\/)?deepseek-/i.test(row.model))
+      ? '未配置自定义规则时，DeepSeek 按官方参考价估算；中转站实际扣费可能因折扣/倍率不同而有差异，可在“价格规则”覆盖。'
+      : '公开参考价估算 · 未计价模型不计入费用 · 缓存与推理 Token 为子集';
+    document.body.classList.toggle('hermes-only', Boolean(data.requestMetrics && data.requestMetrics.scope === 'not_applicable'));
     renderFilterOptions(data);
     updateRangeDescription(data);
     renderKpis(data);
@@ -1051,7 +1066,7 @@
         ? '未计价'
         : `预估 ${formatCurrency(row.cost)}${row.pricingStatus === 'partial' ? ' *' : ''}`;
       const share = total ? row.total / total : 0;
-      return `<article class="model-stat"><div class="model-stat-heading"><strong>${htmlEscape(row.model)}</strong><span class="provider-pill">${htmlEscape(row.provider)}</span><span class="model-stat-meta">输入 ${formatCompact(row.input)} · 输出 ${formatCompact(row.output)}</span></div><div class="model-stat-volume"><div class="model-stat-value" title="${formatNumber(row.total)} Token">${formatCompact(row.total)} <small>${formatPercent(share)}</small></div><div class="model-stat-bar" aria-hidden="true"><i style="width:${share * 100}%;background:${modelColor(modelKey(row))}"></i></div></div><div class="model-stat-requests"><span class="mobile-column-label">请求</span>${formatNumber(row.requests)}</div><div class="model-stat-cost"><span class="mobile-column-label">预估费用</span>${htmlEscape(costLabel)}</div><div class="model-stat-speed">轮次平均输出速度 ${htmlEscape(formatSpeed(row))} · ${formatNumber(row.speedSampleCount)} 个完整轮次样本</div></article>`;
+      return `<article class="model-stat"><div class="model-stat-heading"><strong>${htmlEscape(row.model)}</strong><span class="provider-pill">${htmlEscape(row.provider)}</span><span class="model-stat-meta">输入 ${formatCompact(row.input)} · 输出 ${formatCompact(row.output)}</span></div><div class="model-stat-volume"><div class="model-stat-value" title="${formatNumber(row.total)} Token">${formatCompact(row.total)} <small>${formatPercent(share)}</small></div><div class="model-stat-bar" aria-hidden="true"><i style="width:${share * 100}%;background:${modelColor(modelKey(row))}"></i></div></div><div class="model-stat-requests"><span class="mobile-column-label">请求</span>${formatNumber(row.requests)}</div><div class="model-stat-cost"><span class="mobile-column-label">预估费用</span>${htmlEscape(costLabel)}</div><div class="model-stat-speed">轮次平均输出速度 ${htmlEscape(row.sourceKind === 'hermes' ? '不适用' : formatSpeed(row))} · ${row.sourceKind === 'hermes' ? 'Hermes 未提供请求边界' : `${formatNumber(row.speedSampleCount)} 个完整轮次样本`}</div></article>`;
     }).join('') : '<div class="empty-state">当前组合暂无模型用量，可直接切换任一筛选项。</div>';
     enhanceChartTooltips();
     window.dispatchEvent(new CustomEvent('codex-dashboard:render', { detail: { data, state: dashboardSnapshot(), refreshQueries: Boolean(options.refreshQueries) } }));
@@ -1075,6 +1090,7 @@
       params.set('days', state.range === 'all' ? '0' : state.range);
     }
     params.set('compare', '1');
+    if (state.sourceKind !== 'all') params.set('source_kind', state.sourceKind);
     if (state.provider !== 'all') params.set('provider', state.provider);
     if (state.workspace !== 'all') params.set('workspace', state.workspace);
     if (state.model !== 'all') params.set('model', state.model);
@@ -1264,10 +1280,11 @@
     $('#updateCloseIcon').addEventListener('click', () => $('#updateDialog').close());
     $('#updateCloseButton').addEventListener('click', () => $('#updateDialog').close());
     $$('#rangeControls button').forEach(button => button.addEventListener('click', () => setRange(button.dataset.range)));
+    $('#sourceKindFilter').addEventListener('change', event => { state.sourceKind = event.target.value; state.provider = state.workspace = state.model = 'all'; state.tablePage = 1; fetchDashboard(); });
     $('#providerFilter').addEventListener('change', event => { state.provider = event.target.value; state.tablePage = 1; fetchDashboard(); });
     $('#workspaceFilter').addEventListener('change', event => { state.workspace = event.target.value; state.tablePage = 1; fetchDashboard(); });
     $('#modelFilter').addEventListener('change', event => { state.model = event.target.value; state.tablePage = 1; fetchDashboard(); });
-    $('#resetFilters').addEventListener('click', () => { state.provider = state.workspace = state.model = 'all'; setRange('30'); });
+    $('#resetFilters').addEventListener('click', () => { state.sourceKind = state.provider = state.workspace = state.model = 'all'; $('#sourceKindFilter').value = 'all'; setRange('30'); });
     $('#refreshButton').addEventListener('click', refreshNow);
     $('#exportButton').addEventListener('click', exportCsv);
     $('#retryButton').addEventListener('click', () => fetchDashboard({ refreshQueries: true }));
@@ -1309,6 +1326,7 @@
     });
     window.addEventListener('codex-dashboard:set-filters', event => {
       const detail = event.detail || {};
+      if (detail.sourceKind !== undefined) { state.sourceKind = String(detail.sourceKind || 'all'); $('#sourceKindFilter').value = state.sourceKind; }
       if (detail.provider !== undefined) state.provider = String(detail.provider || 'all');
       if (detail.workspace !== undefined) state.workspace = String(detail.workspace || 'all');
       if (detail.model !== undefined) state.model = String(detail.model || 'all');
@@ -1328,11 +1346,12 @@
 
   async function exportCsv() {
     if (!state.data) return;
-    const fields = ['date', 'model', 'provider', 'provider_label', 'input_tokens', 'fresh_input_tokens', 'output_tokens', 'cached_input_tokens', 'cache_read_input_tokens', 'cache_hit_rate', 'cache_read_available_count', 'cache_write_input_tokens', 'cache_write_available_count', 'reasoning_output_tokens', 'total_tokens', 'cost_display_mode', 'displayed_cost_usd', 'estimated_cost_usd', 'cost_before_discount_usd', 'cost_after_discount_usd', 'cache_savings_before_discount_usd', 'cache_savings_after_discount_usd', 'ttft_median_ms', 'ttft_p90_ms', 'ttft_sample_count', 'ttft_coverage', 'pricing_status', 'pricing_model', 'pricing_rate_band', 'request_count', 'speed_output_tokens', 'speed_duration_ms', 'speed_sample_count', 'output_tokens_per_second'];
+    const fields = ['source_kind', 'date', 'model', 'provider', 'provider_label', 'input_tokens', 'fresh_input_tokens', 'output_tokens', 'cached_input_tokens', 'cache_read_input_tokens', 'cache_hit_rate', 'cache_read_available_count', 'cache_write_input_tokens', 'cache_write_available_count', 'reasoning_output_tokens', 'total_tokens', 'cost_display_mode', 'displayed_cost_usd', 'estimated_cost_usd', 'cost_before_discount_usd', 'cost_after_discount_usd', 'cache_savings_before_discount_usd', 'cache_savings_after_discount_usd', 'ttft_median_ms', 'ttft_p90_ms', 'ttft_sample_count', 'ttft_coverage', 'pricing_status', 'pricing_model', 'pricing_rate_band', 'request_count', 'speed_output_tokens', 'speed_duration_ms', 'speed_sample_count', 'output_tokens_per_second'];
     const rows = rowsForView(state.data.dailyModelUsage)
       .filter(row => state.workspace === 'all' || !row.workspace || row.workspace === state.workspace)
       .sort((a, b) => b.date.localeCompare(a.date) || b.total - a.total)
       .map(row => ({
+        source_kind: row.sourceKind,
         date: row.date,
         model: row.model,
         provider: row.providerId,
@@ -1463,7 +1482,7 @@
       date.setDate(date.getDate() - days + 1);
       startDate = dateKey(date);
     }
-    return { range: state.range, startDate, endDate, provider: state.provider, workspace: state.workspace, model: state.model, costMode: state.costMode };
+    return { range: state.range, startDate, endDate, sourceKind: state.sourceKind, provider: state.provider, workspace: state.workspace, model: state.model, costMode: state.costMode };
   }
 
   function setCostMode(mode) {

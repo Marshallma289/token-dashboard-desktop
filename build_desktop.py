@@ -27,7 +27,7 @@ ROOT_FILES = {
 }
 SOURCE_TREES = ("tests", "web", "assets", ".github/workflows")
 EXCLUDED_DIRS = {".git", ".venv", "__pycache__", ".pytest_cache", "release", "dist", "build", "work", "outputs"}
-RUNTIME_FILES = ("backend.py", "desktop.py", "pricing.py", "VERSION", "requirements-desktop.txt", "updater.py", "update_helpers.py")
+RUNTIME_FILES = ("backend.py", "hermes_source.py", "desktop.py", "pricing.py", "VERSION", "requirements-desktop.txt", "updater.py", "update_helpers.py")
 PORTABLE_FILES = (
     "LICENSE", "THIRD_PARTY_NOTICES.md", "providers.json.example", "VERSION",
     "便携版使用说明.txt", "启动 Codex Token 看板.cmd",
@@ -49,7 +49,7 @@ def eligible_file(path: Path, root: Path) -> bool:
 def stage_source(source: Path, destination: Path) -> None:
     """Copy only distributable source files; never copy user caches/config."""
     destination.mkdir(parents=True, exist_ok=True)
-    for name in sorted(ROOT_FILES):
+    for name in sorted(set(ROOT_FILES) | set(RUNTIME_FILES)):
         path = source / name
         if path.is_file() and eligible_file(path, source):
             shutil.copy2(path, destination / name)

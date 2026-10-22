@@ -10,10 +10,11 @@
   function calculateRate(options = {}) {
     const cached = finiteNumber(options.cachedTokens);
     if (cached === null) return null;
-    if (options.hitRateProvided) return finiteNumber(options.hitRate);
+    const valid = value => value !== null && value >= 0 && value <= 1 ? value : null;
+    if (options.hitRateProvided) return valid(finiteNumber(options.hitRate));
     if (options.denominatorProvided) {
       const denominator = finiteNumber(options.cacheReadInputTokens);
-      return denominator !== null && denominator > 0 ? cached / denominator : null;
+      return denominator !== null && denominator > 0 ? valid(cached / denominator) : null;
     }
     const availableCount = finiteNumber(options.availableCount);
     const requestCount = finiteNumber(options.requestCount);
@@ -21,7 +22,7 @@
     if (availableCount !== null && requestCount !== null && requestCount > 0 && availableCount < requestCount) return null;
     if (options.available === false) return null;
     const denominator = finiteNumber(options.inputTokens);
-    return denominator !== null && denominator > 0 ? cached / denominator : null;
+    return denominator !== null && denominator > 0 ? valid(cached / denominator) : null;
   }
 
   function formatPercent(value, available = true) {

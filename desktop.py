@@ -190,6 +190,7 @@ class DesktopRuntime:
         db_path: Optional[Path] = None,
         providers_path: Optional[Path] = None,
         interval: Optional[float] = None,
+        hermes_db: Optional[Path] = None,
     ) -> None:
         data_dir = local_data_dir()
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -198,9 +199,11 @@ class DesktopRuntime:
             if sys.platform != "darwin":
                 candidates.insert(0, application_dir() / "providers.json")
             providers_path = next((path for path in candidates if path.is_file()), None)
+        from hermes_source import resolve_hermes_paths
         self.database = database or DashboardDB(
             db_path or _configured_database(),
             providers_path=providers_path,
+            hermes_db=resolve_hermes_paths(hermes_db)[0],
         )
         self._owns_database = database is None
         self.service = DashboardService(self.database, interval=interval)
@@ -644,7 +647,8 @@ def main() -> int:
         if getattr(sys, 'frozen', False) and '--update-job' in sys.argv:
             os.chdir(installation_dir())
         _wait_for_webview_cleanup()
-        runtime = DesktopRuntime()
+        runtime = (DesktopRuntime(hermes_db=Path(sys.argv[sys.argv.index('--hermes-db') + 1]))
+                   if '--hermes-db' in sys.argv else DesktopRuntime())
         url = runtime.start()
         bridge = DesktopBridge(runtime)
         window = webview.create_window(

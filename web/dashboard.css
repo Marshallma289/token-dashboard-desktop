@@ -211,3 +211,8 @@ tbody tr:nth-child(even) td, body[data-theme="dark"] tbody tr:nth-child(even) td
   .is-connecting .status-dot, .is-scanning .status-dot { animation: none; }
   .kpi-card, .model-stat, .icon-button, .export-button { transition: none; }
 }
+
+/* Preserve saved layout while making unavailable Hermes request metrics explicit. */
+.hermes-only [data-layout-id="overview-ttft"],
+.hermes-only [data-layout-id="trends-requests"] { background: var(--panel-bg, transparent); }
+.hermes-only #requestChart:empty { min-height: 0; }

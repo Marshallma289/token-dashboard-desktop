@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 import os
 import tempfile
@@ -6,6 +7,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from backend import DashboardDB, default_roots
+
+
+# Both timezone instances must use the same instant near the static rollouts.
+FIXTURE_NOW = dt.datetime(2026, 9, 20, 12, tzinfo=dt.timezone.utc)
 
 
 def write_lines(path, rows):
@@ -31,13 +36,13 @@ class ReviewRegressionTests(unittest.TestCase):
             root.mkdir()
             write_lines(root / "one.jsonl", [session(), turn("gpt-test"), usage("thread-a", "r1", 100)])
             db_path = Path(tmp) / "cache.sqlite3"
-            first = DashboardDB(db_path, roots=[root], timezone_name="Asia/Shanghai")
+            first = DashboardDB(db_path, roots=[root], timezone_name="Asia/Shanghai", clock=lambda: FIXTURE_NOW)
             try:
                 first.scan()
                 self.assertEqual(first.dashboard(30)["daily_activity"][0]["date"], "2026-09-19")
             finally:
                 first.close()
-            second = DashboardDB(db_path, roots=[root], timezone_name="UTC")
+            second = DashboardDB(db_path, roots=[root], timezone_name="UTC", clock=lambda: FIXTURE_NOW)
             try:
                 result = second.scan()
                 self.assertEqual(result.files_scanned, 1)
@@ -53,7 +58,7 @@ class ReviewRegressionTests(unittest.TestCase):
             duplicate = json.loads(json.dumps(legacy))
             duplicate["timestamp"] = "2026-09-18T16:30:01Z"
             write_lines(root / "legacy.jsonl", [session(), turn("legacy-model"), legacy, duplicate])
-            db = DashboardDB(Path(tmp) / "cache.sqlite3", roots=[root], timezone_name="UTC")
+            db = DashboardDB(Path(tmp) / "cache.sqlite3", roots=[root], timezone_name="UTC", clock=lambda: FIXTURE_NOW)
             try:
                 db.scan()
                 self.assertEqual(db.counts()["usage_records"], 1)
@@ -71,7 +76,7 @@ class ReviewRegressionTests(unittest.TestCase):
                 settings, usage("thread-b", "b1", 200), turn("model-a2", "turn-a2"), usage("thread-a", "a2", 300),
             ]
             write_lines(root / "threads.jsonl", rows)
-            db = DashboardDB(Path(tmp) / "cache.sqlite3", roots=[root], timezone_name="UTC")
+            db = DashboardDB(Path(tmp) / "cache.sqlite3", roots=[root], timezone_name="UTC", clock=lambda: FIXTURE_NOW)
             try:
                 db.scan()
                 rows_b = db.dashboard(30, workspace="/workspace/b")["daily_model_usage"]
@@ -87,7 +92,7 @@ class ReviewRegressionTests(unittest.TestCase):
             root = Path(tmp) / "sessions"
             root.mkdir()
             write_lines(root / "correction.jsonl", [session(), turn("gpt-test"), usage("thread-a", "same", 100), usage("thread-a", "same", 120, "2026-09-18T16:31:00Z")])
-            db = DashboardDB(Path(tmp) / "cache.sqlite3", roots=[root], timezone_name="UTC")
+            db = DashboardDB(Path(tmp) / "cache.sqlite3", roots=[root], timezone_name="UTC", clock=lambda: FIXTURE_NOW)
             try:
                 db.scan()
                 self.assertEqual(db.counts()["usage_records"], 1)

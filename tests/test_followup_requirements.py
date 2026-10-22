@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 import shutil
 import tempfile
@@ -5,6 +6,10 @@ import unittest
 from pathlib import Path
 
 from backend import DashboardDB
+
+
+# Preserve the UTC/local midnight fixture inside the relative 30-day window.
+FIXTURE_NOW = dt.datetime(2026, 9, 20, 12, tzinfo=dt.timezone.utc)
 
 
 class FollowupRequirementTests(unittest.TestCase):
@@ -18,6 +23,7 @@ class FollowupRequirementTests(unittest.TestCase):
             self.temp_dir / "cache.sqlite3",
             roots=[self.sessions, self.archive],
             timezone_name="Asia/Shanghai",
+            clock=lambda: FIXTURE_NOW,
         )
 
     def tearDown(self):

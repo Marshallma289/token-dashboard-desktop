@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 import shutil
 import tempfile
@@ -12,6 +13,8 @@ from backend import DashboardDB, DashboardService, create_server
 
 HERE = Path(__file__).resolve().parent
 FIXTURES = HERE / "fixtures"
+# Keep relative dashboard windows anchored to the static September rollouts.
+FIXTURE_NOW = dt.datetime(2026, 9, 20, 12, tzinfo=dt.timezone.utc)
 
 
 class BackendTests(unittest.TestCase):
@@ -24,7 +27,10 @@ class BackendTests(unittest.TestCase):
         self.providers = self.temp_dir / "providers.json"
         self.providers.write_text(json.dumps({"providers": {"moonshot": "Moonshot AI"}}), encoding="utf-8")
         self.db_path = self.temp_dir / "cache.sqlite3"
-        self.db = DashboardDB(self.db_path, roots=[self.root], providers_path=self.providers)
+        self.db = DashboardDB(
+            self.db_path, roots=[self.root], providers_path=self.providers,
+            clock=lambda: FIXTURE_NOW,
+        )
 
     def tearDown(self):
         self.db.close()

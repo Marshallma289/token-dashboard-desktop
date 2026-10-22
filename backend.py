@@ -208,6 +208,13 @@ def _input_includes_cache(row: Mapping[str, Any]) -> bool:
     return True
 
 
+def _cache_input_tokens(row: Mapping[str, Any]) -> int:
+    total = int(row['input_tokens'] or 0)
+    if not _input_includes_cache(row):
+        total += int(row['cached_input_tokens'] or 0) + int(row['cache_write_input_tokens'] or 0)
+    return total
+
+
 def _fresh_input_tokens(input_tokens: Any, cached_input_tokens: Any, cache_write_input_tokens: Any,
                         input_includes_cache: bool = True) -> int:
     """Estimate uncached input without letting counters subtract below zero.
@@ -2041,6 +2048,7 @@ class DashboardDB:
                                              (day, hour, row["id"]))
                 self._connection.execute("INSERT OR REPLACE INTO history_meta VALUES ('timezone', ?)",
                                          (self.timezone_name,))
+            self._repair_hermes_token_totals()
             self._collect_unused_snapshots()
             self._connection.commit()
         except Exception:
@@ -2062,6 +2070,25 @@ class DashboardDB:
         else:
             identity = "source\0%s\0%d" % (source_path, source_line)
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+    def _repair_hermes_token_totals(self) -> None:
+        # Repair retained history too, even if the source disappeared or its
+        # watermark has not changed. Rebuild snapshots through the normal
+        # fingerprint path, preserving logical identities and frozen rates.
+        rows = self._connection.execute("""SELECT u.*, r.snapshot_id
+            FROM usage_records u JOIN history_requests r ON r.logical_key=u.record_key
+            WHERE u.source_kind='hermes' AND u.total_tokens !=
+                u.input_tokens+u.cached_input_tokens+u.cache_write_input_tokens+u.output_tokens""").fetchall()
+        for old in rows:
+            row = dict(old)
+            row['total_tokens'] = _cache_input_tokens(row) + row['output_tokens']
+            key = row['record_key']
+            replacement = self._store_snapshot(key, row, preserve_pricing=True)
+            self._connection.execute("""UPDATE history_sources SET snapshot_id=?
+                WHERE logical_key=? AND snapshot_id=?""", (replacement, key, old['snapshot_id']))
+            self._connection.execute("""UPDATE history_requests SET snapshot_id=?,
+                retained_snapshot_id=CASE WHEN retained_snapshot_id=? THEN ? ELSE retained_snapshot_id END
+                WHERE logical_key=?""", (replacement, old['snapshot_id'], replacement, key))
 
     def _history_key(self, row) -> bytes:
         if row["response_id"]:
@@ -2098,7 +2125,7 @@ class DashboardDB:
                 row["source_line"] if "source_line" in row.keys() else 0,
                 row["source_path"] if "source_path" in row.keys() else "")
 
-    def _store_snapshot(self, key, row, force_reprice=False):
+    def _store_snapshot(self, key, row, force_reprice=False, preserve_pricing=False):
         if 'hermes_metadata' in row.keys() and row['source_kind'] == 'hermes':
             row = dict(self._json_object(row['hermes_metadata']), **dict(row))
         context = (row["provider"], row["model"], row["workspace"])
@@ -2159,10 +2186,20 @@ class DashboardDB:
         frozen_snapshot = self._json_object(previous["effective_rate_snapshot"]) if previous else {}
         if force_reprice:
             frozen_snapshot = {}
-        quote = self._quote_for_usage(
-            row["model"], row["provider"], row["timestamp"], tokens[0], tokens[2], tokens[3], tokens[1],
-            rate_snapshot=frozen_snapshot or None, aggregate=source_kind == 'hermes',
-            hermes_metadata=self._json_object(hermes_metadata))
+        if preserve_pricing:
+            # A derived-token migration must not reprice old self-reported
+            # amounts, even if this release newly recognizes their model.
+            quote = {name: row[name] for name in (
+                'pricing_status', 'cost_multiplier', 'cost_before_discount_usd',
+                'cost_after_discount_usd', 'cache_savings_before_discount_usd',
+                'cache_savings_after_discount_usd')}
+            quote['rate_snapshot'] = self._json_object(row['rate_snapshot'])
+            quote['cost_breakdown_before_discount'] = self._json_object(row['cost_breakdown_before_discount'])
+        else:
+            quote = self._quote_for_usage(
+                row["model"], row["provider"], row["timestamp"], tokens[0], tokens[2], tokens[3], tokens[1],
+                rate_snapshot=frozen_snapshot or None, aggregate=source_kind == 'hermes',
+                hermes_metadata=self._json_object(hermes_metadata))
         pricing_fields = (
             quote["pricing_status"],
             json.dumps(quote["rate_snapshot"], ensure_ascii=False, sort_keys=True, separators=(",", ":")),
@@ -2697,7 +2734,11 @@ class DashboardDB:
             "cached_input_tokens": int(row["cached_input_tokens"] or 0),
             "cache_write_input_tokens": int(row["cache_write_input_tokens"] or 0),
             "fresh_input_tokens": _fresh_input_tokens(
-                row["input_tokens"], row["cached_input_tokens"], row["cache_write_input_tokens"]),
+                row["input_tokens"], row["cached_input_tokens"], row["cache_write_input_tokens"],
+                input_includes_cache=_input_includes_cache(row)),
+            "cache_read_input_tokens": _cache_input_tokens(row) if row['cache_read_available'] else None,
+            "cache_hit_rate": (int(row['cached_input_tokens'] or 0) / _cache_input_tokens(row)
+                               if row['cache_read_available'] and _cache_input_tokens(row) > 0 else None),
             "fresh_input_tokens_estimated": not (
                 bool(row["cache_read_available"]) and bool(row["cache_write_available"])),
             "reasoning_output_tokens": int(row["reasoning_output_tokens"] or 0),
@@ -3165,11 +3206,7 @@ class DashboardDB:
         target["cache_read_available_count"] += _request_weight(row) * int(bool(row["cache_read_available"]))
         target["cache_write_available_count"] += _request_weight(row) * int(bool(row["cache_write_available"]))
         if bool(row["cache_read_available"]):
-            # Codex: input_tokens 已包含 cache_read，分母就是 input。
-            # Hermes: input_tokens 与 cache_read 并列，分母要两者相加。
-            target["cache_read_input_tokens"] += (
-                int(row["input_tokens"] or 0) + int(row["cached_input_tokens"] or 0)
-                if not _input_includes_cache(row) else int(row["input_tokens"] or 0))
+            target["cache_read_input_tokens"] += _cache_input_tokens(row)
             target["_cache_read_cached_tokens"] += int(row["cached_input_tokens"] or 0)
         if quote["is_priced"]:
             before = float(quote["cost_before_discount_usd"] or 0)

@@ -147,7 +147,8 @@ Windows 与 Mac 共用 `backend.py`、`desktop.py`、`pricing.py` 和 `web/`，�
 - 源库不交给 SQLite 建立共享内存：用普通只读文件句柄将 DB 与存在的 WAL 复制到临时目录，确认复制前后的大小与修改时间稳定后，再用 `sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)` 查询临时快照。临时快照关闭后删除；不会在 Hermes 源目录写入、checkpoint、VACUUM，或创建、更新 `-wal` / `-shm`。活跃 WAL 中已提交的数据会被读取，不使用忽略 WAL 的 `immutable` 模式。
 - 每个库以 `MAX(last_seen)` 与行数保存 watermark，并额外比对 DB/WAL 的大小、mtime 签名；水位与签名均未变化时跳过行转换和重新计价。水位变化时以新累计快照替换旧值，不把累计用量再次相加。即使较旧会话的更新未超过全库最大时间，文件签名变化也会触发刷新，避免漏读。
 - 一行是 session × model × provider × task 的累计记录，`api_call_count` 是请求数；不拆成伪请求。总览、趋势、分组、会话、计价计数和导出按调用数加权；明细分页按实际记录行数分页，同时显示累计调用数。多个 profile 的身份独立，Codex 旧库记录默认 `source_kind=codex`、`api_call_count=1`。
-- 日期与小时取 `last_seen` 转本地时区的结果，整个聚合区间的用量归入结束日，不推测逐次请求分布。总 Token 为 input + output，缓存和 reasoning 不重复相加。保留源库原始数值；若缓存读取量超过输入量、无法作为输入的子集解释，则缓存占比显示未知，不显示超过 100% 的比例。workspace 优先 `sessions.cwd`，为空时使用 `sessions.source`，详情标明来源。
+- 日期与小时取 `last_seen` 转本地时区的结果，整个聚合区间的用量归入结束日，不推测逐次请求分布。Hermes 的 input 是未缓存输入，缓存读取、缓存写入为独立用量：总 Token = input + cache_read + cache_write + output；reasoning 已包含在 output 内，不再相加。缓存命中率为 cache_read ÷ (input + cache_read + cache_write)。Codex 的 Input 已包含缓存，保持原有总量口径。workspace 优先 `sessions.cwd`，为空时使用 `sessions.source`，详情标明来源。
+- 启动时自动修正旧版 Hermes 历史中漏加缓存的总量；即使源库暂不可用或未发生变化，也能修正已保存的统计。保留调用次数、逻辑记录标识和历史价格，不修改 Hermes 源库。
 - 优先使用已有模型参考价／自定义价格规则估算，聚合行使用普通档参考价，并标注“无法判断是否触发长上下文阶梯价”。未命中参考价时，仅在 `cost_status` 为 estimated、actual、known、confirmed、reported、priced 且自报金额大于零时采用 Hermes 自报值，优先实际金额；否则仍为未计价。详情保留自报金额、`cost_status`、`cost_source` 和费用依据；0 不被当作已知免费账单。
 - Hermes 没有单次请求速度、TTFT、上下文窗口、请求大小分布或父子代理关系。Hermes 视图显示“不适用／未提供”；“全部”视图的请求级图表仅使用 Codex 样本，并标注“仅含 Codex；Hermes 未提供”。Hermes 的任务字段仅作任务分类，不代表真实子代理关系。
 - 源库缺失或暂时不可读时保留已采集历史并跳过该源；不创建空 Hermes 库。源读取和历史统计库写入严格分离。直接构造 `DashboardDB` 的库调用者以 `hermes_db=...` 显式启用 Hermes，方便使用独立测试数据。

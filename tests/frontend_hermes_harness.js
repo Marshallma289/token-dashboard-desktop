@@ -18,14 +18,16 @@ assert.equal(env.window.CodexDashboard.getState().sourceKind, 'codex');
 
 let analytics = fs.readFileSync(path.join(root, 'web/analytics.js'), 'utf8');
 analytics = analytics.replace("document.addEventListener('DOMContentLoaded', initialize, { once: true });", `
-  window.__hermes = { filterParams, state, renderRequests, detailRows, renderContextWindow, requestSpeedInfo, renderTtft, renderTasks };
+  window.__hermes = { filterParams, state, renderRequests, detailRows, renderContextWindow, requestSpeedInfo, renderTtft, renderTasks, exportRequestPage };
 `);
 vm.runInContext(analytics, env.context);
 assert.equal(env.window.__hermes.filterParams().get('source_kind'), 'codex', 'detail queries must share source filter');
 if (process.argv.includes('--semantics')) {
   const api = env.window.__hermes;
   const row = { source_kind: 'hermes', api_call_count: 7, request_id: 'x', timestamp: '2026-10-22T12:00:00Z',
-    input_tokens: 1000, output_tokens: 200, total_tokens: 1200, provider_label: 'Hermes 自定义供应商',
+    input_tokens: 1000, output_tokens: 200, total_tokens: 21250, provider_label: 'Hermes 自定义供应商',
+    cached_input_tokens: 20000, cache_write_input_tokens: 50, fresh_input_tokens: 1000,
+    cache_read_available: true, cache_write_available: true, cache_read_input_tokens: 21050,
     workspace: 'weixin', workspace_source: 'sessions.source', pricing_status: 'unpriced',
     cost_status: 'unknown', cost_source: 'none', hermes_estimated_cost_usd: 0,
     rate_snapshot: { cost_origin: 'unpriced', note: '无法判断是否触发长上下文阶梯价' } };
@@ -41,6 +43,15 @@ if (process.argv.includes('--semantics')) {
   assert.match(details, /Hermes.*自报/);
   assert.match(details, /unknown/);
   assert.match(details, /无法判断是否触发长上下文阶梯价/);
+  assert.match(details, /缓存占比:95\.0%/);
+  assert.match(details, /总 Token:21,250/);
+  api.exportRequestPage();
+  const csvLines = env.blobs[0].parts[0].trim().replace(/^\ufeff/, '').split('\r\n');
+  const headers = csvLines[0].split(',');
+  const values = csvLines[1].split(',');
+  assert.equal(values[headers.indexOf('cache_read_input_tokens')], '21050');
+  assert.equal(values[headers.indexOf('cache_hit_rate')], '0.950119');
+  assert.equal(values[headers.indexOf('total_tokens')], '21250');
   env.window.CodexDashboard.__renderTest({daily_model_usage:[{source_kind:'hermes', model:'test', provider:'custom',
     provider_label:'Hermes 自定义供应商', input_tokens:1000,output_tokens:200,total_tokens:1200,request_count:7}],
     request_metrics:{scope:'not_applicable',reason:'Hermes 未提供'}});

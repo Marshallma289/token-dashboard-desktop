@@ -80,8 +80,10 @@
           <label class="control-group select-group" for="sourceKindFilter"><span class="control-label">数据源</span><select id="sourceKindFilter" aria-label="按数据源筛选"><option value="all">全部</option><option value="codex">Codex</option><option value="hermes">Hermes</option></select></label>
           <label class="control-group select-group" for="providerFilter"><span class="control-label">供应商</span><select id="providerFilter" aria-label="按供应商筛选"><option value="all">全部供应商</option></select></label>
           <label class="control-group select-group" for="workspaceFilter"><span class="control-label">工作空间</span><select id="workspaceFilter" aria-label="按工作空间筛选"><option value="all">全部工作空间</option></select></label>
-          <label class="control-group select-group" for="modelFilter"><span class="control-label">模型</span><select id="modelFilter" aria-label="按模型筛选"><option value="all">全部模型</option></select></label>
-          <button id="resetFilters" class="reset-button filter-reset" type="button">重置筛选</button>
+          <div class="filter-model-actions">
+            <label class="control-group select-group" for="modelFilter"><span class="control-label">模型</span><select id="modelFilter" aria-label="按模型筛选"><option value="all">全部模型</option></select></label>
+            <button id="resetFilters" class="reset-button filter-reset" type="button">重置筛选</button>
+          </div>
         </div>
         <div class="filter-footnote"><p id="rangeDescription" aria-live="polite">过去 30 天，截止今日</p><p>日期起止日均包含；筛选同步应用于各页面、明细、导出和历史重算。</p></div>
       </section>

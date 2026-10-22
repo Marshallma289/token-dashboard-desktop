@@ -62,7 +62,7 @@ class HermesSourceTests(unittest.TestCase):
         self.assertEqual(watermark, (1792686600.5, 1))
         self.assertEqual(len(rows), 1)
         row = rows[0]
-        self.assertEqual((row['api_call_count'], row['total_tokens']), (7, 1200))
+        self.assertEqual((row['api_call_count'], row['total_tokens']), (7, 1350))
         self.assertEqual((row['cached_input_tokens'], row['cache_write_input_tokens'], row['reasoning_output_tokens']), (100, 50, 80))
         self.assertEqual(row['day'], '2026-10-23')
         self.assertEqual((row['workspace'], row['workspace_source']), ('weixin', 'sessions.source'))
@@ -219,7 +219,7 @@ class HermesAggregationTests(HermesScanTests):
         self.assertEqual(summary['input_tokens'], 1000)
         self.assertIsNotNone(summary['cache_hit_rate'],
                              'Hermes 缓存命中率应计入并列的 input，而不是返回 None')
-        self.assertAlmostEqual(summary['cache_hit_rate'], 2000 / 3000, places=4)
+        self.assertAlmostEqual(summary['cache_hit_rate'], 2000 / 3050, places=4)
         self.assertLessEqual(summary['cache_hit_rate'], 1.0)
 
     def test_weighted_counts_in_every_group_and_record_pagination(self):

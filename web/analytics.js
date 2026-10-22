@@ -685,7 +685,7 @@
     const rates = get(rateSnapshot, 'rates', 'rate_snapshot', 'token_rates') || rateSnapshot;
     const mode = currentCostKey();
     const currentCost = mode === 'costBefore' ? before : after;
-    const detailInput = get(request, 'input_tokens', 'input');
+    const detailInput = get(request, 'cache_read_input_tokens', 'input_tokens', 'input');
     const detailCache = get(request, 'cache_read_tokens', 'cached_input_tokens', 'cache');
     const detailRate = cacheMetrics.calculateRate({ cachedTokens: detailCache, inputTokens: detailInput, available: get(request, 'cache_read_available') === true });
     const detailCacheRate = cachePercent(detailRate, detailRate !== null && get(request, 'cache_read_available') === true);
@@ -791,8 +791,8 @@
       source_kind: row.source_kind, api_call_count: row.api_call_count, record_kind: row.record_kind, hermes_estimated_cost_usd: row.hermes_estimated_cost_usd, hermes_actual_cost_usd: row.hermes_actual_cost_usd, cost_status: row.cost_status, cost_source: row.cost_source, workspace_source: row.workspace_source,
       request_id: get(row, 'request_id', 'id'), timestamp: get(row, 'timestamp', 'time'), provider: get(row, 'provider'), workspace: get(row, 'workspace'), model: get(row, 'model'),
       input_tokens: get(row, 'input_tokens', 'input'), fresh_input_tokens: get(row, 'fresh_input_tokens'), cache_read_tokens: get(row, 'cache_read_available') === true ? get(row, 'cache_read_tokens', 'cached_input_tokens', 'cache') : '未提供',
-      cache_read_input_tokens: get(row, 'cache_read_available') === true ? get(row, 'input_tokens', 'input') : '',
-      cache_hit_rate: get(row, 'cache_read_available') === true && numeric(get(row, 'input_tokens', 'input')) > 0 ? (numeric(get(row, 'cache_read_tokens', 'cached_input_tokens', 'cache')) / numeric(get(row, 'input_tokens', 'input'))).toFixed(6) : '',
+      cache_read_input_tokens: get(row, 'cache_read_available') === true ? get(row, 'cache_read_input_tokens', 'input_tokens', 'input') : '',
+      cache_hit_rate: get(row, 'cache_read_available') === true && numeric(get(row, 'cache_read_input_tokens', 'input_tokens', 'input')) > 0 ? (numeric(get(row, 'cache_read_tokens', 'cached_input_tokens', 'cache')) / numeric(get(row, 'cache_read_input_tokens', 'input_tokens', 'input'))).toFixed(6) : '',
       cache_write_input_tokens: get(row, 'cache_write_available') === true ? get(row, 'cache_write_tokens', 'cache_write_input_tokens', 'cache_write') : '未提供',
       output_tokens: get(row, 'output_tokens', 'output'), reasoning_tokens: get(row, 'reasoning_output_tokens', 'reasoning_tokens', 'reasoning'), total_tokens: totalOf(row),
       request_duration_estimate_ms: get(row, 'request_duration_estimate_ms'),

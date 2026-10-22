@@ -94,7 +94,10 @@ class HermesSource:
             cached_input_tokens=int(raw['cache_read_tokens'] or 0),
             cache_write_input_tokens=int(raw['cache_write_tokens'] or 0),
             reasoning_output_tokens=int(raw['reasoning_tokens'] or 0),
-            total_tokens=int(raw['input_tokens'] or 0) + int(raw['output_tokens'] or 0),
+            # Hermes stores uncached input, cache read, and cache write as
+            # disjoint buckets. Reasoning is already included in output.
+            total_tokens=sum(int(raw[name] or 0) for name in (
+                'input_tokens', 'cache_read_tokens', 'cache_write_tokens', 'output_tokens')),
             cache_read_available=1, cache_write_available=1,
             speed_group_key=None, speed_output_tokens=0, speed_duration_ms=None,
             speed_exclusion_reason=EXCLUSION, ttft_ms=None,

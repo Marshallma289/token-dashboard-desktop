@@ -18,7 +18,7 @@ class HermesTokenTotalsTests(unittest.TestCase):
         self.source = self.root / 'state.db'
         make_hermes(self.source, input_tokens=1000, output_tokens=200,
                     cache_read_tokens=20000, cache_write_tokens=50,
-                    reasoning_tokens=80)
+                    reasoning_tokens=80, first_seen=1792686300.5)
         self.history = self.root / 'usage.db'
 
     def database(self):

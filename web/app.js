@@ -375,6 +375,7 @@
     const providerLabel = text(pick(item, 'provider_label', 'providerLabel', 'provider_name', 'providerName', 'vendor'), providerId || '未知供应商');
     return {
       sourceKind: text(item.source_kind),
+      dateAttribution: text(item.date_attribution),
       date: dateKey(pick(item, 'date', 'day', 'date_key', 'timestamp')) || fallbackDate,
       model: text(pick(item, 'model', 'model_name', 'modelName', 'model_id', 'modelId', 'name'), '未知模型'),
       provider: providerLabel,
@@ -530,6 +531,7 @@
     if (body.workspaces !== undefined) filterPayload.workspaces = body.workspaces;
     return {
       summary,
+      timeAttribution: body.time_attribution || {},
       requestMetrics: body.request_metrics || {},
       filters: normalizeFilters(filterPayload, source),
       pricing: body.pricing && typeof body.pricing === 'object' ? body.pricing : {},
@@ -748,6 +750,7 @@
   }
 
   function renderKpis(data) {
+    const timeAttribution = data.timeAttribution || {};
     const m = viewMetrics(data);
     const todayKey = data.localDate || dateKey(new Date());
     const todayRows = rowsForView(data.dailyModelUsage).filter(row => row.date === todayKey);
@@ -765,8 +768,8 @@
     const activeCost = state.costMode === 'before' ? m.costBefore : m.costAfter;
     const cards = [
       [`预估费用 USD · ${state.costMode === 'before' ? '折扣前' : '折扣后'}`, m.total > 0 && m.coverage === 0 ? '未计价' : formatCurrency(activeCost), costSub, activeCost, costDetails],
-      ['总 Token', formatCompact(m.total), 'Input + Output（Reasoning 为子集）', m.total],
-      ['今日 Token', formatCompact(today), todayRows.length ? `${todayRows.length} 条模型记录` : '今日暂无记录', today],
+      [timeAttribution.summary_incomplete ? '总 Token（已确认）' : '总 Token', formatCompact(m.total), timeAttribution.summary_incomplete ? '跨日累计未能完整归入当前范围' : '含 Hermes 独立缓存桶；Reasoning 为输出子集', m.total],
+      ['今日 Token', timeAttribution.today_incomplete ? '未完整' : formatCompact(today), timeAttribution.today_incomplete ? `已确认 ${formatNumber(today)} Token · 跨日累计未分日` : todayRows.length ? `${todayRows.length} 条模型记录` : '今日暂无记录', timeAttribution.today_incomplete ? '未完整' : today],
       ['请求数', formatCompact(m.requests), 'Hermes 按 API 调用次数计数', m.requests],
       ['活跃工作空间', formatNumber(m.active), '有请求记录的空间', m.active],
       ['模型 / 供应商', formatNumber(m.models), '去重后的组合数', m.models],
@@ -842,7 +845,7 @@
     markup += `<polygon points="${area}" fill="var(--accent-soft)" opacity=".8"/><polyline points="${points}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
     rows.forEach((row, index) => {
       const xx = x(index), yy = y(row[metricKey] || 0);
-      markup += `<circle cx="${xx}" cy="${yy}" r="4" fill="var(--surface)" stroke="var(--accent)" stroke-width="2"/><rect x="${xx - Math.max(8, plotWidth / rows.length / 2)}" y="${top}" width="${Math.max(16, plotWidth / rows.length)}" height="${plotHeight}" fill="transparent"><title>${dateLabel(row.date, true)}\n请求数：${formatNumber(row.requests)}\nToken：${formatNumber(row.tokens)}</title></rect>`;
+      markup += `<circle cx="${xx}" cy="${yy}" r="4" fill="var(--surface)" stroke="var(--accent)" stroke-width="2"/><rect x="${xx - Math.max(8, plotWidth / rows.length / 2)}" y="${top}" width="${Math.max(16, plotWidth / rows.length)}" height="${plotHeight}" fill="transparent"><title>${row.dateAttribution === 'undated_interval' ? '未分日' : dateLabel(row.date, true)}\n请求数：${formatNumber(row.requests)}\nToken：${formatNumber(row.tokens)}</title></rect>`;
     });
     const step = Math.max(1, Math.ceil(rows.length / 7));
     rows.forEach((row, index) => { if (index % step === 0 || index === rows.length - 1) markup += `<text class="chart-axis-label" x="${x(index)}" y="${height - 7}" text-anchor="middle">${htmlEscape(dateLabel(row.date))}</text>`; });
@@ -1036,7 +1039,7 @@
       const pricingTitle = row.pricingStatus === 'unpriced'
         ? (row.pricingNote || '未计价')
         : `${row.pricingModel || row.model}${row.pricingRateBand ? ` · ${row.pricingRateBand}` : ''}`;
-      return `<tr class="usage-summary-row" tabindex="0" role="button" aria-label="查看 ${htmlEscape(row.date)} ${htmlEscape(row.model)} ${htmlEscape(row.provider)} 的请求明细" data-source-kind="${htmlEscape(row.sourceKind || '')}" data-date="${htmlEscape(row.date)}" data-model="${htmlEscape(row.model)}" data-provider="${htmlEscape(row.providerId || row.provider)}" data-workspace="${htmlEscape(row.workspace || '')}"><td>${htmlEscape(dateLabel(row.date, true))}</td><td><strong title="${htmlEscape(row.model)}">${htmlEscape(row.model)}</strong></td><td><span class="provider-pill" title="${htmlEscape(row.provider)}">${htmlEscape(row.provider)}</span></td><td class="num">${htmlEscape(formatCompact(row.input))}</td><td class="num">${htmlEscape(formatCompact(row.output))}</td><td class="num">${htmlEscape(formatCompact(row.cache))}</td><td class="num">${htmlEscape(formatCompact(row.reasoning))}</td><td class="num"><strong title="${htmlEscape(formatNumber(row.total))}">${htmlEscape(formatCompact(row.total))}</strong></td><td class="num" title="${htmlEscape(pricingTitle)}">${cost}</td><td class="num">${htmlEscape(row.sourceKind === 'hermes' ? '不适用' : formatSpeed(row))}</td><td class="num">${htmlEscape(row.sourceKind === 'hermes' ? '不适用' : formatNumber(row.speedSampleCount))}</td><td class="num">${htmlEscape(formatCompact(row.requests))}</td></tr>`;
+      return `<tr class="usage-summary-row" tabindex="0" role="button" aria-label="查看 ${htmlEscape(row.date)} ${htmlEscape(row.model)} ${htmlEscape(row.provider)} 的请求明细" data-source-kind="${htmlEscape(row.sourceKind || '')}" data-date="${htmlEscape(row.date)}" data-model="${htmlEscape(row.model)}" data-provider="${htmlEscape(row.providerId || row.provider)}" data-workspace="${htmlEscape(row.workspace || '')}"><td>${htmlEscape(row.dateAttribution === 'undated_interval' ? '未分日' : dateLabel(row.date, true))}</td><td><strong title="${htmlEscape(row.model)}">${htmlEscape(row.model)}</strong></td><td><span class="provider-pill" title="${htmlEscape(row.provider)}">${htmlEscape(row.provider)}</span></td><td class="num">${htmlEscape(formatCompact(row.input))}</td><td class="num">${htmlEscape(formatCompact(row.output))}</td><td class="num">${htmlEscape(formatCompact(row.cache))}</td><td class="num">${htmlEscape(formatCompact(row.reasoning))}</td><td class="num"><strong title="${htmlEscape(formatNumber(row.total))}">${htmlEscape(formatCompact(row.total))}</strong></td><td class="num" title="${htmlEscape(pricingTitle)}">${cost}</td><td class="num">${htmlEscape(row.sourceKind === 'hermes' ? '不适用' : formatSpeed(row))}</td><td class="num">${htmlEscape(row.sourceKind === 'hermes' ? '不适用' : formatNumber(row.speedSampleCount))}</td><td class="num">${htmlEscape(formatCompact(row.requests))}</td></tr>`;
     }).join('');
     $('#tablePaginationSummary').textContent = rows.length
       ? `共 ${formatNumber(rows.length)} 条，每页 ${state.tablePageSize} 条 · 第 ${state.tablePage} / ${totalPages} 页`
@@ -1046,6 +1049,12 @@
   }
 
   function renderAll(data, options = {}) {
+    const timeAttribution = data.timeAttribution || {};
+    const timeNotice = $('#timeAttributionNotice');
+    if (timeNotice) {
+      timeNotice.textContent = timeAttribution.message || '';
+      timeNotice.hidden = !timeAttribution.message;
+    }
     const apiHint = $('#apiHint');
     if (apiHint) apiHint.textContent = data.dailyModelUsage.some(row => row.sourceKind === 'hermes' && /^(?:models\/)?(?:deepseek\/)?deepseek-/i.test(row.model))
       ? '未配置自定义规则时，DeepSeek 按官方参考价估算；中转站实际扣费可能因折扣/倍率不同而有差异，可在“价格规则”覆盖。'
@@ -1352,7 +1361,7 @@
       .sort((a, b) => b.date.localeCompare(a.date) || b.total - a.total)
       .map(row => ({
         source_kind: row.sourceKind,
-        date: row.date,
+        date: row.dateAttribution === 'undated_interval' ? '未分日' : row.date,
         model: row.model,
         provider: row.providerId,
         provider_label: row.provider,

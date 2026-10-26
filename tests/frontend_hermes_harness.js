@@ -77,4 +77,15 @@ if (process.argv.includes('--pricing')) {
   env.window.CodexDashboard.__renderTest({daily_model_usage:[]});
   assert.doesNotMatch(env.node('#apiHint').textContent, /DeepSeek/);
 }
+if (process.argv.includes('--time')) {
+  env.window.CodexDashboard.__renderTest({summary:{total_tokens:100001200},
+    daily_model_usage:[{date:'',date_attribution:'undated_interval',source_kind:'hermes',
+      model:'test',provider:'custom',total_tokens:100001200,request_count:7}],
+    time_attribution:{today_incomplete:true,summary_incomplete:false,unallocated_records:1,
+      message:'Hermes 有跨日累计记录，无法精确拆分每日用量。'},
+    request_metrics:{scope:'not_applicable'}});
+  assert.match(env.node('#kpiGrid').innerHTML,/今日 Token[^]*未完整/);
+  assert.match(env.node('#timeAttributionNotice').textContent,/跨日累计/);
+  assert.equal(env.node('#timeAttributionNotice').hidden,false);
+}
 console.log('Hermes frontend ' + (process.argv.includes('--pricing') ? 'pricing' : process.argv.includes('--semantics') ? 'semantics' : 'source filter') + ': OK');

@@ -223,6 +223,11 @@ class HermesAggregationTests(HermesScanTests):
         self.assertLessEqual(summary['cache_hit_rate'], 1.0)
 
     def test_weighted_counts_in_every_group_and_record_pagination(self):
+        # Daily weighting is meaningful only for an interval within one day.
+        writer = sqlite3.connect(self.source)
+        writer.execute('UPDATE session_model_usage SET first_seen=last_seen-300')
+        writer.commit()
+        writer.close()
         db = self.database()
         db.scan()
         data = db.dashboard(days=0)

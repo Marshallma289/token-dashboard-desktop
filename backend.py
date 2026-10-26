@@ -56,6 +56,8 @@ except (AttributeError, OSError):
 
 def safe_csv_row(row):
     """Keep text cells from being interpreted as spreadsheet formulas."""
+    if row.get('date_attribution') == 'undated_interval' and 'date' in row:
+        row = dict(row, date='未分日')
     return {key: ("'" + value if isinstance(value, str)
             and value.lstrip().startswith(("=", "+", "-", "@")) else value)
             for key, value in row.items()}
@@ -2523,6 +2525,27 @@ class DashboardDB:
                 raise
         return result
 
+    def _hermes_interval(self, row):
+        if row['source_kind'] != 'hermes':
+            return None
+        metadata = self._json_object(row['hermes_metadata'])
+        try:
+            first = _dt.datetime.fromtimestamp(float(metadata['first_seen']), self.timezone).date()
+            last = _dt.datetime.fromtimestamp(float(metadata['last_seen']), self.timezone).date()
+            return first, last
+        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+            return (None, None)
+
+    def _hermes_undated(self, row):
+        interval = self._hermes_interval(row)
+        return interval is not None and (interval[0] is None or interval[0] != interval[1])
+
+    def _limit_hermes_interval(self, where, params, start):
+        # last_seen is already bounded by the existing day predicate. A
+        # cumulative row is usable for a range only if its beginning fits too.
+        where.append("(source_kind <> 'hermes' OR CAST(json_extract(hermes_metadata, '$.first_seen') AS REAL) >= ?)")
+        params.append(_dt.datetime.combine(start, _dt.time.min, tzinfo=self.timezone).timestamp())
+
     def _fetch_rows(
         self,
         days: Optional[int],
@@ -2549,6 +2572,7 @@ class DashboardDB:
                 raise ValueError("start_date must not be after end_date")
             where.append("day >= ? AND day <= ?")
             params.extend((start.isoformat(), end.isoformat()))
+            self._limit_hermes_interval(where, params, start)
         elif days is not None and days > 0:
             today = self._local_now().date()
             cutoff = today - _dt.timedelta(days=days - 1)
@@ -2556,6 +2580,7 @@ class DashboardDB:
             # read before Python builds dashboard aggregates.
             where.append("day >= ? AND day <= ?")
             params.extend((cutoff.isoformat(), today.isoformat()))
+            self._limit_hermes_interval(where, params, cutoff)
         providers = self.catalog.resolve(provider)
         if providers:
             where.append("provider IN (%s)" % ",".join("?" for _ in providers))
@@ -2637,11 +2662,13 @@ class DashboardDB:
                 raise ValueError("start_date must not be after end_date")
             where.append("day >= ? AND day <= ?")
             params.extend((start.isoformat(), end.isoformat()))
+            self._limit_hermes_interval(where, params, start)
         elif days is not None and int(days) > 0:
             today = self._local_now().date()
             cutoff = today - _dt.timedelta(days=int(days) - 1)
             where.append("day >= ? AND day <= ?")
             params.extend((cutoff.isoformat(), today.isoformat()))
+            self._limit_hermes_interval(where, params, cutoff)
         providers = self.catalog.resolve(provider)
         if providers:
             where.append("provider IN (%s)" % ",".join("?" for _ in providers))
@@ -2723,6 +2750,7 @@ class DashboardDB:
             "request_id": str(row["request_id"]),
             "source_kind": row['source_kind'], "api_call_count": _request_weight(row),
             "record_kind": 'aggregate' if row['source_kind'] == 'hermes' else 'request',
+            "date_attribution": 'undated_interval' if self._hermes_undated(row) else 'day',
             **(self._json_object(row['hermes_metadata']) if row['source_kind'] == 'hermes' else {}),
             "timestamp": str(row["timestamp"]),
             "provider": str(row["provider"]),
@@ -3390,15 +3418,17 @@ class DashboardDB:
             workspace_key = str(row["workspace"])
             workspace_groups.setdefault(workspace_key, self._empty_metrics())
             self._add_metrics(workspace_groups[workspace_key], row, quote)
-            active_key = (str(row["day"]), int(row["hour"]))
-            active_groups.setdefault(active_key, self._empty_metrics())
-            self._add_metrics(active_groups[active_key], row, quote)
-            day_key = str(row["day"])
-            daily_groups.setdefault(day_key, self._empty_metrics())
-            self._add_metrics(daily_groups[day_key], row, quote)
+            undated = self._hermes_undated(row)
+            day_key = '' if undated else str(row["day"])
+            if not undated:
+                active_key = (day_key, int(row["hour"]))
+                active_groups.setdefault(active_key, self._empty_metrics())
+                self._add_metrics(active_groups[active_key], row, quote)
+                daily_groups.setdefault(day_key, self._empty_metrics())
+                self._add_metrics(daily_groups[day_key], row, quote)
             canonical = canonical_model(row["model"])
             model_key = (
-                str(row["day"]),
+                day_key,
                 str(row["provider"]),
                 self._provider_label(row),
                 canonical, str(row["source_kind"]),
@@ -3459,6 +3489,7 @@ class DashboardDB:
             )
             item = {
                 "date": day,
+                "date_attribution": 'day' if day else 'undated_interval',
                 "source_kind": kind,
                 "provider": provider_id,
                 "provider_label": provider_label,
@@ -3537,6 +3568,31 @@ class DashboardDB:
         if not effective_start and days is not None and days > 0:
             effective_end = self._local_now().date().isoformat()
             effective_start = (self._local_now().date() - _dt.timedelta(days=days - 1)).isoformat()
+        range_start = self._parse_local_date(effective_start) if effective_start else None
+        range_end = self._parse_local_date(effective_end) if effective_end else None
+        today = self._local_now().date()
+        uncertain = []
+        summary_incomplete = today_incomplete = False
+        candidates = rows if not range_start else (self._fetch_rows(0, provider, workspace, model, source_kind=source_kind) if source_kind != 'codex' else [])
+        for row in candidates:
+            if not self._hermes_undated(row):
+                continue
+            first, last = self._hermes_interval(row)
+            if first is not None and ((range_start and last < range_start) or (range_end and first > range_end)):
+                continue
+            uncertain.append(row)
+            if range_start and (first is None or first < range_start or last > range_end):
+                summary_incomplete = True
+            if (not range_start or range_start <= today <= range_end) and (first is None or first <= today <= last):
+                today_incomplete = True
+        time_attribution = {
+            'unallocated_records': len(uncertain),
+            'unallocated_interval_tokens': sum(int(r['total_tokens']) for r in uncertain),
+            'summary_incomplete': summary_incomplete,
+            'today_incomplete': today_incomplete,
+            'message': ('Hermes 有跨日累计记录，无法精确拆分每日用量；按日图表不计入这些记录。'
+                        + (' 当前范围仅显示可确认用量，实际用量未完整。' if summary_incomplete else ' 累计总量保留，明细标为“未分日”。')) if uncertain else '',
+        }
         comparison = None
         if compare and effective_start and effective_end:
             current_start = self._parse_local_date(effective_start)
@@ -3578,6 +3634,7 @@ class DashboardDB:
                 'excluded_request_count': sum(_request_weight(r) for r in rows if r['source_kind'] == 'hermes'),
             },
             "summary": summary_aliases,
+            "time_attribution": time_attribution,
             "speed_exclusions": dict(summary_aliases["speed_exclusions"]),
             "comparison": comparison,
             "pricing": pricing_metadata,

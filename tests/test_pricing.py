@@ -41,6 +41,36 @@ class PricingCatalogTests(unittest.TestCase):
         self.assertEqual(metadata["gpt-6-sol"]["short_context"]["input"], 2.0)
         self.assertEqual(metadata["gpt-6-luna"]["short_context"]["output"], 0.5)
 
+    def test_gpt_6_1_terra_rates_and_long_context(self):
+        standard = self.pricing.quote(
+            "gpt-6.1-terra", timestamp="2026-10-27T00:00:00Z",
+            input_tokens=100_000, cached_input_tokens=10_000,
+            cache_write_input_tokens=10_000, output_tokens=20_000,
+        )
+        self.assertTrue(standard.is_priced)
+        self.assertEqual(standard.rate_band, "standard")
+        self.assertAlmostEqual(standard.estimated_cost_usd, 0.193, places=10)
+        long_context = self.pricing.quote(
+            "gpt-6.1-terra", timestamp="2026-10-27T00:00:00Z",
+            input_tokens=272_001, cached_input_tokens=10_000,
+            cache_write_input_tokens=10_000, output_tokens=20_000,
+        )
+        self.assertEqual(long_context.rate_band, "long_context")
+        self.assertAlmostEqual(long_context.estimated_cost_usd, 0.680002, places=10)
+        rates = {item["model"]: item for item in self.pricing.metadata()["models"]}["gpt-6.1-terra"]
+        self.assertEqual(rates["short_context"], {"input": 1.0, "cached_input": 0.05, "cache_write": 1.25, "output": 5.0})
+        self.assertEqual(rates["long_context"], {"input": 2.0, "cached_input": 0.1, "cache_write": 2.5, "output": 7.5})
+
+    def test_gpt_6_1_sol_uses_standard_rates_above_272k(self):
+        quote = self.pricing.quote(
+            "gpt-6.1-sol", timestamp="2026-10-27T00:00:00Z",
+            input_tokens=272_001, cached_input_tokens=10_000,
+            cache_write_input_tokens=10_000, output_tokens=20_000,
+        )
+        self.assertEqual(quote.rate_band, "standard")
+        self.assertIn("surcharges are not included", quote.note)
+        self.assertAlmostEqual(quote.estimated_cost_usd, 0.730002, places=10)
+
     def test_openai_token_classes_are_priced_separately(self):
         quote = self.pricing.quote(
             "gpt-5.6-sol",

@@ -51,15 +51,13 @@ def main():
         installer = Path(__file__).resolve().parent / name
         assert installer.is_file(), 'Both terminal installers are required'
         upload_files.append(installer)
-    release_body = '''本次更新改进仪表盘可视化与自动刷新，并保护本机个性化设置。
+    release_body = """本次更新完善 GPT-6.1 模型的费用估算。
 
-- 优化 Token 统计卡片、缓存命中率、费用趋势和模型对比；缓存命中率仅按日志提供缓存字段的样本计算，为“缓存读取 Token ÷ Input Token”（Input 包含缓存读取），并展示样本覆盖情况。
-- 新增会话汇总与请求上下文窗口可视化。窗口占用只在日志提供可关联的上下文容量和输入 Token 快照时显示；数据不足时不会假设模型容量。
-- 修复新用量未自动出现在页面的问题，增加实时通知漏失时每 30 秒读取一次的兜底与失败重试。
-- 更新后保留已调整的模块顺序和尺寸；布局读取失败时不会用默认值覆盖本机设置。
-- 清理已停用的界面样式与重复刷新分支。
+- 新增 GPT-6.1 Terra 标准及长上下文参考价格，包含缓存读取与 30 分钟缓存写入。
+- GPT-6.1 Sol 在看板中统一使用普通档价格估算。OpenAI 官方对超过 272K 输入的请求仍有长上下文加价，实际 API 账单可能高于看板估算。
+- 历史已冻结价格不会自动改变，可在软件中按需重新计价。
 
-Windows x64 与 Apple Silicon macOS arm64 共用源码。支持终端一键安装，无需 Python、手动解压或管理员权限；安装命令见仓库 README。统计数据库与个人设置会保留，更新失败可恢复旧程序。macOS 要求 14 或更新版本，当前采用临时签名，未公证。'''
+Windows x64 与 Apple Silicon macOS arm64 共用源码。安装命令见仓库 README；macOS 要求 14 或更新版本，当前采用临时签名，未公证。"""
     release = request('/releases', method='POST', data={'tag_name': tag, 'target_commitish': commit, 'name': f'Codex Token {version} · Build {number}', 'draft': True, 'prerelease': False, 'body': release_body})
     upload_url = release['upload_url'].split('{', 1)[0]
     for file in upload_files:

@@ -20,6 +20,8 @@ QWEN_PRICING_URL = "https://www.alibabacloud.com/help/en/model-studio/model-pric
 XIAOMI_PRICING_URL = "https://xiaomimimo.com"
 TOKENS_PER_MILLION = 1_000_000
 OPENAI_LONG_CONTEXT_THRESHOLD = 272_000
+SOL_FLAT_RATE_NOTE = ("GPT-6.1 Sol uses standard rates at all context lengths in this catalog; "
+                      "official API long-context surcharges are not included.")
 
 
 @dataclass(frozen=True)
@@ -66,9 +68,14 @@ OPENAI_RATES: Dict[str, Tuple[TokenRates, Optional[TokenRates]]] = {
         TokenRates(10.0, 1.0, 12.5, 50.0),
         TokenRates(20.0, 2.0, 25.0, 75.0),
     ),
+    "gpt-6.1-terra": (
+        TokenRates(1.0, 0.05, 1.25, 5.0),
+        TokenRates(2.0, 0.1, 2.5, 7.5),
+    ),
+    # User-selected flat estimate; official API pricing has a long-context surcharge.
     "gpt-6.1-sol": (
         TokenRates(2.0, 0.1, 2.5, 10.0),
-        TokenRates(4.0, 0.2, 5.0, 15.0),
+        None,
     ),
     "gpt-6-sol": (
         TokenRates(2.0, 0.2, 2.5, 10.0),
@@ -512,6 +519,7 @@ class PricingCatalog:
                 cache_write_input_tokens=cache_write_input_tokens, output_tokens=output_tokens,
                 rate_band=band, source_url=OPENAI_PRICING_URL,
                 effective_at=f"{PRICING_REFERENCE_DATE}T00:00:00Z",
+                note=SOL_FLAT_RATE_NOTE if pricing_model == "gpt-6.1-sol" else None,
             )
 
         deepseek_rates = DEEPSEEK_RATES.get(pricing_model)
@@ -641,6 +649,7 @@ class PricingCatalog:
                     else None
                 ),
                 "source": OPENAI_PRICING_URL,
+                "note": SOL_FLAT_RATE_NOTE if model == "gpt-6.1-sol" else None,
             }
             for model, (short, long) in OPENAI_RATES.items()
         ]

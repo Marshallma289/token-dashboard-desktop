@@ -22,6 +22,8 @@ TOKENS_PER_MILLION = 1_000_000
 OPENAI_LONG_CONTEXT_THRESHOLD = 272_000
 SOL_FLAT_RATE_NOTE = ("GPT-6.1 Sol uses standard rates at all context lengths in this catalog; "
                       "official API long-context surcharges are not included.")
+GPT_62_FLAT_RATE_NOTE = ("GPT-6.2 uses standard rates at all context lengths in this catalog; "
+                         "official API long-context surcharges are not included.")
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,9 @@ class Quote:
 
 
 OPENAI_RATES: Dict[str, Tuple[TokenRates, Optional[TokenRates]]] = {
+    # User-selected flat estimate; official API pricing has a long-context surcharge.
+    "gpt-6.2-astra": (TokenRates(8.0, 0.4, 10.0, 40.0), None),
+    "gpt-6.2-sol": (TokenRates(2.0, 0.1, 2.5, 10.0), None),
     # 1M context models use 272K input tokens as the tier boundary.
     "gpt-6-astra": (
         TokenRates(10.0, 1.0, 12.5, 50.0),
@@ -103,6 +108,12 @@ OPENAI_RATES: Dict[str, Tuple[TokenRates, Optional[TokenRates]]] = {
         TokenRates(1.75, 0.175, 1.75, 14.0),
         None,
     ),
+}
+
+FLAT_RATE_NOTES = {
+    "gpt-6.1-sol": SOL_FLAT_RATE_NOTE,
+    "gpt-6.2-astra": GPT_62_FLAT_RATE_NOTE,
+    "gpt-6.2-sol": GPT_62_FLAT_RATE_NOTE,
 }
 
 
@@ -518,8 +529,9 @@ class PricingCatalog:
                 input_tokens=input_tokens, cached_input_tokens=cached_input_tokens,
                 cache_write_input_tokens=cache_write_input_tokens, output_tokens=output_tokens,
                 rate_band=band, source_url=OPENAI_PRICING_URL,
-                effective_at=f"{PRICING_REFERENCE_DATE}T00:00:00Z",
-                note=SOL_FLAT_RATE_NOTE if pricing_model == "gpt-6.1-sol" else None,
+                effective_at=("2026-11-18T00:00:00Z" if pricing_model in ("gpt-6.2-astra", "gpt-6.2-sol")
+                              else f"{PRICING_REFERENCE_DATE}T00:00:00Z"),
+                note=FLAT_RATE_NOTES.get(pricing_model),
             )
 
         deepseek_rates = DEEPSEEK_RATES.get(pricing_model)
@@ -649,7 +661,7 @@ class PricingCatalog:
                     else None
                 ),
                 "source": OPENAI_PRICING_URL,
-                "note": SOL_FLAT_RATE_NOTE if model == "gpt-6.1-sol" else None,
+                "note": FLAT_RATE_NOTES.get(model),
             }
             for model, (short, long) in OPENAI_RATES.items()
         ]

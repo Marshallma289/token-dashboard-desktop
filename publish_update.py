@@ -51,10 +51,10 @@ def main():
         installer = Path(__file__).resolve().parent / name
         assert installer.is_file(), 'Both terminal installers are required'
         upload_files.append(installer)
-    release_body = """本次更新完善 GPT-6.1 模型的费用估算。
+    release_body = """本次更新新增 GPT-6.2 模型的费用估算。
 
-- 新增 GPT-6.1 Terra 标准及长上下文参考价格，包含缓存读取与 30 分钟缓存写入。
-- GPT-6.1 Sol 在看板中统一使用普通档价格估算。OpenAI 官方对超过 272K 输入的请求仍有长上下文加价，实际 API 账单可能高于看板估算。
+- 新增 GPT-6.2 Astra 和 GPT-6.2 Sol 的普通档参考价格，包含缓存读取与 30 分钟缓存写入。
+- GPT-6.2 在看板中统一使用普通档价格估算。OpenAI 官方对超过 272K 输入的请求仍有长上下文加价，实际 API 账单可能高于看板估算。
 - 历史已冻结价格不会自动改变，可在软件中按需重新计价。
 
 Windows x64 与 Apple Silicon macOS arm64 共用源码。安装命令见仓库 README；macOS 要求 14 或更新版本，当前采用临时签名，未公证。"""

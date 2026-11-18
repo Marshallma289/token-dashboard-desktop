@@ -71,6 +71,28 @@ class PricingCatalogTests(unittest.TestCase):
         self.assertIn("surcharges are not included", quote.note)
         self.assertAlmostEqual(quote.estimated_cost_usd, 0.730002, places=10)
 
+    def test_gpt_6_2_rates_are_flat_at_all_context_lengths(self):
+        models = {
+            "gpt-6.2-astra": (8.0, 0.4, 10.0, 40.0),
+            "gpt-6.2-sol": (2.0, 0.1, 2.5, 10.0),
+        }
+        metadata = {item["model"]: item for item in self.pricing.metadata()["models"]}
+        for model, (input_rate, cached_rate, write_rate, output_rate) in models.items():
+            with self.subTest(model=model):
+                for total in (272_000, 272_001):
+                    quote = self.pricing.quote(model, timestamp="2026-11-18T00:00:00Z", input_tokens=total,
+                        cached_input_tokens=10_000, cache_write_input_tokens=10_000,
+                        output_tokens=20_000)
+                    expected = ((total - 20_000) * input_rate + 10_000 * cached_rate
+                                + 10_000 * write_rate + 20_000 * output_rate) / 1_000_000
+                    self.assertEqual(quote.rate_band, "standard")
+                    self.assertAlmostEqual(quote.estimated_cost_usd, expected, places=10)
+                    self.assertIn("surcharges are not included", quote.note)
+                self.assertEqual(metadata[model]["short_context"], {
+                    "input": input_rate, "cached_input": cached_rate,
+                    "cache_write": write_rate, "output": output_rate})
+                self.assertIsNone(metadata[model]["long_context"])
+
     def test_openai_token_classes_are_priced_separately(self):
         quote = self.pricing.quote(
             "gpt-5.6-sol",

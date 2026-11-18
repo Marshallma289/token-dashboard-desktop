@@ -240,7 +240,7 @@ python backend.py serve --db work/hermes-usage.sqlite3 --root work/empty-codex -
 | Qwen | 使用 Alibaba Cloud Model Studio 国际站参考价 |
 | Xiaomi MiMo | 使用价格表中的参考价；未单列缓存写入价格时按普通输入估算 |
 
-GPT-6.1 Sol 在本看板中按普通档估算所有上下文长度，不包含 OpenAI 官方超过 272K 输入时的长上下文加价；实际 API 账单可能更高。
+GPT-6.1 Sol、GPT-6.2 Astra 和 GPT-6.2 Sol 在本看板中按普通档估算所有上下文长度，不包含 OpenAI 官方超过 272K 输入时的长上下文加价；实际 API 账单可能更高。
 
 模型名按已配置别名归一化，例如 `deepseek/deepseek-flash` 并入 `deepseek-flash`；原始名称保留在 API 的 `source_models` 字段中。不会将任意带前缀的名称自动认作已知模型。
 

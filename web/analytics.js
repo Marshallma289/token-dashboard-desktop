@@ -382,33 +382,48 @@
     }
     const values = rows.map(row => available(row) ? value(row) : null);
     const max = Math.max(...values, monetaryMetric ? .000001 : 1);
-    const width = Math.max(host.clientWidth || 680, 280), height = 240, left = monetaryMetric ? 72 : 52, right = 24, top = 18, bottom = 34;
-    const plotWidth = width - left - right, plotHeight = height - top - bottom;
-    const x = index => rows.length === 1 ? left + plotWidth / 2 : left + index * plotWidth / (rows.length - 1);
-    const y = amount => top + plotHeight - amount / max * plotHeight;
-    let svg = `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img" aria-label="每日${esc(metricName)}趋势"><title>每日${esc(metricName)}趋势</title>`;
-    [0, .5, 1].forEach(ratio => { const yy = y(max * ratio); svg += `<line class="chart-grid-line" x1="${left}" y1="${yy}" x2="${width - right}" y2="${yy}"/><text class="chart-axis-label" x="${left - 7}" y="${yy + 3}" text-anchor="end">${esc(monetaryMetric ? currency(max * ratio) : compact(max * ratio))}</text>`; });
-    const points = rows.filter(available).map((row) => { const index = rows.indexOf(row); return `${x(index).toFixed(1)},${y(value(row)).toFixed(1)}`; }).join(' ');
-    if (rows.every(available)) svg += `<polygon points="${left},${top + plotHeight} ${points} ${x(rows.length - 1)},${top + plotHeight}" fill="var(--accent)" opacity=".08"/>`;
-    const segments = []; let segment = [];
-    rows.forEach((row, index) => { if (available(row)) segment.push(`${x(index)},${y(value(row))}`); else if (segment.length) { segments.push(segment.join(' ')); segment = []; } });
-    if (segment.length) segments.push(segment.join(' '));
-    segments.forEach(line => { svg += `<polyline points="${line}" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>`; });
-    rows.forEach((row, index) => {
-      if (!available(row)) return;
-      const amount = value(row);
-      const cacheRate = cacheMetrics.calculateRate({ cachedTokens: row.cache, cacheReadInputTokens: row.cacheInput, denominatorProvided: row.cacheInputKnown });
-      const tip = `${dateLabel(row.date)} · ${metricName}: ${monetaryMetric ? currency(amount) : number(amount)}${cacheRate === null ? '' : ` · 缓存占比 ${cachePercent(cacheRate, true)}`}`;
-      svg += `<circle cx="${x(index)}" cy="${y(amount)}" r="3.5" fill="var(--surface)" stroke="var(--accent)" stroke-width="2"><title>${esc(tip)}</title></circle>`;
-      const step = Math.max(1, Math.ceil(rows.length / 8));
-      if (index % step === 0 || index === rows.length - 1) svg += `<text class="chart-axis-label" x="${x(index)}" y="${height - 8}" text-anchor="middle">${esc(row.date.slice(5))}</text>`;
-    });
-    svg += '</svg>';
     const formatValue = amount => monetaryMetric ? currency(amount) : number(amount);
     const sum = values.reduce((a, b) => a + (b || 0), 0);
     const peak = Math.max(...values);
     const peakRow = rows[values.indexOf(peak)];
     $('#trendSummary').innerHTML = `<div><span>区间合计 · ${esc(metricName)}</span><strong>${esc(formatValue(sum))}</strong></div><div><span>单日峰值 · ${esc(peakRow.date)}</span><strong>${esc(formatValue(peak))}</strong></div><div><span>有记录的日期</span><strong>${number(rows.length)} <small>天</small></strong></div>`;
+    const width = Math.max(host.clientWidth || 680, 280);
+    const height = window.innerHeight <= 720 ? 190 : window.innerHeight <= 800 ? 220 : 256;
+    const left = monetaryMetric ? 72 : 52, right = 24, top = 18, bottom = 34;
+    const plotWidth = width - left - right, plotHeight = height - top - bottom;
+    const x = index => rows.length === 1 ? left + plotWidth / 2 : left + index * plotWidth / (rows.length - 1);
+    const y = amount => top + plotHeight - amount / max * plotHeight;
+    let svg = `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img" aria-label="每日${esc(metricName)}趋势"><title>每日${esc(metricName)}趋势</title>
+      <defs>
+        <linearGradient id="overview-trend-stroke" gradientUnits="userSpaceOnUse" x1="${left}" x2="${width - right}">
+          <stop offset="0%" stop-color="var(--signal-start)"/>
+          <stop offset="100%" stop-color="var(--signal-end)"/>
+        </linearGradient>
+        <linearGradient id="overview-trend-fill" x1="0%" y1="0%" x2="0%" y2="100%">
+        <stop offset="0%" stop-color="var(--signal-end)" stop-opacity=".29"/>
+        <stop offset="100%" stop-color="var(--signal-start)" stop-opacity=".02"/>
+      </linearGradient></defs>`;
+    [0, .5, 1].forEach(ratio => { const yy = y(max * ratio); svg += `<line class="chart-grid-line" x1="${left}" y1="${yy}" x2="${width - right}" y2="${yy}"/><text class="chart-axis-label" x="${left - 7}" y="${yy + 3}" text-anchor="end">${esc(monetaryMetric ? currency(max * ratio) : compact(max * ratio))}</text>`; });
+    const points = rows.filter(available).map((row) => { const index = rows.indexOf(row); return `${x(index).toFixed(1)},${y(value(row)).toFixed(1)}`; }).join(' ');
+    if (rows.every(available)) svg += `<polygon points="${left},${top + plotHeight} ${points} ${x(rows.length - 1)},${top + plotHeight}" fill="url(#overview-trend-fill)"/>`;
+    const segments = []; let segment = [];
+    rows.forEach((row, index) => { if (available(row)) segment.push(`${x(index)},${y(value(row))}`); else if (segment.length) { segments.push(segment.join(' ')); segment = []; } });
+    if (segment.length) segments.push(segment.join(' '));
+    segments.forEach(line => { svg += `<polyline class="trend-trace" points="${line}" fill="none" stroke="url(#overview-trend-stroke)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>`; });
+    const dateTicks = window.CodexDashboard.dateTickIndexes(rows.length, plotWidth, 8);
+    rows.forEach((row, index) => {
+      if (dateTicks.has(index)) svg += `<text class="chart-axis-label" x="${x(index)}" y="${height - 8}" text-anchor="middle">${esc(row.date.slice(5))}</text>`;
+      if (!available(row)) return;
+      const amount = value(row);
+      const cacheRate = cacheMetrics.calculateRate({ cachedTokens: row.cache, cacheReadInputTokens: row.cacheInput, denominatorProvided: row.cacheInputKnown });
+      const tip = `${dateLabel(row.date)} · ${metricName}: ${monetaryMetric ? currency(amount) : number(amount)}${cacheRate === null ? '' : ` · 缓存占比 ${cachePercent(cacheRate, true)}`}`;
+      const isPeak = row === peakRow;
+      if (isPeak) {
+        svg += `<circle cx="${x(index)}" cy="${y(amount)}" r="9" fill="none" stroke="var(--signal-peak)" opacity=".55" pointer-events="none" aria-hidden="true"/>`;
+      }
+      svg += `<circle cx="${x(index)}" cy="${y(amount)}" r="${isPeak ? 4.5 : 3.5}" fill="var(--surface)" stroke="${isPeak ? 'var(--signal-peak)' : 'url(#overview-trend-stroke)'}" stroke-width="2"><title>${esc(tip)}</title></circle>`;
+    });
+    svg += '</svg>';
     host.innerHTML = svg + `<details class="chart-data"><summary>查看每日数据</summary><div class="table-wrap"><table><caption class="sr-only">每日${esc(metricName)}趋势数据</caption><thead><tr><th scope="col">日期</th><th scope="col" class="num">${esc(metricName)}</th></tr></thead><tbody>${rows.map(row => `<tr><td>${esc(row.date)}</td><td class="num">${esc((available(row) ? formatValue(value(row)) : '未计价'))}</td></tr>`).join('')}</tbody></table></div></details>`;
     if (window.CodexDashboard && window.CodexDashboard.enhanceChartTooltips) window.CodexDashboard.enhanceChartTooltips();
     $('#trendMetricNote').textContent = metric === 'cost' ? `费用趋势按${currentCostLabel()}显示；未计价记录不计入费用。` : metric === 'cache' ? '缓存趋势按可用的缓存读取 Token 汇总。' : metric === 'cache_savings' ? `缓存节省按${currentCostLabel()}显示，并依赖缓存单价配置。` : `当前显示每日${metricName}。`;

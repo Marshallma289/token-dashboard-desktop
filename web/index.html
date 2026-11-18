@@ -12,15 +12,21 @@
 <body data-theme="light">
   <a class="skip-link" href="#main">跳到主要内容</a>
   <div class="app-shell">
-    <header class="topbar">
+    <aside class="app-sidebar">
       <div class="brand-block">
         <div class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3-5 4 10 3-5h4"/></svg></div>
-        <div>
-          <h1>Codex Token <span>实时看板</span></h1>
-          <p>每一次调用，都清晰可见。</p>
+        <div class="brand-name">
+          <span class="brand-title">Codex Token</span>
+          <span class="brand-title-local">实时看板</span>
         </div>
       </div>
-      <div class="topbar-actions">
+      <nav id="workspaceNavigation" class="primary-tabs" role="tablist" aria-label="看板页面" aria-orientation="vertical">
+        <button id="viewTabOverview" class="app-tab is-selected" type="button" role="tab" aria-selected="true" aria-controls="view-overview" tabindex="0" data-view="overview"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z"/></svg><span>总览</span></button>
+        <button id="viewTabTrends" class="app-tab" type="button" role="tab" aria-selected="false" aria-controls="view-trends" tabindex="-1" data-view="trends"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v16h16M7 15l4-4 4 2 5-6"/></svg><span>趋势分析</span></button>
+        <button id="viewTabUsage" class="app-tab" type="button" role="tab" aria-selected="false" aria-controls="view-usage" tabindex="-1" data-view="usage"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h14v18H5zM8 7h8M8 12h8M8 16h5"/></svg><span>用量明细</span></button>
+        <button id="viewTabPricing" class="app-tab" type="button" role="tab" aria-selected="false" aria-controls="view-pricing" tabindex="-1" data-view="pricing"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h14M9 5v4M15 10v4M11 15v4"/></svg><span>价格与数据</span></button>
+      </nav>
+      <div class="sidebar-footer">
         <div class="status-cluster" aria-label="服务状态">
           <div id="scanBadge" class="connection-badge is-connecting" role="status" aria-live="polite" title="正在检查扫描服务状态">
             <span class="status-dot" aria-hidden="true"></span>
@@ -32,29 +38,37 @@
           </div>
         </div>
         <span id="lastUpdated" class="updated-text">等待数据</span>
-        <button id="updateButton" class="reset-button update-button" type="button" aria-haspopup="dialog" aria-controls="updateDialog" hidden>检查更新</button>
-        <button id="dataSettingsButton" class="reset-button data-settings-button" type="button" aria-haspopup="dialog" aria-controls="dataSettingsDialog" hidden>数据管理</button>
-        <button id="exportButton" class="export-button" type="button" title="导出当前筛选的每日模型用量">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 17v3h14v-3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          <span>导出 CSV</span>
-        </button>
-        <button id="refreshButton" class="icon-button" type="button" title="立即刷新" aria-label="立即刷新数据">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-14.8-3.8L3 10m0 0V5m0 5h5M4 13a8.1 8.1 0 0 0 14.8 3.8L21 14m0 0v5m0-5h-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </button>
-        <button id="themeButton" class="icon-button" type="button" title="切换深浅色主题" aria-label="切换深浅色主题">
-          <svg class="theme-icon sun-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 2v2.2M12 19.8V22M4.9 4.9l1.55 1.55m11.1 11.1 1.55 1.55M2 12h2.2m15.6 0H22M4.9 19.1l1.55-1.55m11.1-11.1 1.55-1.55" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
-          <svg class="theme-icon moon-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.3 15.4A8.6 8.6 0 0 1 8.6 3.7 8.7 8.7 0 1 0 20.3 15.4Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
-        </button>
+        <span class="version-tag" id="appVersion"></span>
       </div>
-    </header>
-
+    </aside>
     <main id="main" tabindex="-1">
-      <div class="overview-heading"><div><h2>用量看板<span class="version-tag" id="appVersion">—</span></h2><p>统一查看消耗、趋势、明细和价格规则。</p></div><a class="detail-link" href="#detailTitle">查看用量明细 <span aria-hidden="true">↗</span></a></div>
+      <header class="workspace-header">
+        <h1 id="dashboardPageTitle">用量总览</h1>
+        <div class="topbar-actions">
+          <button id="layoutEditButton" class="reset-button layout-edit-button" type="button" aria-pressed="false" aria-controls="layoutToolbar" title="拖动模块排序，调整宽度和高度；布局保存在本机"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h18v18H3zM3 9h18M10 9v12"/></svg><span id="layoutEditLabel">编辑布局</span></button>
+          <button id="updateButton" class="reset-button update-button" type="button" aria-haspopup="dialog" aria-controls="updateDialog" hidden>检查更新</button>
+          <button id="dataSettingsButton" class="reset-button data-settings-button" type="button" aria-haspopup="dialog" aria-controls="dataSettingsDialog" hidden>数据管理</button>
+          <button id="refreshButton" class="icon-button" type="button" title="立即刷新" aria-label="立即刷新数据">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-14.8-3.8L3 10m0 0V5m0 5h5M4 13a8.1 8.1 0 0 0 14.8 3.8L21 14m0 0v5m0-5h-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <button id="themeButton" class="icon-button" type="button" title="切换深浅色主题" aria-label="切换深浅色主题">
+            <svg class="theme-icon sun-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 2v2.2M12 19.8V22M4.9 4.9l1.55 1.55m11.1 11.1 1.55 1.55M2 12h2.2m15.6 0H22M4.9 19.1l1.55-1.55m11.1-11.1 1.55-1.55" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+            <svg class="theme-icon moon-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.3 15.4A8.6 8.6 0 0 1 8.6 3.7 8.7 8.7 0 1 0 20.3 15.4Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+          </button>
+          <button id="exportButton" class="export-button" type="button" aria-label="导出 CSV" title="导出当前筛选的每日模型用量">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 17v3h14v-3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>导出 CSV</span>
+          </button>
+        </div>
+      </header>
 
       <section class="control-panel global-filter-panel" aria-label="全局筛选">
-        <div class="filter-row filter-row-main">
-          <div class="control-group range-group">
+        <div class="filter-toolbar">
+          <div class="filter-period">
             <span class="control-label">时间范围</span>
+            <p id="rangeDescription" aria-live="polite">过去 30 天，截止今日</p>
+          </div>
+          <div class="control-group range-group">
             <div id="rangeControls" class="segmented-control" role="group" aria-label="时间范围">
               <button type="button" data-range="1">1 天</button>
               <button type="button" data-range="7">7 天</button>
@@ -63,29 +77,37 @@
               <button type="button" data-range="all">全部</button>
             </div>
           </div>
-          <div class="control-group custom-range-group">
-            <span class="control-label">自定义日期（含首尾）</span>
-            <div class="date-range-fields"><input id="customStartDate" type="date" aria-label="开始日期"><span>至</span><input id="customEndDate" type="date" aria-label="结束日期"><button id="applyCustomRange" class="reset-button" type="button">应用</button></div>
-          </div>
-          <div class="control-group">
-            <span class="control-label">快捷范围</span>
-            <div class="segmented-control quick-range-controls"><button id="rangeThisWeek" type="button">本周</button><button id="rangeThisMonth" type="button">本月</button></div>
-          </div>
-          <div class="control-group">
-            <span class="control-label">费用显示</span>
-            <div id="costModeControls" class="segmented-control" role="group" aria-label="费用显示模式"><button type="button" data-cost-mode="before">折扣前</button><button type="button" data-cost-mode="after">折扣后</button></div>
-          </div>
-        </div>
-        <div class="filter-row filter-row-selects">
           <label class="control-group select-group" for="sourceKindFilter"><span class="control-label">数据源</span><select id="sourceKindFilter" aria-label="按数据源筛选"><option value="all">全部</option><option value="codex">Codex</option><option value="hermes">Hermes</option></select></label>
-          <label class="control-group select-group" for="providerFilter"><span class="control-label">供应商</span><select id="providerFilter" aria-label="按供应商筛选"><option value="all">全部供应商</option></select></label>
-          <label class="control-group select-group" for="workspaceFilter"><span class="control-label">工作空间</span><select id="workspaceFilter" aria-label="按工作空间筛选"><option value="all">全部工作空间</option></select></label>
-          <div class="filter-model-actions">
+          <button id="advancedFiltersButton" class="reset-button advanced-filters-button" type="button" aria-expanded="false" aria-controls="advancedFilters">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M7 12h10M10 18h4"/></svg>
+            <span>筛选</span><span id="activeFiltersCount" class="filter-count" hidden></span>
+          </button>
+        </div>
+        <div id="advancedFilters" class="advanced-filters" hidden>
+          <div class="advanced-dates">
+            <div class="control-group custom-range-group">
+              <span class="control-label">自定义日期（含首尾）</span>
+              <div class="date-range-fields"><input id="customStartDate" type="date" aria-label="开始日期"><span>至</span><input id="customEndDate" type="date" aria-label="结束日期"><button id="applyCustomRange" class="reset-button" type="button">应用</button></div>
+            </div>
+            <div class="control-group">
+              <span class="control-label">快捷范围</span>
+              <div class="segmented-control quick-range-controls"><button id="rangeThisWeek" type="button">本周</button><button id="rangeThisMonth" type="button">本月</button></div>
+            </div>
+            <div class="control-group">
+              <span class="control-label">费用显示</span>
+              <div id="costModeControls" class="segmented-control" role="group" aria-label="费用显示模式"><button type="button" data-cost-mode="before">折扣前</button><button type="button" data-cost-mode="after">折扣后</button></div>
+            </div>
+          </div>
+          <div class="advanced-selects">
+            <label class="control-group select-group" for="providerFilter"><span class="control-label">供应商</span><select id="providerFilter" aria-label="按供应商筛选"><option value="all">全部供应商</option></select></label>
+            <label class="control-group select-group" for="workspaceFilter"><span class="control-label">工作空间</span><select id="workspaceFilter" aria-label="按工作空间筛选"><option value="all">全部工作空间</option></select></label>
             <label class="control-group select-group" for="modelFilter"><span class="control-label">模型</span><select id="modelFilter" aria-label="按模型筛选"><option value="all">全部模型</option></select></label>
+          </div>
+          <div class="filter-footnote">
+            <p>筛选应用于各页面、导出和历史重算。日期起止日均包含。</p>
             <button id="resetFilters" class="reset-button filter-reset" type="button">重置筛选</button>
           </div>
         </div>
-        <div class="filter-footnote"><p id="rangeDescription" aria-live="polite">过去 30 天，截止今日</p><p>日期起止日均包含；筛选同步应用于各页面、明细、导出和历史重算。</p></div>
         <p id="timeAttributionNotice" class="panel-description" role="status" aria-live="polite" hidden></p>
       </section>
 
@@ -95,15 +117,6 @@
         <button id="retryButton" type="button">重试</button>
       </div>
 
-      <div class="view-toolbar">
-      <nav class="primary-tabs" role="tablist" aria-label="看板页面">
-        <button id="viewTabOverview" class="app-tab is-selected" type="button" role="tab" aria-selected="true" aria-controls="view-overview" tabindex="0" data-view="overview">总览</button>
-        <button id="viewTabTrends" class="app-tab" type="button" role="tab" aria-selected="false" aria-controls="view-trends" tabindex="-1" data-view="trends">趋势分析</button>
-        <button id="viewTabUsage" class="app-tab" type="button" role="tab" aria-selected="false" aria-controls="view-usage" tabindex="-1" data-view="usage">用量明细</button>
-        <button id="viewTabPricing" class="app-tab" type="button" role="tab" aria-selected="false" aria-controls="view-pricing" tabindex="-1" data-view="pricing">价格与数据</button>
-      </nav>
-      <button id="layoutEditButton" class="reset-button layout-edit-button" type="button" aria-pressed="false" aria-controls="layoutToolbar" title="拖动模块排序，调整宽度和高度；布局保存在本机">编辑布局</button>
-      </div>
       <div id="layoutToolbar" class="layout-toolbar" aria-label="布局编辑" hidden>
         <div><strong id="layoutPageName">编辑总览布局</strong><p>拖动模块左上方手柄排序，拖动右下角调整大小；也可用模块上的按钮、宽高输入框或手柄方向键。窄屏会自动排为单列。</p><span id="layoutSaveStatus" role="status" aria-live="polite">布局自动保存在本机。</span></div>
         <button id="layoutResetButton" class="reset-button" type="button">恢复本页默认</button>
@@ -115,10 +128,11 @@
         <section id="kpiGrid" class="kpi-grid" aria-label="关键指标"></section>
         </section>
         <section class="panel analytics-panel analytics-trend-panel layout-module" data-layout-id="overview-trend" aria-labelledby="analyticsTrendTitle">
-          <div class="panel-heading"><div><h2 id="analyticsTrendTitle">每日费用与 Token 趋势</h2></div><label class="inline-select" for="trendMetric">趋势指标<select id="trendMetric"><option value="tokens">Token</option><option value="requests">请求数</option><option value="cost" selected>费用</option><option value="cache">缓存读取</option><option value="cache_savings">缓存节省</option></select></label></div>
-          <p id="trendMetricNote" class="panel-description">费用按当前折扣显示模式统计。</p>
-          <div id="trendSummary" class="trend-summary"></div>
-          <div id="analyticsTrendChart" class="chart-host chart-host-trend" aria-label="每日统计趋势"></div>
+          <div class="panel-heading"><div><h2 id="analyticsTrendTitle">每日费用与 Token 趋势</h2><p id="trendMetricNote" class="panel-description">费用按当前折扣显示模式统计。</p></div><label class="inline-select" for="trendMetric">趋势指标<select id="trendMetric"><option value="tokens">Token</option><option value="requests">请求数</option><option value="cost" selected>费用</option><option value="cache">缓存读取</option><option value="cache_savings">缓存节省</option></select></label></div>
+          <div class="trend-content">
+            <div id="analyticsTrendChart" class="chart-host chart-host-trend" aria-label="每日统计趋势"></div>
+            <div id="trendSummary" class="trend-summary"></div>
+          </div>
         </section>
           <section class="panel analytics-panel layout-module" data-layout-id="overview-comparison" aria-labelledby="comparisonTitle">
             <div class="panel-heading"><div><h2 id="comparisonTitle">与上一等长期间对比</h2></div><span id="comparisonMeta" class="panel-meta">等待数据</span></div>
@@ -146,7 +160,6 @@
       </section>
 
       <section id="view-trends" class="app-view" role="tabpanel" aria-labelledby="viewTabTrends" tabindex="0" data-view-panel="trends" hidden>
-        <div class="view-heading"><div><h2>用量分布</h2><p>按工作空间、活跃时间、请求大小和模型查看结构变化。</p></div></div>
         <div class="trend-dashboard-grid layout-grid" data-layout-grid="trends">
           <section class="panel workspace-panel layout-module" data-layout-id="trends-workspace" aria-labelledby="workspaceTitle">
             <div class="panel-heading"><div><h2 id="workspaceTitle">工作空间活跃分布</h2></div><span id="workspaceMeta" class="panel-meta">—</span></div>
@@ -177,7 +190,6 @@
       </section>
 
       <section id="view-usage" class="app-view" role="tabpanel" aria-labelledby="viewTabUsage" tabindex="0" data-view-panel="usage" hidden>
-        <div class="view-heading"><div><h2>逐日、逐请求与任务消耗</h2><p>当前筛选会同步作用于以下明细。</p></div></div>
         <nav class="secondary-tabs" role="tablist" aria-label="用量明细类型">
           <button id="usageTabDaily" class="app-subtab is-selected" type="button" role="tab" aria-selected="true" aria-controls="usage-daily-panel" tabindex="0" data-subview="daily">每日汇总</button>
           <button id="usageTabRequests" class="app-subtab" type="button" role="tab" aria-selected="false" aria-controls="requestsPanel" tabindex="-1" data-subview="requests">单次请求</button>
@@ -218,7 +230,6 @@
       </section>
 
       <section id="view-pricing" class="app-view" role="tabpanel" aria-labelledby="viewTabPricing" tabindex="0" data-view-panel="pricing" hidden>
-        <div class="view-heading"><div><h2>价格规则与扫描状态</h2><p>编辑模型价格，检查本地数据扫描情况。</p></div></div>
         <nav class="secondary-tabs" role="tablist" aria-label="价格与数据页面">
           <button id="pricingTabRules" class="app-subtab is-selected" type="button" role="tab" aria-selected="true" aria-controls="pricingPanel" tabindex="0" data-subview="rules">价格规则</button>
           <button id="pricingTabDiagnostics" class="app-subtab" type="button" role="tab" aria-selected="false" aria-controls="diagnosticsPanel" tabindex="-1" data-subview="diagnostics">扫描诊断</button>
@@ -243,9 +254,8 @@
         </section>
         </div>
       </section>
+      <footer class="footer"><span id="historyStatus">历史用量自动保存在本机</span><span id="apiHint">公开参考价估算 · 未计价模型不计入费用 · 缓存与推理 Token 为子集</span></footer>
     </main>
-
-    <footer class="footer"><span id="historyStatus">历史用量自动保存在本机</span><span id="apiHint">公开参考价估算 · 未计价模型不计入费用 · 缓存与推理 Token 为子集</span></footer>
   </div>
   <div id="chartTooltip" class="chart-tooltip" role="tooltip" hidden></div>
   <dialog id="updateDialog" class="update-dialog" aria-labelledby="updateTitle" aria-describedby="updateNotice">

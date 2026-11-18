@@ -51,11 +51,11 @@ def main():
         installer = Path(__file__).resolve().parent / name
         assert installer.is_file(), 'Both terminal installers are required'
         upload_files.append(installer)
-    release_body = """本次更新新增 GPT-6.2 模型的费用估算。
+    release_body = """1.8.0 更新桌面看板界面。
 
-- 新增 GPT-6.2 Astra 和 GPT-6.2 Sol 的普通档参考价格，包含缓存读取与 30 分钟缓存写入。
-- GPT-6.2 在看板中统一使用普通档价格估算。OpenAI 官方对超过 272K 输入的请求仍有长上下文加价，实际 API 账单可能高于看板估算。
-- 历史已冻结价格不会自动改变，可在软件中按需重新计价。
+- 更新深浅主题和侧栏导航，集中显示扫描状态、实时连接与更新时间。
+- 重排总览读数，补充趋势区间摘要，统一模型用量对照的列结构。
+- 整理全局筛选和较矮横屏窗口的布局，保留本机保存的模块顺序与尺寸。
 
 Windows x64 与 Apple Silicon macOS arm64 共用源码。安装命令见仓库 README；macOS 要求 14 或更新版本，当前采用临时签名，未公证。"""
     release = request('/releases', method='POST', data={'tag_name': tag, 'target_commitish': commit, 'name': f'Codex Token {version} · Build {number}', 'draft': True, 'prerelease': False, 'body': release_body})

@@ -747,6 +747,15 @@
     state.provider = provider.value;
     state.workspace = workspace.value;
     state.model = $('#modelFilter').value;
+    updateAdvancedFiltersCount();
+  }
+
+  function updateAdvancedFiltersCount() {
+    const count = $('#activeFiltersCount');
+    if (!count) return;
+    const selected = [state.provider, state.workspace, state.model].filter(value => value !== 'all').length;
+    count.hidden = selected === 0;
+    count.textContent = selected ? String(selected) : '';
   }
 
   function renderKpis(data) {
@@ -786,10 +795,11 @@
       'M20 7H7a4 4 0 0 0 0 8h13M16 3l4 4-4 4M8 11l-4 4 4 4',
       'M5 18a9 9 0 1 1 14 0M12 13l5-5M8 20h8'
     ];
-    $('#kpiGrid').innerHTML = cards.map((card, index) => {
+    const tiles = cards.map((card, index) => {
       const title = card[1] === '未计价' ? '当前范围暂无可计价的 Token' : card[0].startsWith('预估费用') ? formatCurrencyDetailed(card[3]) : card[0].includes('率') || card[0].includes('占比') ? card[1] : typeof card[3] === 'number' ? formatNumber(card[3]) : card[1];
       return `<article class="kpi-card" data-metric="${index}"><div class="kpi-label"><span>${htmlEscape(card[0])}</span><span class="kpi-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="${iconPaths[index]}"/></svg></span></div><div class="kpi-value" title="${htmlEscape(title)}">${htmlEscape(card[1])}</div><div class="kpi-sub" title="${htmlEscape(card[4] || card[2])}">${htmlEscape(card[2])}</div></article>`;
-    }).join('');
+    });
+    $('#kpiGrid').innerHTML = `<div class="kpi-primary">${tiles.slice(0, 4).join('')}</div><div class="kpi-secondary">${tiles.slice(4).join('')}</div>`;
   }
 
   function renderWorkspace(data) {
@@ -819,6 +829,13 @@
     host.innerHTML = `${markup}</svg>`;
   }
 
+  function dateTickIndexes(length, plotWidth, limit) {
+    const count = Math.min(length, limit, Math.max(2, 1 + Math.floor(plotWidth / 68)));
+    const last = length - 1;
+    return new Set(Array.from({ length: count }, (_, index) =>
+      Math.round(index * last / Math.max(1, count - 1))));
+  }
+
   function renderDailyTrend(data) {
     const host = $('#dailyTrendChart');
     const rows = data.dailyActivity.filter(row => state.workspace === 'all' || !row.workspace || row.workspace === state.workspace).slice(-120);
@@ -830,7 +847,7 @@
     const max = Math.max(...values, 1);
     const width = Math.max(host.clientWidth || 620, 360);
     const height = 165;
-    const left = 39, right = 10, top = 10, bottom = 27;
+    const left = 39, right = 22, top = 10, bottom = 27;
     const plotWidth = width - left - right;
     const plotHeight = height - top - bottom;
     const x = index => rows.length === 1 ? left + plotWidth / 2 : left + index * plotWidth / (rows.length - 1);
@@ -847,8 +864,8 @@
       const xx = x(index), yy = y(row[metricKey] || 0);
       markup += `<circle cx="${xx}" cy="${yy}" r="4" fill="var(--surface)" stroke="var(--accent)" stroke-width="2"/><rect x="${xx - Math.max(8, plotWidth / rows.length / 2)}" y="${top}" width="${Math.max(16, plotWidth / rows.length)}" height="${plotHeight}" fill="transparent"><title>${row.dateAttribution === 'undated_interval' ? '未分日' : dateLabel(row.date, true)}\n请求数：${formatNumber(row.requests)}\nToken：${formatNumber(row.tokens)}</title></rect>`;
     });
-    const step = Math.max(1, Math.ceil(rows.length / 7));
-    rows.forEach((row, index) => { if (index % step === 0 || index === rows.length - 1) markup += `<text class="chart-axis-label" x="${x(index)}" y="${height - 7}" text-anchor="middle">${htmlEscape(dateLabel(row.date))}</text>`; });
+    const dateTicks = dateTickIndexes(rows.length, plotWidth, 7);
+    rows.forEach((row, index) => { if (dateTicks.has(index)) markup += `<text class="chart-axis-label" x="${x(index)}" y="${height - 7}" text-anchor="middle">${htmlEscape(dateLabel(row.date))}</text>`; });
     markup += `<text class="chart-axis-label" x="${width - right}" y="${top + 1}" text-anchor="end">${htmlEscape(metricName)}</text></svg>`;
     host.innerHTML = markup;
     $('#activityMeta').textContent = `${rows.length} 天 · ${metricName}`;
@@ -1000,6 +1017,7 @@
     const yFor = value => top + plotHeight - value / maxTotal * plotHeight;
     let markup = `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img" aria-label="模型与供应商每日 Token 用量堆叠图"><title>模型与供应商每日 Token 用量</title>`;
     [0, .5, 1].forEach(ratio => { const yy = yFor(maxTotal * ratio); markup += `<line class="chart-grid-line" x1="${left}" y1="${yy}" x2="${width - right}" y2="${yy}"/><text class="chart-axis-label" x="${left - 6}" y="${yy + 3}" text-anchor="end">${formatCompact(maxTotal * ratio)}</text>`; });
+    const dateTicks = dateTickIndexes(dates.length, plotWidth, 9);
     dates.forEach((date, index) => {
       const values = grouped.get(date), x = left + index * slot + (slot - barWidth) / 2;
       let cumulative = 0;
@@ -1010,8 +1028,7 @@
         markup += `<rect class="bar-hover" x="${x}" y="${yTop}" width="${barWidth}" height="${Math.max(1, yBottom - yTop)}" rx="2" fill="${color(key)}"><title>${htmlEscape(dateLabel(date, true))} · ${htmlEscape(seriesName(key))}：${formatNumber(value)}</title></rect>`;
         cumulative += value;
       });
-      const labelStep = Math.max(1, Math.ceil(dates.length / 9));
-      if (index % labelStep === 0 || index === dates.length - 1) markup += `<text class="chart-axis-label" x="${x + barWidth / 2}" y="${height - 13}" text-anchor="middle">${htmlEscape(dateLabel(date))}</text>`;
+      if (dateTicks.has(index)) markup += `<text class="chart-axis-label" x="${x + barWidth / 2}" y="${height - 13}" text-anchor="middle">${htmlEscape(dateLabel(date))}</text>`;
     });
     markup += `<line class="chart-axis-line" x1="${left}" y1="${top + plotHeight}" x2="${width - right}" y2="${top + plotHeight}"/><text class="chart-axis-label" x="${width - right}" y="${height - 1}" text-anchor="end">日期</text></svg>`;
     host.innerHTML = markup;
@@ -1280,6 +1297,14 @@
   }
 
   function bindEvents() {
+    const advancedButton = $('#advancedFiltersButton');
+    if (advancedButton) {
+      advancedButton.addEventListener('click', () => {
+        const filters = $('#advancedFilters');
+        filters.hidden = !filters.hidden;
+        advancedButton.setAttribute('aria-expanded', String(!filters.hidden));
+      });
+    }
     $('#updateButton').addEventListener('click', () => {
       const dialog = $('#updateDialog');
       if (!dialog.open) dialog.showModal();
@@ -1512,6 +1537,7 @@
     refresh: () => fetchDashboard({ refreshQueries: true }),
     exportCsv: () => exportCsv(),
     enhanceChartTooltips,
+    dateTickIndexes,
     formatCurrency,
     formatCurrencyDetailed,
     formatNumber,

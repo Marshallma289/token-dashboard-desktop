@@ -266,6 +266,8 @@
       });
       Object.entries(tabs).forEach(([subview, id]) => setTabState(byId(id), subview === state[view]));
     });
+    const pageTitle = byId('dashboardPageTitle');
+    if (pageTitle) pageTitle.textContent = state.view === 'overview' ? '用量总览' : pageLabels[state.view];
     const pageName = byId('layoutPageName');
     if (pageName) pageName.textContent = `编辑${pageLabels[state.view]}布局`;
     saveState();
@@ -444,7 +446,7 @@
     if (!bridgeLoaded) navigationEdits.add('view');
     document.body.dataset.layoutEditing = String(editing);
     const button = byId('layoutEditButton');
-    button.textContent = editing ? '完成布局' : '编辑布局';
+    (byId('layoutEditLabel') || button).textContent = editing ? '完成布局' : '编辑布局';
     button.setAttribute('aria-pressed', String(editing));
     byId('layoutToolbar').hidden = !editing;
     document.querySelectorAll('.layout-module-controls, .layout-resize-handle').forEach(control => { control.hidden = !editing; });
@@ -605,6 +607,13 @@
     requestVisibleCharts();
   }
   function bindNavigation() {
+    const navigation = byId('workspaceNavigation');
+    if (navigation && window.matchMedia) {
+      const narrow = window.matchMedia('(max-width: 900px)');
+      const syncOrientation = () => navigation.setAttribute('aria-orientation', narrow.matches ? 'horizontal' : 'vertical');
+      syncOrientation();
+      narrow.addEventListener('change', syncOrientation);
+    }
     document.addEventListener('click', event => {
       const tab = event.target.closest('[role="tab"]');
       if (tab && tablistFor(tab)) { activateTab(tab); return; }

@@ -649,6 +649,81 @@ class ScanResult:
         }
 
 
+_APPEND_MAX_FILES = 16
+_APPEND_MAX_RECORDS = 4096  # per file, including duplicate snapshots
+_APPEND_MAX_BYTES = 32 * 1024 * 1024
+_APPEND_MAX_FAST_TAIL = 2 * 1024 * 1024
+
+
+class _RolloutPrefix:
+    """Hash committed input; retain only whitelisted parser header metadata."""
+
+    def __init__(self, compare_size=0):
+        self.digest = hashlib.sha256()
+        self.compare_size = compare_size
+        self.compared_digest = None
+        self.lines = 0
+        self.headers = []
+        self.simple = True
+        self.saw_usage = False
+
+    @staticmethod
+    def simple_usage(event):
+        if not isinstance(event, dict) or event.get('type') != 'token_usage_record':
+            return False
+        if event.keys() - {'type', 'timestamp', 'payload'}:
+            return False
+        payload = event.get('payload')
+        if not isinstance(payload, dict) or payload.keys() - {'thread_id', 'response_id', 'turn_id', 'usage'}:
+            return False
+        if not isinstance(payload.get('response_id'), str) or not payload['response_id'].strip():
+            return False
+        if any(not isinstance(payload[key], str) for key in ('thread_id', 'turn_id') if key in payload):
+            return False
+        usage = payload.get('usage')
+        if not isinstance(usage, dict) or any(key in usage for key in
+                ('time_to_first_token_ms', 'ttft_ms', 'first_token_latency_ms')):
+            return False
+        timestamp = event.get('timestamp')
+        if not isinstance(timestamp, str):
+            return False
+        try:
+            return _dt.datetime.fromisoformat(timestamp.strip().replace('Z', '+00:00')).tzinfo is not None
+        except ValueError:
+            return False
+
+    def observe(self, line, event):
+        if not self.simple:
+            return
+        kind = event.get('type') if isinstance(event, dict) else None
+        if self.headers and self.simple_usage(event):
+            self.saw_usage = True
+            return
+        header_keys = {'session_meta': {'id', 'cwd', 'model_provider'},
+                       'turn_context': {'turn_id', 'model', 'cwd', 'thread_id'}}
+        expected = 'session_meta' if not self.headers else 'turn_context' if len(self.headers) == 1 else None
+        if kind == expected and kind in header_keys and not self.saw_usage:
+            payload = event.get('payload')
+            if (not (event.keys() - {'type', 'timestamp', 'payload'}) and isinstance(payload, dict)
+                    and not (payload.keys() - header_keys[kind])
+                    and all(isinstance(value, str) and len(value) <= 4096 for value in payload.values())):
+                # No timing events are permitted, so a header timestamp is unnecessary.
+                self.headers.append((line, {'type': kind, 'payload': payload}))
+                return
+        self.simple = False
+        self.headers.clear()
+
+
+@dataclass(frozen=True)
+class _AppendCheckpoint:
+    signature: tuple
+    identity: tuple
+    digest: bytes
+    lines: int
+    headers: tuple
+    groups: Dict[bytes, List[ParsedRecord]]
+
+
 class RolloutParser:
     """Parse only metadata and usage from a rollout JSONL file."""
 
@@ -656,13 +731,20 @@ class RolloutParser:
         self.catalog = catalog
         self.timezone = timezone or _resolve_timezone(None)
         self._parse_errors = 0
+        self._prefix = None
+        self._compare_prefix_size = 0
 
     def _iter_json(self, path: Path) -> Iterator[Tuple[int, Dict[str, Any]]]:
+        prefix = self._prefix
         try:
             # Both schema detection and parsing read the same byte prefix.
             # A writer may append indefinitely; committed lines in this prefix
             # must remain usable without chasing a moving EOF.
             with path.open("rb") as handle:
+                opened = os.fstat(handle.fileno())
+                if (opened.st_dev, opened.st_ino) != self._read_identity:
+                    self._read_failed = True
+                    return
                 remaining = self._read_limit
                 line_number = 0
                 while remaining > 0:
@@ -672,6 +754,13 @@ class RolloutParser:
                         break
                     remaining -= len(raw)
                     line_number += 1
+                    if prefix is not None:
+                        prefix.digest.update(raw)
+                        prefix.lines = line_number
+                        if self._read_limit - remaining == prefix.compare_size:
+                            prefix.compared_digest = prefix.digest.digest()
+                    if not raw.endswith(b"\n"):
+                        self._unterminated_line = line_number
                     line = raw.decode("utf-8", errors="replace")
                     if not line.strip():
                         continue
@@ -685,7 +774,9 @@ class RolloutParser:
                         else:
                             self._incomplete_tail = True
                         continue
-                    if isinstance(value, dict):
+                    if prefix is not None:
+                        prefix.observe(line_number, value)
+                    if isinstance(value, dict) and not (self._parse_errors and self._unterminated_line == line_number):
                         yield line_number, value
         except (OSError, UnicodeError):
             self._read_failed = True
@@ -706,26 +797,43 @@ class RolloutParser:
         value = _first(payload, "thread_id", "threadId") or _first(event, "thread_id", "threadId")
         return str(value).strip() if value is not None and str(value).strip() else None
 
-    def parse(self, path: Path) -> Tuple[List[ParsedRecord], int]:
+    def _parse_with_checkpoint(self, path, size):
+        # The scanner serializes parser access. Keep the ordinary parse/I/O
+        # entry points intact for full reads, including their failure paths.
+        self._compare_prefix_size = size
+        try:
+            return self.parse(path)
+        finally:
+            self._compare_prefix_size = 0
+
+    def parse(self, path: Path, *, simple_events=None) -> Tuple[List[ParsedRecord], int]:
         # Detect a modern record before parsing old token_count events.  A
         # rollout can contain both during migration; modern usage is the
         # single-request source of truth and old totals would double count it.
         self._parse_errors = 0
         self._read_failed = False
         self._incomplete_tail = False
+        self._unterminated_line = None
         try:
-            self._read_limit = path.stat().st_size
+            info = path.stat()
+            self._read_limit = info.st_size
+            self._read_identity = (info.st_dev, info.st_ino)
         except OSError:
             self._read_limit = 0
+            self._read_identity = None
             self._read_failed = True
-        has_modern = False
-        try:
-            for _, event in self._iter_json(path):
-                if self._event_type(event) == "token_usage_record":
-                    has_modern = True
-                    break
-        except Exception:
-            pass
+        self._prefix = None
+        has_modern = simple_events is not None
+        if simple_events is None:
+            try:
+                for _, event in self._iter_json(path):
+                    if self._event_type(event) == "token_usage_record":
+                        has_modern = True
+                        break
+            except Exception:
+                pass
+            if 0 < self._read_limit <= _APPEND_MAX_BYTES:
+                self._prefix = _RolloutPrefix(self._compare_prefix_size)
 
         # Reset errors from the lightweight schema-detection pass; report
         # malformed lines exactly once from the real parse below.
@@ -762,7 +870,8 @@ class RolloutParser:
         except OSError:
             fallback_mtime = time.time()
 
-        for line_number, event in self._iter_json(path):
+        events = simple_events if simple_events is not None else self._iter_json(path)
+        for line_number, event in events:
             event_type = self._event_type(event)
             payload = self._payload(event)
             payload_type = str(payload.get("type") or "").strip()
@@ -1203,6 +1312,9 @@ class DashboardDB:
         self._data_version = 0
         self._lock = threading.RLock()
         self._scan_lock = threading.Lock()
+        self._append_cache: Dict[str, _AppendCheckpoint] = {}
+        self._append_epoch = 0
+        self._append_storage_version = None
         self._connection = self._open_connection()
         self._connection.row_factory = sqlite3.Row
         with self._lock:
@@ -1626,6 +1738,7 @@ class DashboardDB:
                 after_old_snapshots = int(self._connection.execute(
                     "SELECT COUNT(*) FROM history_snapshots WHERE day < ?", (cutoff_day,)
                 ).fetchone()[0])
+                self._invalidate_append_cache()
                 self._data_version += 1
                 self._dashboard_cache.clear()
                 settings = self._data_settings_locked()
@@ -1729,6 +1842,7 @@ class DashboardDB:
                     self.db_path = destination
                     self._connection = new_connection
                     new_connection = None
+                    self._invalidate_append_cache()
                     self._data_version += 1
                     self._dashboard_cache.clear()
                     try:
@@ -2351,15 +2465,23 @@ class DashboardDB:
             return value.replace(tzinfo=self.timezone)
         return value.astimezone(self.timezone)
 
-    def scan(self) -> ScanResult:
+    def scan(self, force: bool = False) -> ScanResult:
         # Manual refreshes and the poller share parser state and source indexes.
         # Serialize scans, while leaving the database writer free during I/O.
         with self._scan_lock:
-            result = self._scan_files()
-            self._scan_hermes(result)
-            return result
+            try:
+                result = self._scan_files(force=True) if force else self._scan_files()
+                if force:
+                    self._scan_hermes(result, force=True)
+                else:
+                    self._scan_hermes(result)
+                return result
+            except Exception:
+                with self._lock:
+                    self._invalidate_append_cache()
+                raise
 
-    def _scan_hermes(self, result):
+    def _scan_hermes(self, result, force=False):
         if self.hermes_db is None:
             return
         from hermes_source import HermesSource, resolve_hermes_paths
@@ -2373,7 +2495,7 @@ class DashboardDB:
                 signature_key = 'hermes_signature:' + hashlib.sha256(str(path).encode('utf-8')).hexdigest()
                 previous_signature = self._connection.execute('SELECT value FROM history_meta WHERE key=?', (signature_key,)).fetchone()
             watermark = ((previous['last_seen'], previous['row_count'])
-                         if previous and previous['timezone'] == self.timezone_name else None)
+                         if not force and previous and previous['timezone'] == self.timezone_name else None)
             try:
                 source = HermesSource(path, self.timezone)
                 rows, watermark = source.read(watermark, previous_signature[0] if previous_signature else None)
@@ -2416,7 +2538,71 @@ class DashboardDB:
             result.hermes_rows_read += len(rows)
             result.records_added += len(rows)
 
-    def _scan_files(self) -> ScanResult:
+    def _invalidate_append_cache(self):
+        self._append_cache.clear()
+        self._append_epoch += 1
+
+    @staticmethod
+    def _simple_attribution(record):
+        return (record.thread_id, record.turn_id, record.provider, record.model, record.workspace)
+
+    def _append_groups(self, records):
+        groups = {}
+        for record in records:
+            row = dict(vars(record), **vars(record.usage))
+            groups.setdefault(self._history_key(row), []).append(record)
+        return groups
+
+    def _simple_append(self, path, stat, checkpoint):
+        previous_size = checkpoint.signature[1]
+        tail_size = stat.st_size - previous_size
+        if not checkpoint.headers or tail_size > _APPEND_MAX_FAST_TAIL:
+            return None
+        try:
+            digest = hashlib.sha256()
+            with path.open('rb') as handle:
+                opened = os.fstat(handle.fileno())
+                if (opened.st_dev, opened.st_ino) != checkpoint.identity:
+                    return None
+                remaining = previous_size
+                while remaining:
+                    block = handle.read(min(remaining, 256 * 1024))
+                    if not block:
+                        return None
+                    digest.update(block)
+                    remaining -= len(block)
+                if digest.digest() != checkpoint.digest:
+                    return None
+                tail = handle.read(tail_size)
+            if len(tail) != tail_size or not tail.endswith(b'\n'):
+                return None
+            events = list(checkpoint.headers)
+            # Split only on LF, exactly as the authoritative binary readline does.
+            lines = tail[:-1].split(b'\n')
+            for line, raw in enumerate(lines, checkpoint.lines + 1):
+                text = raw.decode('utf-8', errors='replace')
+                if text.strip():
+                    event = json.loads(text)
+                    if not _RolloutPrefix.simple_usage(event):
+                        return None
+                    events.append((line, event))
+            if len(events) == len(checkpoint.headers):
+                return None
+            records, errors = self.parser.parse(path, simple_events=events)
+            if errors or self.parser._read_failed or self.parser._read_limit != stat.st_size:
+                return None
+        except (OSError, ValueError, TypeError):
+            return None
+        groups = self._append_groups(records)
+        attribution = self._simple_attribution(next(iter(checkpoint.groups.values()))[0])
+        if (len(records) != len(events) - len(checkpoint.headers) or len(groups) != len(records)
+                or any(key in checkpoint.groups for key in groups)
+                or any(self._simple_attribution(record) != attribution for record in records)):
+            return None
+        digest.update(tail)
+        return {**checkpoint.groups, **groups}, digest.digest(), checkpoint.lines + len(lines)
+
+    def _scan_files(self, force=False) -> ScanResult:
         result = ScanResult()
         files = self._files()
         complete_roots = tuple(self._complete_roots)
@@ -2424,65 +2610,168 @@ class DashboardDB:
         result.files_seen = len(files)
         seen = {str(path) for path in files}
         with self._lock:
+            storage_version = self._connection.execute('PRAGMA data_version').fetchone()[0]
+            if force or storage_version != self._append_storage_version:
+                self._invalidate_append_cache()
+                self._append_storage_version = storage_version
+            append_epoch = self._append_epoch
+            checkpoints = dict(self._append_cache)
             existing = {row["path"]: row for row in self._connection.execute("SELECT * FROM source_files")}
         prepared = []
+        attempted = set()
         for path in files:
             key = str(path)
             try:
                 stat = path.stat()
             except OSError:
+                attempted.add(key)
                 result.incomplete_files += 1
                 continue
             signature = (stat.st_mtime_ns, stat.st_size, self.timezone_name, PARSER_SCHEMA_VERSION)
             previous = existing.get(key)
-            if previous and tuple(previous[name] for name in
+            if not force and previous and tuple(previous[name] for name in
                     ("mtime_ns", "size", "timezone", "parser_version")) == signature:
                 result.files_unchanged += 1
                 continue
             result.files_scanned += 1
-            records, parse_errors = self.parser.parse(path)
+            attempted.add(key)
+            identity = (stat.st_dev, stat.st_ino)
+            checkpoint = checkpoints.get(key)
+            if (checkpoint is not None and (not previous or checkpoint.identity != identity
+                    or not (checkpoint.signature[1] < stat.st_size <= _APPEND_MAX_BYTES)
+                    or checkpoint.signature != tuple(previous[name] for name in
+                        ('mtime_ns', 'size', 'timezone', 'parser_version')))):
+                checkpoint = None
+            fast = self._simple_append(path, stat, checkpoint) if checkpoint else None
+            if fast is not None:
+                # A moving tail must go through the normal growth/retry path.
+                try:
+                    fast_after = path.stat()
+                except OSError:
+                    fast = None
+                else:
+                    if (fast_after.st_dev, fast_after.st_ino, fast_after.st_size,
+                            fast_after.st_mtime_ns, fast_after.st_ctime_ns) != (
+                            *identity, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns):
+                        fast = None
+            if fast is None:
+                if checkpoint:
+                    records, parse_errors = self.parser._parse_with_checkpoint(path, checkpoint.signature[1])
+                else:
+                    records, parse_errors = self.parser.parse(path)
+            else:
+                parse_errors = 0
             result.parse_errors += parse_errors
             try:
                 after = path.stat()
-                stable = (after.st_size, after.st_mtime_ns) == (stat.st_size, stat.st_mtime_ns)
+                same_file = (after.st_dev, after.st_ino) == (stat.st_dev, stat.st_ino)
+                stable = same_file and (after.st_size, after.st_mtime_ns, after.st_ctime_ns) == (
+                    stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
                 grew = after.st_size > stat.st_size and after.st_size >= self.parser._read_limit \
-                    and after.st_ino == stat.st_ino
+                    and same_file
             except OSError:
                 stable = grew = False
             complete = stable and not self.parser._incomplete_tail
-            if self.parser._read_failed or not complete:
+            invalid_read = self.parser._read_failed or self.parser._read_identity != identity
+            if invalid_read or not complete:
                 result.incomplete_files += 1
             # A growing append-only log has usable committed JSONL records.
             # Replacements/truncations/read failures need a clean retry.
-            if self.parser._read_failed or not (stable or grew):
+            if invalid_read or not (stable or (grew and fast is None)):
                 continue
-            if parse_errors and previous:
-                result.records_skipped += previous["record_count"]
-                continue
-            prepared.append((key, signature, records, parse_errors, complete,
-                             "modern" if self.parser._has_modern else "legacy"))
+            usage_format = 'modern' if self.parser._has_modern else 'legacy'
+            prefix = self.parser._prefix
+            clean = complete and not parse_errors and self.parser._unterminated_line is None
+            candidate = None
+            prior = None
+            groups = fast[0] if fast is not None else self._append_groups(records)
+            if clean and self.parser._read_limit == stat.st_size:
+                if fast is not None:
+                    prior = checkpoint
+                    _, digest, lines = fast
+                    headers = checkpoint.headers
+                elif prefix is not None:
+                    if checkpoint and prefix.compared_digest == checkpoint.digest:
+                        prior = checkpoint
+                    digest, lines = prefix.digest.digest(), prefix.lines
+                    headers = ()
+                    if prefix.simple and prefix.saw_usage and groups:
+                        attribution = self._simple_attribution(records[0])
+                        # One attribution and one stable response per key ensure
+                        # a new usage event cannot revise an old group or sample.
+                        owner = prefix.headers[0][1]['payload'].get('id', '').strip()
+                        context_owner = prefix.headers[-1][1]['payload'].get('thread_id', owner).strip()
+                        if owner and owner == context_owner == attribution[0] and len(groups) == len(records) and all(
+                                self._simple_attribution(record) == attribution and record.response_id
+                                for record in records):
+                            headers = tuple(prefix.headers)
+                if not force and (fast is not None or prefix is not None) and len(groups) <= _APPEND_MAX_RECORDS \
+                        and (fast is not None or len(records) <= _APPEND_MAX_RECORDS):
+                    candidate = _AppendCheckpoint(signature, identity, digest, lines, headers, groups)
+            prepared.append((key, signature, groups, parse_errors, complete, usage_format, prior, candidate))
         with self._lock:
             try:
                 self._connection.execute("BEGIN")
                 _cleanup_days, cleanup_before = self._cleanup_meta_locked()
+                cutoff = cleanup_before.isoformat() if cleanup_before else None
+                cache_valid = (append_epoch == self._append_epoch and storage_version ==
+                               self._connection.execute('PRAGMA data_version').fetchone()[0])
                 # A user cleanup/relocation may have committed while parsing.
                 existing = {row["path"]: row for row in self._connection.execute("SELECT * FROM source_files")}
                 affected = set()
-                for key, signature, records, parse_errors, complete, usage_format in prepared:
+                for key, signature, groups, parse_errors, complete, usage_format, prior, candidate in prepared:
                     previous = existing.get(key)
-                    parsed = []
-                    purged_records = 0
-                    for record in records:
-                        if cleanup_before and _dt.date.fromisoformat(record.day) < cleanup_before:
-                            purged_records += 1
-                            continue
-                        row = dict(vars(record))
-                        row.update(vars(record.usage))
-                        parsed.append((self._history_key(row), row))
-                    result.records_skipped += purged_records
-                    new_keys = {logical for logical, _ in parsed}
-                    superseded = previous and previous["usage_format"] == "legacy" and usage_format == "modern"
-                    if previous and (complete or superseded):
+                    if cutoff:
+                        eligible = {logical: [record for record in group if record.day >= cutoff]
+                                    for logical, group in groups.items()}
+                        result.records_skipped += sum(len(group) - len(eligible[logical])
+                                                      for logical, group in groups.items())
+                        groups = {logical: group for logical, group in eligible.items() if group}
+                    new_keys = groups.keys()
+                    superseded = previous and previous['usage_format'] == 'legacy' and usage_format == 'modern'
+                    delta = (cache_valid and prior is not None and previous is not None
+                             and previous['usage_format'] == usage_format)
+                    if delta:
+                        old = prior.groups
+                        if cutoff:
+                            old = {logical: [record for record in group if record.day >= cutoff]
+                                   for logical, group in old.items()}
+                            old = {logical: group for logical, group in old.items() if group}
+                        changed = {logical for logical, group in groups.items() if old.get(logical) != group}
+                        removed = old.keys() - new_keys
+                        file_id = previous['id']
+                        for logical in (changed & old.keys()) | removed:
+                            if logical in removed:
+                                link = self._connection.execute('''SELECT snapshot_id FROM history_sources
+                                    WHERE file_id=? AND logical_key=?''', (file_id, logical)).fetchone()
+                                if link:
+                                    self._retain_snapshot(logical, link[0])
+                            self._connection.execute('DELETE FROM history_sources WHERE file_id=? AND logical_key=?',
+                                                     (file_id, logical))
+                        affected.update(removed)
+                    else:
+                        changed = new_keys
+                    writes = ((logical, record) for logical in changed for record in groups[logical])
+                    parsed = [(logical, dict(vars(record), **vars(record.usage)))
+                              for logical, record in sorted(writes, key=lambda item: item[1].source_line)]
+                    if previous and parse_errors:
+                        # A damaged rescan cannot prove corrections or legacy retirement.
+                        file_id = previous["id"]
+                        self._connection.execute("UPDATE source_files SET parser_version=0 WHERE id=?", (file_id,))
+                        for logical, row in parsed:
+                            if (previous["usage_format"] != "modern" or usage_format != "modern"
+                                or not row["thread_id"] or not row["response_id"]
+                                or logical in affected or self._connection.execute(
+                                    "SELECT 1 FROM history_requests WHERE logical_key=?", (logical,)).fetchone()):
+                                result.records_skipped += 1
+                                continue
+                            self._store_source(file_id, logical, self._store_snapshot(logical, row), row["source_line"])
+                            affected.add(logical)
+                            result.records_added += 1
+                        self._connection.execute("""UPDATE source_files SET record_count=(
+                            SELECT COUNT(*) FROM history_sources WHERE file_id=?) WHERE id=?""", (file_id, file_id))
+                        continue
+                    if not delta and previous and (complete or superseded):
                         # Old cumulative telemetry superseded by modern usage
                         # must not survive as a second copy of the same calls.
                         retire = bool(superseded)
@@ -2503,9 +2792,9 @@ class DashboardDB:
                         self._connection.execute("""UPDATE source_files SET record_count=(
                             SELECT COUNT(*) FROM history_sources WHERE file_id=?) WHERE id=?""",
                             (file_id, file_id))
-                    affected.update(new_keys)
-                    result.records_added += len(new_keys)
-                    result.records_skipped += len(parsed) - len(new_keys)
+                    affected.update(changed)
+                    result.records_added += len(changed)
+                    result.records_skipped += len(parsed) - len(changed)
                 for path, previous in existing.items():
                     if previous['usage_format'] == 'hermes':
                         continue
@@ -2513,10 +2802,22 @@ class DashboardDB:
                         affected.update(self._detach_source(previous["id"]))
                         self._connection.execute("DELETE FROM source_files WHERE id=?", (previous["id"],))
                         result.files_removed += 1
-                self._rebuild_logical_records(affected)
                 if affected or result.files_removed:
+                    self._rebuild_logical_records(affected)
                     self._collect_unused_snapshots()
                 self._connection.commit()
+                # Publish only after a successful commit. Do not resurrect a
+                # checkpoint invalidated by concurrent storage maintenance.
+                if not cache_valid:
+                    self._invalidate_append_cache()
+                else:
+                    for path in attempted | (self._append_cache.keys() - seen):
+                        self._append_cache.pop(path, None)
+                    for path, _, _, _, _, _, _, candidate in prepared:
+                        if candidate is not None:
+                            self._append_cache[path] = candidate
+                            if len(self._append_cache) > _APPEND_MAX_FILES:
+                                self._append_cache.pop(next(iter(self._append_cache)))
                 if affected or result.files_removed:
                     self._data_version += 1
                 self._maintain_storage()
@@ -3573,7 +3874,8 @@ class DashboardDB:
         today = self._local_now().date()
         uncertain = []
         summary_incomplete = today_incomplete = False
-        candidates = rows if not range_start else (self._fetch_rows(0, provider, workspace, model, source_kind=source_kind) if source_kind != 'codex' else [])
+        candidates = rows if not range_start else (
+            self._fetch_rows(0, provider, workspace, model, source_kind='hermes') if source_kind != 'codex' else [])
         for row in candidates:
             if not self._hermes_undated(row):
                 continue
@@ -3703,6 +4005,7 @@ class DashboardService:
         self._stop = threading.Event()
         self._wake_scan = threading.Event()
         self._refresh_requested = threading.Event()
+        self._force_refresh_requested = False
         self._changed = threading.Condition()
         self._version = 0
         self._thread: Optional[threading.Thread] = None
@@ -3723,10 +4026,10 @@ class DashboardService:
             self._version += 1
             self._changed.notify_all()
 
-    def refresh(self) -> ScanResult:
+    def refresh(self, force: bool = False) -> ScanResult:
         started = time.perf_counter()
         try:
-            result = self.database.scan()
+            result = self.database.scan(force=True) if force else self.database.scan()
         except Exception as error:
             self._record_failure(error)
             raise
@@ -3774,20 +4077,26 @@ class DashboardService:
             with self._changed:
                 requested = self._refresh_requested.is_set()
                 self._refresh_requested.clear()
+                force = self._force_refresh_requested
+                self._force_refresh_requested = False
             if woke and not requested:
                 continue
             if not requested and not self.auto_scan:
                 continue
             try:
-                self.refresh()
+                if force:
+                    self.refresh(force=True)
+                else:
+                    self.refresh()
             except Exception:
                 # A partially-written JSONL is expected while Codex is active;
                 # keep the poller alive and let the next pass retry it.
                 continue
 
-    def request_refresh(self) -> None:
+    def request_refresh(self, force: bool = False) -> None:
         """Queue an immediate background refresh without blocking the UI."""
         with self._changed:
+            self._force_refresh_requested |= force
             self._refresh_requested.set()
             self._wake_scan.set()
 
@@ -4149,7 +4458,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if body:
                     self._write_json({"error": "invalid_body"}, HTTPStatus.BAD_REQUEST)
                     return
-                result = service.refresh()
+                result = service.refresh(force=True)
                 self._write_json({"health": service.health(), "scan": result.as_dict()})
                 return
             self._write_json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
@@ -4273,7 +4582,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     db = _database_from_args(args)
     try:
         if args.command == "scan":
-            _print_json(db.scan().as_dict())
+            _print_json(db.scan(force=True).as_dict())
             return 0
         if args.command == "summary":
             db.scan()

@@ -51,11 +51,11 @@ def main():
         installer = Path(__file__).resolve().parent / name
         assert installer.is_file(), 'Both terminal installers are required'
         upload_files.append(installer)
-    release_body = """1.8.0 更新桌面看板界面。
+    release_body = f"""{version} 新增 Codex 与 Hermes 全局技能管理。
 
-- 更新深浅主题和侧栏导航，集中显示扫描状态、实时连接与更新时间。
-- 重排总览读数，补充趋势区间摘要，统一模型用量对照的列结构。
-- 整理全局筛选和较矮横屏窗口的布局，保留本机保存的模块顺序与尺寸。
+- Codex 与 Hermes 使用独立的技能库、部署目录、预设和备份。
+- 支持从本地目录、压缩包、公开 GitHub 仓库和 skills.sh 导入技能，预览更新差异，并通过预设批量启停。
+- 支持快照备份与恢复、按工作区进行 Git 同步，也可通过本机 CLI 管理技能。
 
 Windows x64 与 Apple Silicon macOS arm64 共用源码。安装命令见仓库 README；macOS 要求 14 或更新版本，当前采用临时签名，未公证。"""
     release = request('/releases', method='POST', data={'tag_name': tag, 'target_commitish': commit, 'name': f'Codex Token {version} · Build {number}', 'draft': True, 'prerelease': False, 'body': release_body})

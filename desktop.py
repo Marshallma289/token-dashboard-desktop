@@ -14,9 +14,14 @@ import threading
 import time
 import tempfile
 from typing import Any, Iterable, Mapping, Optional
+from urllib.error import HTTPError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from backend import DashboardDB, DashboardService, create_server, safe_csv_row, local_data_dir
+from skills_service import check_dependencies as check_skills_dependencies
+from skills_service import forget_endpoint as forget_skills_endpoint
+from skills_service import publish_endpoint as publish_skills_endpoint
 from updater import Updater, cleanup_completed_updates, confirm_startup, installation_dir
 
 
@@ -206,10 +211,12 @@ class DesktopRuntime:
             hermes_db=resolve_hermes_paths(hermes_db)[0],
         )
         self._owns_database = database is None
+        self._data_dir = data_dir
         self.service = DashboardService(self.database, interval=interval)
-        self.server = create_server(self.service, "127.0.0.1", 0)
+        self.server = create_server(self.service, "127.0.0.1", 0, skills_data_dir=data_dir)
         self.thread: Optional[threading.Thread] = None
         self._stopped = threading.Event()
+        self._skills_autosync = None
 
     @property
     def url(self) -> str:
@@ -217,8 +224,12 @@ class DesktopRuntime:
         return f"http://127.0.0.1:{port}/?desktop=1"
 
     def start(self) -> str:
+        if self._stopped.is_set():
+            raise RuntimeError("Desktop runtime has already stopped")
         if self.thread and self.thread.is_alive():
             return self.url
+        self._skills_autosync = self.server.skills_service.autosync
+        self._skills_autosync.start()
         # Show the window immediately. Existing cached totals are readable
         # while the first fresh scan runs in the background.
         self.service.start(initial_refresh=False)
@@ -229,16 +240,26 @@ class DesktopRuntime:
             daemon=True,
         )
         self.thread.start()
+        try:
+            publish_skills_endpoint(self._data_dir, self.server.server_port)
+        except OSError:
+            pass  # Explicit --port still works when the discovery hint cannot be saved.
         return self.url
 
     def stop(self) -> None:
         if self._stopped.is_set():
             return
         self._stopped.set()
+        if self._skills_autosync is not None:
+            self._skills_autosync.stop()
         if self.thread and self.thread.is_alive():
             self.server.shutdown()
             self.thread.join(timeout=5)
         self.server.server_close()
+        try:
+            forget_skills_endpoint(self._data_dir, self.server.server_port)
+        except OSError:
+            pass
         self.service.stop()
         if self._owns_database:
             self.database.close()
@@ -361,6 +382,36 @@ class DesktopBridge:
         except Exception as error:
             return {"ok": False, "error": f"无法选择文件夹：{error}"}
 
+    def _is_skills_dialog_origin(self) -> bool:
+        if self._window is None or self._runtime is None:
+            return False
+        current = self._window.get_current_url()
+        if not isinstance(current, str):
+            return False
+        active, expected = urlsplit(current), urlsplit(self._runtime.url)
+        return (active.scheme, active.netloc) == (expected.scheme, expected.netloc)
+
+    def choose_skills_directory(self, agent: str) -> Mapping[str, Any]:
+        """Pick one local directory; the HTTP API must perform any import."""
+        if agent not in ("codex", "hermes"):
+            return {"ok": False, "error": "invalid_agent"}
+        try:
+            if not self._is_skills_dialog_origin():
+                return {"ok": False, "error": "forbidden_origin"}
+            import webview
+
+            selected = self._window.create_file_dialog(
+                webview.FileDialog.FOLDER, directory=str(Path.home()), allow_multiple=False,
+            )
+            if not self._is_skills_dialog_origin():
+                return {"ok": False, "error": "forbidden_origin"}
+            if not selected:
+                return {"ok": False, "cancelled": True}
+            path = selected[0] if isinstance(selected, (list, tuple)) else selected
+            return {"ok": True, "path": str(path)}
+        except Exception:
+            return {"ok": False, "error": "choose_directory_failed"}
+
     def set_data_directory(self, directory: str) -> Mapping[str, Any]:
         if not self._data_lock.acquire(blocking=False):
             return {"ok": False, "error": "数据管理操作正在进行，请稍后再试"}
@@ -436,6 +487,9 @@ def run_self_test() -> Mapping[str, Any]:
     The frozen executable can run this check on native build machines too.
     """
     checks = []
+    if getattr(sys, "frozen", False):
+        check_skills_dependencies()
+        checks.append("frozen_skills_imports")
     with tempfile.TemporaryDirectory(prefix="codex-token-self-test-") as folder:
         root = Path(folder)
         sessions = root / "sessions"
@@ -476,7 +530,7 @@ def run_self_test() -> Mapping[str, Any]:
         try:
             service = DashboardService(db)
             service.refresh()
-            server = create_server(service, "127.0.0.1", 0)
+            server = create_server(service, "127.0.0.1", 0, skills_data_dir=root / "skills-data")
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             url = f"http://127.0.0.1:{server.server_port}"
@@ -489,6 +543,33 @@ def run_self_test() -> Mapping[str, Any]:
                                            "Origin": url}, method="POST")
                 with urlopen(request, timeout=5) as response:
                     return json.loads(response.read().decode("utf-8"))
+            try:
+                write("/api/skills", {})
+            except HTTPError as error:
+                with error:
+                    if error.code != 400 or json.load(error) != {"ok": False, "error": "invalid_body"}:
+                        raise RuntimeError("Self-test skills route failed") from None
+            else:
+                raise RuntimeError("Self-test skills route accepted an invalid request")
+            checks.append("skills_route")
+            autosync_request = {"agent": "codex", "op": "autosync_status", "payload": {}}
+            autosync_response = write("/api/skills", autosync_request)
+            autosync_status = autosync_response["result"]["status"]
+            if (autosync_response.get("ok") is not True or autosync_status.get("agent") != "codex"
+                    or autosync_status.get("enabled") is not False or autosync_status.get("state") != "disabled"):
+                raise RuntimeError("Self-test automatic sync must be disabled by default")
+            checks.append("skills_autosync_disabled")
+            if getattr(sys, "frozen", False):
+                cli_name = "CodexTokenSkills.exe" if sys.platform == "win32" else "CodexTokenSkills"
+                cli = Path(sys.executable).resolve().with_name(cli_name)
+                bundled = Path(__file__).resolve().parent / "assets" / "codex-token-skill-manager" / "SKILL.md"
+                if not bundled.is_file():
+                    raise RuntimeError("Frozen skill manager asset is missing")
+                completed = subprocess.run([str(cli), "--port", str(server.server_port), "--agent", "codex",
+                                            "--op", "autosync_status"], capture_output=True, check=True, timeout=20)
+                if json.loads(completed.stdout) != autosync_response:
+                    raise RuntimeError("Frozen skills CLI check failed")
+                checks.append("frozen_skills_cli")
             health = json.loads(read("/api/health"))
             if health["status"] != "ok":
                 raise RuntimeError("Self-test scanner is unhealthy")

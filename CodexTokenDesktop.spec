@@ -34,11 +34,14 @@ else:
     ]
 
 a = Analysis(
-    ['desktop.py'],
+    ['desktop.py', 'skills_service.py'],
     pathex=[],
     binaries=[],
-    datas=[('web', 'web'), ('VERSION', '.'), ('build-info.json', '.'), ('LICENSE', '.'), ('THIRD_PARTY_NOTICES.md', '.')],
-    hiddenimports=['webview', *platform_imports],
+    datas=[('web', 'web'), ('VERSION', '.'), ('build-info.json', '.'), ('LICENSE', '.'), ('THIRD_PARTY_NOTICES.md', '.'),
+           ('assets/codex-token-skill-manager', 'assets/codex-token-skill-manager')],
+    hiddenimports=['webview', *platform_imports, 'hermes_source',
+                   'skills_service', 'skills_core', 'skills_sources', 'skills_backup',
+                   'skills_github', 'skills_autosync'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -79,7 +82,7 @@ pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
-    a.scripts,
+    [entry for entry in a.scripts if entry[0] != 'skills_service'],
     [],
     exclude_binaries=True,
     name='CodexTokenDesktop',
@@ -95,8 +98,20 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
+skills_cli = EXE(
+    pyz,
+    [entry for entry in a.scripts if entry[0] != 'desktop'],
+    [],
+    exclude_binaries=True,
+    name='CodexTokenSkills',
+    strip=False,
+    upx=not is_macos,
+    console=True,
+    argv_emulation=False,
+)
 coll = COLLECT(
     exe,
+    skills_cli,
     a.binaries,
     a.datas,
     strip=False,

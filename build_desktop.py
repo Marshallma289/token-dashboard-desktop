@@ -27,7 +27,11 @@ ROOT_FILES = {
 }
 SOURCE_TREES = ("tests", "web", "assets", ".github/workflows")
 EXCLUDED_DIRS = {".git", ".venv", "__pycache__", ".pytest_cache", "release", "dist", "build", "work", "outputs"}
-RUNTIME_FILES = ("backend.py", "hermes_source.py", "desktop.py", "pricing.py", "VERSION", "requirements-desktop.txt", "updater.py", "update_helpers.py")
+RUNTIME_FILES = (
+    "backend.py", "hermes_source.py", "desktop.py", "pricing.py", "VERSION", "requirements-desktop.txt",
+    "updater.py", "update_helpers.py", "skills_service.py", "skills_core.py", "skills_sources.py", "skills_backup.py",
+    "skills_github.py", "skills_autosync.py",
+)
 PORTABLE_FILES = (
     "LICENSE", "THIRD_PARTY_NOTICES.md", "providers.json.example", "VERSION",
     "便携版使用说明.txt", "启动 Codex Token 看板.cmd",
@@ -69,7 +73,9 @@ def stage_source(source: Path, destination: Path) -> None:
 def source_digest(source: Path) -> str:
     """Hash stable relative paths and original bytes, with unambiguous framing."""
     names = list(RUNTIME_FILES)
-    names.extend(path.relative_to(source).as_posix() for path in (source / "web").rglob("*") if path.is_file() and eligible_file(path, source))
+    for tree in ("web", "assets/codex-token-skill-manager"):
+        names.extend(path.relative_to(source).as_posix() for path in (source / tree).rglob("*")
+                     if path.is_file() and eligible_file(path, source))
     digest = hashlib.sha256()
     for name in sorted(names):
         encoded_name = name.encode("utf-8")
@@ -133,6 +139,9 @@ def build(output_dir: Path, *, skip_tests: bool = False) -> tuple[Path, Path]:
     build_root = Path(tempfile.mkdtemp(prefix=f"build-{version}-{stamp}-", dir=output_dir))
     stage = build_root / "source"
     stage_source(SOURCE_DIR, stage)
+    missing = [name for name in RUNTIME_FILES if not (stage / name).is_file()]
+    if missing:
+        raise RuntimeError("Missing runtime files in clean staging: " + ", ".join(missing))
     runtime_digest = source_digest(stage)
     build_info = {
         "version": version, "source_digest": runtime_digest,
@@ -148,7 +157,8 @@ def build(output_dir: Path, *, skip_tests: bool = False) -> tuple[Path, Path]:
     test_env["HOME"] = str(build_root / "test-home")
     test_env["USERPROFILE"] = test_env["HOME"]
     test_env["CODEX_HOME"] = str(build_root / "test-codex-home")
-    for name in ("HOME", "LOCALAPPDATA", "CODEX_HOME"):
+    test_env["HERMES_HOME"] = str(build_root / "test-hermes-home")
+    for name in ("HOME", "LOCALAPPDATA", "CODEX_HOME", "HERMES_HOME"):
         Path(test_env[name]).mkdir(parents=True, exist_ok=True)
     for name in ("sessions", "archived_sessions"):
         (Path(test_env["CODEX_HOME"]) / name).mkdir(parents=True, exist_ok=True)

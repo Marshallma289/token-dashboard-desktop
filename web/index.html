@@ -25,6 +25,7 @@
         <button id="viewTabTrends" class="app-tab" type="button" role="tab" aria-selected="false" aria-controls="view-trends" tabindex="-1" data-view="trends"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v16h16M7 15l4-4 4 2 5-6"/></svg><span>趋势分析</span></button>
         <button id="viewTabUsage" class="app-tab" type="button" role="tab" aria-selected="false" aria-controls="view-usage" tabindex="-1" data-view="usage"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h14v18H5zM8 7h8M8 12h8M8 16h5"/></svg><span>用量明细</span></button>
         <button id="viewTabPricing" class="app-tab" type="button" role="tab" aria-selected="false" aria-controls="view-pricing" tabindex="-1" data-view="pricing"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h14M9 5v4M15 10v4M11 15v4"/></svg><span>价格与数据</span></button>
+        <button id="viewTabSkills" class="app-tab" type="button" role="tab" aria-selected="false" aria-controls="view-skills" tabindex="-1" data-view="skills"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2 10 5-10 5L2 7l10-5ZM2 12l10 5 10-5M2 17l10 5 10-5"/></svg><span>技能管理</span></button>
       </nav>
       <div class="sidebar-footer">
         <div class="status-cluster" aria-label="服务状态">
@@ -121,6 +122,11 @@
         <div><strong id="layoutPageName">编辑总览布局</strong><p>拖动模块左上方手柄排序，拖动右下角调整大小；也可用模块上的按钮、宽高输入框或手柄方向键。窄屏会自动排为单列。</p><span id="layoutSaveStatus" role="status" aria-live="polite">布局自动保存在本机。</span></div>
         <button id="layoutResetButton" class="reset-button" type="button">恢复本页默认</button>
       </div>
+
+      <section id="view-skills" class="app-view skills-page" role="tabpanel" aria-labelledby="viewTabSkills" tabindex="0" data-view-panel="skills" hidden>
+        <div id="skillsWorkspace"></div>
+        <p id="skillsAnnouncement" class="skills-visually-hidden" role="status"></p>
+      </section>
 
       <section id="view-overview" class="app-view" role="tabpanel" aria-labelledby="viewTabOverview" tabindex="0" data-view-panel="overview">
         <div class="layout-grid" data-layout-grid="overview">
@@ -334,6 +340,7 @@
     </form>
   </dialog>
   <script src="cache-metrics.js" defer></script>
+  <script src="skills.js" defer></script>
   <script src="layout.js" defer></script>
   <script src="app.js" defer></script>
   <script src="data-settings.js" defer></script>

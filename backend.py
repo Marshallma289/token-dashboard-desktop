@@ -33,15 +33,10 @@ from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pricing import DEFAULT_PRICING, PricingCatalog, canonical_model, validate_pricing_rules
+from skills_service import MAX_BODY, InvalidSkillsRequest, SkillsService, SkillsSyncConflict, local_data_dir
 
 
 APP_DIR = Path(__file__).resolve().parent
-def local_data_dir() -> Path:
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "CodexTokenDashboard"
-    return Path(os.environ.get("LOCALAPPDATA", Path.home())) / "CodexTokenDashboard"
-
-
 DEFAULT_DB = local_data_dir() / "usage.sqlite3"
 DEFAULT_PROVIDER_CONFIG = APP_DIR / "providers.json"
 PARSER_SCHEMA_VERSION = 8
@@ -4168,8 +4163,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         # The API must never echo request parameters or rollout data into logs.
         return
 
-    def _write_json(self, value: Mapping[str, Any], status: int = HTTPStatus.OK) -> None:
-        body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    def _write_json(self, value: Mapping[str, Any], status: int = HTTPStatus.OK, *, allow_nan: bool = True) -> None:
+        body = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=allow_nan).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -4218,8 +4213,39 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except ValueError:
             return False
 
-    def _read_mutation_json(self) -> Optional[Dict[str, Any]]:
-        if not self._same_local_origin():
+    def _skills_same_origin(self) -> bool:
+        # Use the real socket, never Forwarded/X-Forwarded-Host. A CLI server
+        # intentionally exposed to the LAN must not expose the skills workspace.
+        try:
+            bound = ipaddress.ip_address(self.server.server_address[0])
+            local = ipaddress.ip_address(self.connection.getsockname()[0])
+            peer = ipaddress.ip_address(self.client_address[0])
+        except (ValueError, OSError):
+            return False
+        if not (bound.is_loopback and local == bound and peer.is_loopback):
+            return False
+        hosts = self.headers.get_all("Host", [])
+        origins = self.headers.get_all("Origin", [])
+        fetch_sites = self.headers.get_all("Sec-Fetch-Site", [])
+        if (len(hosts) != 1 or len(origins) != 1
+                or self.headers.get_all("X-Dashboard-Request", []) != ["1"]
+                or fetch_sites not in ([], ["same-origin"])):
+            return False
+        port = int(self.server.server_port)
+        numeric = f"[{local}]" if local.version == 6 else str(local)
+        suffix = "" if port == 80 else f":{port}"
+        authorities = {f"{host}{suffix}" for host in (numeric, "localhost")}
+        if port == 80:
+            authorities.update((f"{numeric}:80", "localhost:80"))
+        host = hosts[0].lower()
+        return host in authorities and origins[0].lower() == f"http://{host.removesuffix(':80') if port == 80 else host}"
+
+    def _mutation_error(self, error: str, status: int, *, skills: bool = False) -> None:
+        self._write_json({"ok": False, "error": error} if skills else {"error": error}, status)
+
+    def _read_mutation_json(self, *, skills: bool = False) -> Optional[Dict[str, Any]]:
+        same_origin = self._skills_same_origin if skills else self._same_local_origin
+        if not same_origin():
             # Drain small, bounded bodies before rejecting the request. Closing a
             # TCP connection with unread request bytes can reset the response on
             # Windows, making the intended 403 look like a transport failure.
@@ -4228,7 +4254,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     rejected_length = int(self.headers.get("Content-Length", "-1"))
                 except ValueError:
                     rejected_length = -1
-                if 0 <= rejected_length <= 1024 * 1024:
+                if 0 <= rejected_length <= MAX_BODY:
                     previous_timeout = self.connection.gettimeout()
                     try:
                         self.connection.settimeout(1.0)
@@ -4239,30 +4265,60 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         self.close_connection = True
                     finally:
                         self.connection.settimeout(previous_timeout)
-            self._write_json({"error": "forbidden_origin"}, HTTPStatus.FORBIDDEN)
+            self._mutation_error("forbidden_origin", HTTPStatus.FORBIDDEN, skills=skills)
             return None
-        if self.headers.get("Transfer-Encoding"):
-            self._write_json({"error": "invalid_body"}, HTTPStatus.BAD_REQUEST)
+        if self.headers.get("Transfer-Encoding") or (skills and self.headers.get_all("Transfer-Encoding")):
+            self._mutation_error("invalid_body", HTTPStatus.BAD_REQUEST, skills=skills)
             return None
         content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().casefold()
-        if content_type != "application/json":
-            self._write_json({"error": "invalid_content_type"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+        if content_type != "application/json" or (skills and len(self.headers.get_all("Content-Type", [])) != 1):
+            self._mutation_error("invalid_content_type", HTTPStatus.UNSUPPORTED_MEDIA_TYPE, skills=skills)
             return None
         try:
-            length = int(self.headers.get("Content-Length", "-1"))
+            length_header = self.headers.get("Content-Length", "-1")
+            if skills and (len(self.headers.get_all("Content-Length", [])) != 1
+                           or not (length_header.isascii() and length_header.isdecimal())):
+                raise ValueError("invalid length")
+            length = int(length_header)
         except ValueError:
             length = -1
-        if not 0 <= length <= 1024 * 1024:
-            self._write_json({"error": "invalid_body_size"}, HTTPStatus.BAD_REQUEST)
+        if not 0 <= length <= MAX_BODY:
+            self._mutation_error("invalid_body_size", HTTPStatus.BAD_REQUEST, skills=skills)
             return None
+        previous_timeout = self.connection.gettimeout()
         try:
+            if skills:
+                self.connection.settimeout(5.0)
             raw = self.rfile.read(length)
-            value = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError, OSError):
-            self._write_json({"error": "invalid_json"}, HTTPStatus.BAD_REQUEST)
+            if skills and len(raw) != length:
+                raise ValueError("incomplete body")
+            if skills:
+                def unique(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+                    result: Dict[str, Any] = {}
+                    for key, item in pairs:
+                        if key in result:
+                            raise ValueError("duplicate JSON key")
+                        result[key] = item
+                    return result
+
+                def finite(value: str) -> float:
+                    number = float(value)
+                    if not math.isfinite(number):
+                        raise ValueError("non-finite JSON number")
+                    return number
+
+                value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique,
+                                   parse_float=finite, parse_constant=finite)
+            else:
+                value = json.loads(raw.decode("utf-8"))
+        except (ValueError, OSError, RecursionError):
+            self._mutation_error("invalid_json", HTTPStatus.BAD_REQUEST, skills=skills)
             return None
+        finally:
+            if skills:
+                self.connection.settimeout(previous_timeout)
         if not isinstance(value, dict):
-            self._write_json({"error": "invalid_body"}, HTTPStatus.BAD_REQUEST)
+            self._mutation_error("invalid_body", HTTPStatus.BAD_REQUEST, skills=skills)
             return None
         return value
 
@@ -4295,13 +4351,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                          "/cache-metrics.js": "cache-metrics.js",
                          "/layout.js": "layout.js",
                          "/analytics.js": "analytics.js", "/data-settings.js": "data-settings.js",
+                         "/skills.js": "skills.js", "/skills.css": "skills.css",
                          "/dashboard.css": "dashboard.css",
                          "/styles.css": "styles.css"}
         if route in static_routes:
             self._write_static(static_routes[route])
             return
+        if route == "/api/skills":
+            self._mutation_error("method_not_allowed", HTTPStatus.METHOD_NOT_ALLOWED, skills=True)
+            return
         if route == "/api/health":
-            self._write_json(service.health())
+            self._write_json({**service.health(), "skills_api": 1})
             return
         if route == "/api/dashboard":
             query = self._query()
@@ -4414,9 +4474,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._write_json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
 
     def do_OPTIONS(self) -> None:  # noqa: N802
-        self._write_json({"error": "cross_origin_preflight_not_allowed"}, HTTPStatus.FORBIDDEN)
+        self._mutation_error("cross_origin_preflight_not_allowed", HTTPStatus.FORBIDDEN,
+                             skills=self.path.partition("?")[0] == "/api/skills")
+
+    def _post_skills(self) -> None:
+        body = self._read_mutation_json(skills=True)
+        if body is None:
+            return
+        try:
+            result = self.server.skills_service.dispatch(body)
+            self._write_json({"ok": True, "result": result}, allow_nan=False)
+        except SkillsSyncConflict as error:
+            self._write_json(error.response, HTTPStatus.CONFLICT)
+        except InvalidSkillsRequest as error:
+            self._mutation_error(str(error), HTTPStatus.BAD_REQUEST, skills=True)
+        except Exception:
+            # Module exceptions can contain credentials or local paths.
+            self._mutation_error("skills_operation_failed", HTTPStatus.INTERNAL_SERVER_ERROR, skills=True)
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path.partition("?")[0] == "/api/skills":
+            self._post_skills()
+            return
         body = self._read_mutation_json()
         if body is None:
             return
@@ -4511,14 +4590,16 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         # This is normal and should not print connection tracebacks.
         return
 
-    def __init__(self, address: Tuple[str, int], service: DashboardService) -> None:
-        super().__init__(address, DashboardHandler)
+    def __init__(self, address: Tuple[str, int], service: DashboardService, *, skills_data_dir: Optional[Path] = None) -> None:
         self.dashboard_service = service
         self.dashboard_host = address[0]
+        self.skills_service = SkillsService(skills_data_dir if skills_data_dir is not None else local_data_dir())
+        super().__init__(address, DashboardHandler)
 
 
-def create_server(service: DashboardService, host: str = "127.0.0.1", port: int = 8765) -> DashboardHTTPServer:
-    return DashboardHTTPServer((host, int(port)), service)
+def create_server(service: DashboardService, host: str = "127.0.0.1", port: int = 8765,
+                  *, skills_data_dir: Optional[Path] = None) -> DashboardHTTPServer:
+    return DashboardHTTPServer((host, int(port)), service, skills_data_dir=skills_data_dir)
 
 
 def _common_options(parser: argparse.ArgumentParser) -> None:
@@ -4558,6 +4639,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8765)
     serve_parser.add_argument("--interval", type=float, default=None)
+    serve_parser.add_argument("--skills-data-dir", type=Path, help="override the per-user skills data directory")
     serve_parser.add_argument("--no-open", action="store_true", help="do not open the dashboard in a browser")
 
     doctor_parser = subparsers.add_parser("doctor", help="check roots, SQLite, and parser availability")
@@ -4657,7 +4739,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             server: Optional[DashboardHTTPServer] = None
             try:
                 service.start()
-                server = create_server(service, args.host, args.port)
+                server = create_server(service, args.host, args.port, skills_data_dir=args.skills_data_dir)
                 browser_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
                 url = f"http://{browser_host}:{server.server_port}"
                 print(json.dumps({"status": "ok", "url": url}, ensure_ascii=False))

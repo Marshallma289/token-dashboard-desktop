@@ -33,7 +33,7 @@
   const pageLabels = { overview: '总览', trends: '趋势分析', usage: '用量明细', pricing: '价格与数据' };
   const viewTabs = new Map([
     ['overview', 'viewTabOverview'], ['trends', 'viewTabTrends'],
-    ['usage', 'viewTabUsage'], ['pricing', 'viewTabPricing']
+    ['usage', 'viewTabUsage'], ['pricing', 'viewTabPricing'], ['skills', 'viewTabSkills']
   ]);
   const subviewTabs = {
     usage: { daily: 'usageTabDaily', requests: 'usageTabRequests', sessions: 'usageTabSessions', tasks: 'usageTabTasks', all: 'usageTabAll' },
@@ -135,6 +135,7 @@
   if (typeof document === 'undefined' || typeof window === 'undefined') return;
 
   const state = { view: 'overview', usage: 'daily', pricing: 'rules' };
+  let skillsOpen = false;
   let pages = defaultPages();
   let initialized = false;
   let pendingSelection = false;
@@ -253,12 +254,15 @@
     tab.tabIndex = selected ? 0 : -1;
   }
   function renderState(previousView) {
+    const activeView = skillsOpen ? 'skills' : state.view;
     if (editing && subviewTabs[state.view]) {
       state[state.view] = 'all';
       if (!bridgeLoaded) navigationEdits.add(state.view);
     }
-    document.querySelectorAll('[data-view-panel]').forEach(panel => { panel.hidden = panel.dataset.viewPanel !== state.view; });
-    viewTabs.forEach((id, view) => setTabState(byId(id), view === state.view));
+    document.querySelectorAll('[data-view-panel]').forEach(panel => { panel.hidden = panel.dataset.viewPanel !== activeView; });
+    viewTabs.forEach((id, view) => setTabState(byId(id), view === activeView));
+    const main = byId('main');
+    if (main) main.classList.toggle('is-skills-view', skillsOpen);
     Object.entries(subviewTabs).forEach(([view, tabs]) => {
       document.querySelectorAll('[data-subview-panel]').forEach(panel => {
         const parentView = panel.closest('[data-view-panel]');
@@ -267,11 +271,12 @@
       Object.entries(tabs).forEach(([subview, id]) => setTabState(byId(id), subview === state[view]));
     });
     const pageTitle = byId('dashboardPageTitle');
-    if (pageTitle) pageTitle.textContent = state.view === 'overview' ? '用量总览' : pageLabels[state.view];
+    if (pageTitle) pageTitle.textContent = skillsOpen ? '技能管理' : state.view === 'overview' ? '用量总览' : pageLabels[state.view];
     const pageName = byId('layoutPageName');
     if (pageName) pageName.textContent = `编辑${pageLabels[state.view]}布局`;
-    saveState();
-    if (previousView !== state.view) requestVisibleCharts();
+    if (!skillsOpen) saveState();
+    if (skillsOpen && window.DashboardSkills) window.DashboardSkills.open();
+    if (previousView !== activeView && !skillsOpen) requestVisibleCharts();
   }
   function requestVisibleCharts() {
     if (resizeQueued) return;
@@ -282,9 +287,16 @@
     });
   }
   function showView(view, subview) {
+    if (view === 'skills') {
+      if (editing) setEditing(false);
+      skillsOpen = true;
+      if (initialized) renderState(state.view);
+      return true;
+    }
     if (!viewNames.has(view)) return false;
     finishInteraction(false);
-    const previousView = state.view;
+    const previousView = skillsOpen ? 'skills' : state.view;
+    skillsOpen = false;
     state.view = view;
     if (!bridgeLoaded) navigationEdits.add('view');
     if (subviewTabs[view] && subview && Object.prototype.hasOwnProperty.call(subviewTabs[view], subview)) {
@@ -649,7 +661,7 @@
   readSavedState();
   window.CodexDashboardLayout = Object.freeze({
     showView,
-    getState: () => ({ ...state }),
+    getState: () => ({ ...state, view: skillsOpen ? 'skills' : state.view }),
     getLayout: snapshot,
     isEditing: () => editing
   });

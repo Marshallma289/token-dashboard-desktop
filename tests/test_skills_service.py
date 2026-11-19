@@ -234,11 +234,14 @@ class SkillsServiceTests(unittest.TestCase):
     def test_cli_uses_http_and_does_not_mutate_without_apply(self):
         with _test_server(self.root / "workspace") as server:
             appdata = self.root / "profile"
-            endpoint_dir = appdata / "CodexTokenDashboard"
+            home = self.root / "home"
+            endpoint_dir = (
+                home / "Library" / "Application Support" if sys.platform == "darwin" else appdata
+            ) / "CodexTokenDashboard"
             endpoint_dir.mkdir(parents=True)
             skills_service.publish_endpoint(endpoint_dir, server.server_port)
             command = [sys.executable, "-B", str(Path(skills_service.__file__)), "--agent", "hermes", "--op"]
-            env = dict(os.environ, LOCALAPPDATA=str(appdata), HOME=str(self.root), USERPROFILE=str(self.root))
+            env = dict(os.environ, LOCALAPPDATA=str(appdata), HOME=str(home), USERPROFILE=str(home))
             options = dict(capture_output=True, text=True, env=env, timeout=10)
             denied = subprocess.run(command + ["install", "--port", str(server.server_port)], **options)
             self.assertEqual(json.loads(denied.stdout), {"ok": False, "error": "explicit_apply_required"})
@@ -250,9 +253,8 @@ class SkillsServiceTests(unittest.TestCase):
                                      input='{"id":"demo"}', **options)
             self.assertEqual(allowed.returncode, 0, allowed.stderr)
             self.lib.action.assert_called_once_with("install", {"id": "demo"})
-            if sys.platform == "darwin":
-                command += ["--port", str(server.server_port)]
             activity = subprocess.run(command + ["activity"], **options)
+            self.assertEqual(activity.returncode, 0, activity.stderr or activity.stdout)
             self.assertEqual(json.loads(activity.stdout)["result"]["entries"][0]["op"], "install")
 
     def test_sync_conflict_and_stale_details_are_safe_and_cli_can_read_them(self):

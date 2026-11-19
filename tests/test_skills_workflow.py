@@ -16,7 +16,8 @@ from skills_core import SkillLibrary
 class SkillsWorkflowTests(unittest.TestCase):
     def test_same_name_in_two_workspaces_backup_and_disable(self):
         with tempfile.TemporaryDirectory() as temp:
-            base = Path(temp)
+            # macOS TMPDIR may start at /var, a symlink to /private/var.
+            base = Path(temp).resolve(strict=True)
             homes = {agent: base / agent for agent in ('codex', 'hermes')}
             env = {f'{agent.upper()}_HOME': str(home) for agent, home in homes.items()}
             db = DashboardDB(base / 'usage.sqlite3', roots=[base / 'sessions'])

@@ -51,11 +51,10 @@ def main():
         installer = Path(__file__).resolve().parent / name
         assert installer.is_file(), 'Both terminal installers are required'
         upload_files.append(installer)
-    release_body = f"""{version} 新增 Codex 与 Hermes 全局技能管理。
+    release_body = """修复 Codex 技能导入后的安装状态识别。
 
-- Codex 与 Hermes 使用独立的技能库、部署目录、预设和备份。
-- 支持从本地目录、压缩包、公开 GitHub 仓库和 skills.sh 导入技能，预览更新差异，并通过预设批量启停。
-- 支持快照备份与恢复、按工作区进行 Git 同步，也可通过本机 CLI 管理技能。
+- 从普通目录、`.system` 或其他已发现的子目录导入后，技能库会显示已安装状态，详情会显示实际路径。
+- 外部安装保持受保护，发现同名冲突时显示冲突路径并拦截重复安装。
 
 Windows x64 与 Apple Silicon macOS arm64 共用源码。安装命令见仓库 README；macOS 要求 14 或更新版本，当前采用临时签名，未公证。"""
     release = request('/releases', method='POST', data={'tag_name': tag, 'target_commitish': commit, 'name': f'Codex Token {version} · Build {number}', 'draft': True, 'prerelease': False, 'body': release_body})

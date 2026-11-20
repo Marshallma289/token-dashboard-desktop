@@ -457,7 +457,6 @@ class SkillLibrary:
         skill_id = rec['id']
         source = self._files / skill_id if source is None else source
         target = self._target(root, skill_id)
-        txn.directory(root)
         old = rec['deploy']
         verify = None
         if old:
@@ -468,6 +467,11 @@ class SkillLibrary:
                     return
                 verify = lambda p: self._verify_deploy(p, old)
         if verify is None:
+            external, conflicts = self._external_installation(root, rec)
+            require(not conflicts, 'install_conflict', f"Existing Codex skill: {', '.join(conflicts)}")
+            if external:
+                return
+            txn.directory(root)
             self._vacant(target)
         staged = txn.stage(root)
         new = {'root': str(root), 'mode': mode}
@@ -506,23 +510,57 @@ class SkillLibrary:
             st = info(root / rec['id'])
             return identity(st) == deployment['identity'], True
 
-    def _record(self, root, rec):
-        installed, modified = self._deployment_status(root, rec)
+    def _external_installation(self, root, rec, externals=None, *, owned=False):
+        if self.agent != 'codex':
+            return None, []
+        target = root / rec['id']
+        if externals is None:
+            externals = self._externals(root)
+
+        origin = Path(rec['origin']) if rec['origin'] else None
+        # The import preview stages local files before import_path. In those
+        # records origin is temporary, but source retains the scanned location.
+        local = next((item['source'] for item in reversed(rec['history'])
+                      if isinstance(item['source'], dict) and item['source'].get('kind') == 'local'), {})
+        source_path, subdir = local.get('path'), local.get('subdir')
+        source = Path(source_path) if isinstance(source_path, str) and isinstance(subdir, str) else None
+        names = {rec['id'].casefold(), rec['name'].casefold()}
+        installation, conflicts = None, []
+        for row in externals:
+            path = Path(row['path'])
+            if owned and (path == target or target in path.parents):
+                continue
+            from_source = source is not None and (path == source / subdir or
+                                                   (not subdir and path / 'SKILL.md' == source))
+            if not owned and path == origin:
+                if installation is not None:
+                    conflicts.append(installation)
+                installation = row['path']
+            elif not owned and from_source and installation is None:
+                installation = row['path']
+            elif names.intersection((path.name.casefold(), row['name'].casefold())):
+                conflicts.append(row['path'])
+        return installation, conflicts
+
+    def _record(self, root, rec, *, deployment_status=None, externals=None):
+        installed, modified = (self._deployment_status(root, rec) if deployment_status is None
+                               else deployment_status)
+        external, conflicts = self._external_installation(root, rec, externals, owned=installed)
         return {field: rec[field] for field in ('id', 'name', 'description', 'tags', 'source', 'version', 'digest')} | {
-            'managed': True, 'external': False, 'installed': installed, 'modified': modified,
+            'managed': True, 'external': False, 'installed': installed or external is not None, 'modified': modified,
             'mode': rec['deploy']['mode'] if rec['deploy'] else None,
-            'path': str(self._files / rec['id']), 'installed_path': str(root / rec['id']) if installed else None,
+            'path': str(self._files / rec['id']), 'installed_path': str(root / rec['id']) if installed else external,
+            'installed_externally': external is not None, 'install_conflicts': conflicts,
         }
 
-    def _externals(self, root, owned):
+    def _externals(self, root, owned=()):
         if info(root) is None:
             return
         device = root.lstat().st_dev
 
         def walk(parent):
             for path in sorted(parent.iterdir(), key=lambda p: p.name.casefold()):
-                if (path.parent == root and path.name.casefold() in owned) or (
-                        path.name.startswith('.') and path.name != '.system'):
+                if path in owned or (path.name.startswith('.') and path.name != '.system'):
                     continue
                 st = info(path)
                 if st is None or st.st_dev != device:
@@ -553,9 +591,13 @@ class SkillLibrary:
         return [{'name': name, 'ids': data['presets'][name]} for name in sorted(data['presets'], key=str.casefold)]
 
     def _state(self, data, root):
-        records = [self._record(root, rec) for rec in data['skills'].values() if not rec['deleted']]
-        owned = {rec['id'].casefold() for rec in records if rec['installed']}
-        records.extend(self._externals(root, owned))
+        active = [rec for rec in data['skills'].values() if not rec['deleted']]
+        deployments = {rec['id']: self._deployment_status(root, rec) for rec in active}
+        owned = {root / skill_id for skill_id, (installed, _) in deployments.items() if installed}
+        externals = list(self._externals(root, owned if self.agent == 'hermes' else ()))
+        records = [self._record(root, rec, deployment_status=deployments[rec['id']], externals=externals)
+                   for rec in active]
+        records.extend(row for row in externals if root / row['relative_path'].partition('/')[0] not in owned)
         records.sort(key=lambda rec: (rec['name'].casefold(), rec['id']))
         return {'skills': records, 'presets': self._presets(data), 'root': str(root)}
 
@@ -757,6 +799,8 @@ class SkillLibrary:
                 elif op == 'delete':
                     self._remove(data, root, txn, rec)
                 elif op == 'disable' or not enabled:
+                    require(not self._record(root, rec)['installed_externally'], 'external_skill',
+                            'External installations are read-only')
                     self._disable(root, rec, txn)
                 else:
                     self._verify_tree(self._files / rec['id'], rec['digest'], rec['identity'])

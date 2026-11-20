@@ -24,7 +24,8 @@ async function main() {
   try {
     const names = { codex: 'codex-external-fixture', hermes: 'hermes-external-fixture' };
     for (const agent of Object.keys(names)) {
-      const location = path.join(root, agent, 'skills', names[agent]);
+      const location = agent === 'codex' ? path.join(root, agent, 'skills', '.system', names[agent])
+        : path.join(root, agent, 'skills', names[agent]);
       await fs.mkdir(location, { recursive: true });
       await fs.writeFile(path.join(location, 'SKILL.md'), `---\nname: ${names[agent]}\ndescription: external fixture\n---\n<script>throw new Error('not rendered as HTML')</script>\n`);
     }
@@ -121,6 +122,26 @@ async function main() {
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
     assert.ok((await ws.getByRole('checkbox', { name: '选择 catalog-beta' }).locator('..').boundingBox()).width >= 44);
     if (process.env.SKILLS_QA_DIR) await page.screenshot({ path: path.join(process.env.SKILLS_QA_DIR, 'skills-narrow.png'), fullPage: true });
+
+    await section('已装');
+    const discovered = ws.locator('.skills-card').filter({
+      has: page.getByRole('button', { name: `查看 ${names.codex} 详情` })
+    });
+    await discovered.getByRole('button', { name: '导入库' }).click();
+    await dialog.getByRole('button', { name: '预览技能' }).click();
+    await dialog.getByRole('button', { name: '全选', exact: true }).click();
+    await dialog.getByRole('button', { name: '导入所选技能' }).click();
+    await dialog.waitFor({ state: 'hidden' });
+    await wait(discovered.getByText('已装 · 受保护'));
+    assert.equal(await discovered.count(), 1);
+    await section('技能库');
+    await wait(discovered.getByText('已装 · 受保护'));
+    assert.equal(await discovered.getByRole('button', { name: '安装', exact: true }).count(), 0);
+    assert.equal(await discovered.getByRole('button', { name: '停用', exact: true }).count(), 0);
+    await codex.click();
+    await wait(dialog.getByText(path.join(root, 'codex', 'skills', '.system', names.codex), { exact: true }));
+    await page.keyboard.press('Escape');
+    await dialog.waitFor({ state: 'hidden' });
 
     await section('设置');
     await ws.getByRole('button', { name: '查看日志' }).click();

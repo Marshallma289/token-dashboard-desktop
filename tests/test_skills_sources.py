@@ -53,6 +53,57 @@ class SkillSourcesTest(unittest.TestCase):
         self.assertEqual(out["errors"], [])
         return out["imported"][0]["skill"]["id"]
 
+    def test_import_from_codex_installation_keeps_actual_path_and_protects_files(self):
+        root = self.base / "codex" / "skills"
+        for name, folder in (("ordinary", ""), ("create-statusline", ".system"), ("nested", "pack/category")):
+            with self.subTest(folder=folder):
+                path = self.skill(name, root / folder)
+                original = (path / "SKILL.md").read_bytes()
+                external = next(row for row in self.lib.state()["skills"] if row["path"] == str(path))
+                self.assertEqual(external["installed_path"], str(path))
+                source = {".system": path / "SKILL.md", "pack/category": path.parent.parent}.get(folder, path)
+                sid = self.imported(source)
+                detail = self.lib.action("detail", {"id": sid})["skill"]
+                self.assertTrue(detail["installed"])
+                self.assertTrue(detail["installed_externally"])
+                self.assertEqual(detail["installed_path"], str(path))
+                row = next(row for row in self.lib.state()["skills"] if row["id"] == sid)
+                self.assertEqual(row["installed_path"], str(path))
+                result = self.lib.action("install", {"id": sid, "mode": "link"})
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(self.lib.action("disable", {"id": sid})["code"], "external_skill")
+                self.assertTrue(self.lib.action("delete", {"id": sid})["ok"])
+                self.assertEqual((path / "SKILL.md").read_bytes(), original)
+                if folder:
+                    self.assertFalse((root / sid).exists())
+
+    def test_codex_same_name_external_blocks_install_even_in_nested_storage(self):
+        root = self.base / "codex" / "skills"
+        existing = self.skill("renamed-directory", root / ".system")
+        (existing / "SKILL.md").write_text(doc("Duplicate", "external content"), encoding="utf-8")
+        sid = self.imported(self.skill("duplicate"))
+        detail = self.lib.action("detail", {"id": sid})["skill"]
+        self.assertFalse(detail["installed"])
+        self.assertEqual(detail["install_conflicts"], [str(existing)])
+        result = self.lib.action("install", {"id": sid})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "install_conflict")
+        self.assertFalse((root / sid).exists())
+        self.assertIn("external content", (existing / "SKILL.md").read_text(encoding="utf-8"))
+
+    def test_codex_same_name_conflict_created_after_import_blocks_batch_and_preset(self):
+        root = self.base / "codex" / "skills"
+        ids = [self.imported(self.skill(name)) for name in ("other", "shared")]
+        self.assertTrue(self.lib.action("preset_save", {"name": "pair", "ids": ids})["ok"])
+        existing = self.skill("Shared", root / "packages")
+        for op, payload in (("install", {"ids": ids}), ("preset_apply", {"name": "pair"})):
+            with self.subTest(op=op):
+                result = self.lib.action(op, payload)
+                self.assertEqual(result.get("code"), "install_conflict", result)
+                self.assertFalse((root / "other").exists())
+                self.assertFalse((root / "shared").exists())
+                self.assertTrue((existing / "SKILL.md").is_file())
+
     def test_local_discovery_requires_scoped_explicit_selection(self):
         a = self.skill("first")
         self.skill("second")

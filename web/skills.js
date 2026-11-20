@@ -31,6 +31,12 @@
     return [...data.skills, ...external.filter(item => !data.skills.some(skill => isExternal(skill) && idOf(skill) === idOf(item)))];
   };
   const isInstalled = item => item?.installed === true;
+  const canInstall = item => !isInstalled(item) && !list(item?.install_conflicts).length;
+  const canDisable = item => !isExternal(item) && isInstalled(item) && item.installed_externally !== true;
+  const installedSkills = skills => {
+    const importedPaths = new Set(skills.filter(item => item.installed_externally).map(item => item.installed_path));
+    return skills.filter(item => isInstalled(item) && !(isExternal(item) && importedPaths.has(item.installed_path)));
+  };
   const sourceOf = item => {
     if (isExternal(item)) return 'external';
     const source = item?.source;
@@ -54,7 +60,8 @@
     sync_conflict_stale: '版本已变化，请重新核对后再选择处理方式。',
     preview_expired: '预览已过期，请重新预览。', update_expired: '更新预览已过期，请重新打开预览。',
     connection_changed: '仓库连接已更改，请重新确认是否开启自动同步。', sync_not_connected: '尚未连接备份仓库。',
-    autosync_io: '自动同步状态读写失败，请检查本机目录权限。', remote_ahead: '远端有新版本。'
+    autosync_io: '自动同步状态读写失败，请检查本机目录权限。', remote_ahead: '远端有新版本。',
+    'A Codex skill with the same name already exists in the global skills directory. Refresh and check the conflicting paths in the skill details.': 'Codex 全局目录已有同名技能。刷新后，在技能详情中查看冲突路径。'
   };
   function apiMessage(error) {
     const message = text(error?.message ?? error?.error ?? error);
@@ -118,7 +125,8 @@
 
   function getResults(ws) {
     const skills = ws.data?.skills ?? [];
-    const base = skills.filter(skill => ws.view === 'external' ? isExternal(skill) : ws.view === 'installed' ? isInstalled(skill) : !isExternal(skill));
+    const base = ws.view === 'installed' ? installedSkills(skills)
+      : skills.filter(skill => ws.view === 'external' ? isExternal(skill) : !isExternal(skill));
     const options = {
       sources: [...new Set(base.map(sourceOf))].sort(),
       tags: [...new Set(base.flatMap(tagsOf))].sort((a, b) => a.localeCompare(b, 'zh-CN'))
@@ -137,21 +145,28 @@
   const option = (value, label, activeValue) => `<option value="${esc(value)}"${value === activeValue ? ' selected' : ''}>${esc(label)}</option>`;
   const tag = value => `<span class="skills-tag">${esc(value)}</span>`;
   const versionOf = item => text(item?.version ?? item?.version_id ?? item?.revision);
+  const statusLabel = item => {
+    if (isExternal(item)) return '外部 · 受保护';
+    if (item.installed_externally) return '已装 · 受保护';
+    if (isInstalled(item)) return list(item.install_conflicts).length ? '已装 · 同名冲突' : '已装';
+    return canInstall(item) ? '未安装' : '同名冲突';
+  };
   function card(ws, skill) {
     const id = idOf(skill);
     const name = nameOf(skill);
     const external = isExternal(skill);
     const installed = isInstalled(skill);
-    const state = external ? '外部 · 受保护' : installed ? '已装' : '未安装';
     const update = !external && hasUpdate(ws, skill);
     const version = versionOf(skill);
-    const action = external
-      ? btn('导入库', 'adopt', { value: id, disabled: !text(skill.path) || !!ws.busy })
-      : installed ? btn('停用', 'disable', { value: id, disabled: !!ws.busy })
-        : btn('安装', 'install', { value: id, tone: 'quiet-primary', disabled: !!ws.busy });
+    const options = { value: id, disabled: !!ws.busy };
+    let action = '';
+    if (external) action = btn('导入库', 'adopt', { ...options, disabled: !text(skill.path) || !!ws.busy });
+    else if (canDisable(skill)) action = btn('停用', 'disable', options);
+    else if (canInstall(skill)) action = btn('安装', 'install', { ...options, tone: 'quiet-primary' });
+    else if (list(skill.install_conflicts).length) action = btn('查看冲突', 'detail', options);
     const selector = ws.view === 'library' && !external ? `<label class="skills-card-select"><input type="checkbox" data-skill-selection="${esc(id)}" aria-label="选择 ${esc(name)}"${ws.selection.has(id) ? ' checked' : ''}${ws.busy ? ' disabled' : ''}></label>` : `<span class="skills-card-icon">${icon('package')}</span>`;
     return `<article class="skills-card">
-      <div class="skills-card-body"><div class="skills-card-head">${selector}<h3><button type="button" class="skills-title-btn" data-skill-action="${external ? 'external-detail' : 'detail'}" data-value="${esc(id)}" aria-label="查看 ${esc(name)} 详情">${esc(name)}</button></h3><span class="skills-state${installed && !external ? ' is-installed' : ''}"><i aria-hidden="true"></i>${state}</span></div>
+      <div class="skills-card-body"><div class="skills-card-head">${selector}<h3><button type="button" class="skills-title-btn" data-skill-action="${external ? 'external-detail' : 'detail'}" data-value="${esc(id)}" aria-label="查看 ${esc(name)} 详情">${esc(name)}</button></h3><span class="skills-state${installed && !external ? ' is-installed' : ''}"><i aria-hidden="true"></i>${statusLabel(skill)}</span></div>
       <p class="skills-card-desc">${esc(text(skill.description) || '暂无描述')}</p>
       ${tagsOf(skill).length ? `<div class="skills-tags">${tagsOf(skill).slice(0, 4).map(tag).join('')}${tagsOf(skill).length > 4 ? tag(`+${tagsOf(skill).length - 4}`) : ''}</div>` : ''}</div>
       <div class="skills-card-foot"><span class="skills-card-meta" title="${esc(version)}">${esc(sourceLabel(sourceOf(skill)))}${version ? ` <span aria-hidden="true">·</span> ${esc(version)}` : ''}</span><div class="skills-actions">${update ? btn('可更新', 'update', { value: id, tone: 'warning', disabled: !!ws.busy }) : ''}${action}</div></div>
@@ -162,7 +177,7 @@
     const selected = choices.find(item => presetName(item) === ws.preset);
     const members = list(selected?.ids).map(id => selectedSkill(ws, id)).filter(Boolean);
     const busy = !!ws.busy;
-    return `<div class="skills-presets"><label for="skillsPreset">预设</label><select id="skillsPreset">${option('', '选择预设', ws.preset)}${choices.map(item => option(presetName(item), `${presetName(item)} · ${list(item.ids).length} 项`, ws.preset)).join('')}</select>${btn('启用成员', 'preset-apply', { value: 'enable', disabled: busy || !members.some(item => !isInstalled(item)) })}${btn('停用成员', 'preset-apply', { value: 'disable', disabled: busy || !members.some(isInstalled) })}${btn('删除预设', 'preset-delete', { tone: 'danger-quiet', disabled: busy || !selected })}${btn('新建预设', 'preset-save', { glyph: 'plus', disabled: busy })}</div>`;
+    return `<div class="skills-presets"><label for="skillsPreset">预设</label><select id="skillsPreset">${option('', '选择预设', ws.preset)}${choices.map(item => option(presetName(item), `${presetName(item)} · ${list(item.ids).length} 项`, ws.preset)).join('')}</select>${btn('启用成员', 'preset-apply', { value: 'enable', disabled: busy || !members.some(canInstall) })}${btn('停用成员', 'preset-apply', { value: 'disable', disabled: busy || !members.some(canDisable) })}${btn('删除预设', 'preset-delete', { tone: 'danger-quiet', disabled: busy || !selected })}${btn('新建预设', 'preset-save', { glyph: 'plus', disabled: busy })}</div>`;
   }
   function renderList(ws) {
     if (!ws.data) return ws.pending.has('state') ? loading('正在读取技能工作区…') : '';
@@ -196,7 +211,7 @@
     const selected = selectedItems(ws, items);
     const all = selected.length === items.length && items.length > 0;
     const disabled = !!ws.busy;
-    return `${btn(all ? '取消全选' : '全选结果', 'batch-select', { disabled })}${selected.length ? `<span class="skills-count">已选 ${selected.length} 项</span>${btn('清空选择', 'batch-clear', { disabled })}${btn('批量安装', 'batch-install', { disabled: disabled || selected.every(isInstalled) })}${btn('批量停用', 'batch-disable', { disabled: disabled || selected.every(item => !isInstalled(item)) })}${btn('批量删除', 'batch-delete', { tone: 'danger-quiet', disabled })}` : ''}`;
+    return `${btn(all ? '取消全选' : '全选结果', 'batch-select', { disabled })}${selected.length ? `<span class="skills-count">已选 ${selected.length} 项</span>${btn('清空选择', 'batch-clear', { disabled })}${btn('批量安装', 'batch-install', { disabled: disabled || !selected.some(canInstall) })}${btn('批量停用', 'batch-disable', { disabled: disabled || !selected.some(canDisable) })}${btn('批量删除', 'batch-delete', { tone: 'danger-quiet', disabled })}` : ''}`;
   }
   function paintSelection(ws) {
     const toolbar = host.querySelector('#skillsBatch');
@@ -270,7 +285,7 @@
     const form = host.querySelector('[data-skill-form="market"]');
     const draftQuery = form?.elements.query.value;
     const visible = ws.data?.skills ?? [];
-    const counts = { library: visible.filter(skill => !isExternal(skill)).length, installed: visible.filter(isInstalled).length, external: visible.filter(isExternal).length };
+    const counts = { library: visible.filter(skill => !isExternal(skill)).length, installed: installedSkills(visible).length, external: visible.filter(isExternal).length };
     const root = rootPath(ws.data?.root ?? ws.rootInfo);
     host.innerHTML = `<div class="skills-context">
       <div class="skills-context-name"><span class="skills-agent-icon">${icon(active === 'codex' ? 'terminal' : 'hermes')}</span><div><h2>${agents[active]} 全局工作区</h2>${root ? `<code title="${esc(root)}">${esc(root)}</code>` : ''}</div></div>
@@ -425,7 +440,9 @@
       if (!stillOpen()) return;
       const item = { ...skill, ...(result?.skill ?? result?.detail ?? result) };
       const content = text(result?.content ?? item.content ?? item.markdown ?? item.skill_md);
-      const detailRows = [['工作区', agents[ws.agent]], ['状态', external ? '外部 · 未纳入管理' : isInstalled(item) ? '已装' : '未安装'], ['来源', sourceLabel(sourceOf(item))], ['版本', versionOf(item)], ['目录', text(item.path)]];
+      const detailRows = [['工作区', agents[ws.agent]], ['状态', statusLabel(item)], ['来源', sourceLabel(sourceOf(item))],
+        ['版本', versionOf(item)], ['库内目录', external ? '' : text(item.path)], ['安装目录', text(item.installed_path)],
+        ...list(item.install_conflicts).map(path => ['同名冲突目录', path])];
       showModal(title, `<dl class="skills-meta">${detailRows.filter(([, value]) => value).map(([key, value]) => `<div><dt>${key}</dt><dd>${esc(value)}</dd></div>`).join('')}</dl>
       ${item.description ? `<p>${esc(item.description)}</p>` : ''}${tagsOf(item).length ? `<div class="skills-tags">${tagsOf(item).map(tag).join('')}</div>` : ''}
       ${content ? `<details class="skills-document" open><summary>SKILL.md</summary><pre>${esc(content)}</pre></details>` : ''}
@@ -638,7 +655,7 @@
       }
       const op = action.slice(6);
       if (!['install', 'disable', 'delete'].includes(op)) return;
-      const selected = selectedItems(ws, items).filter(item => op === 'delete' || (op === 'disable') === isInstalled(item));
+      const selected = selectedItems(ws, items).filter(item => op === 'delete' || (op === 'disable' ? canDisable(item) : canInstall(item)));
       if (!selected.length) return;
       const verb = { install: '安装', disable: '停用', delete: '删除' }[op];
       const title = `批量${verb} ${selected.length} 项技能`;
@@ -749,8 +766,8 @@
     if (action === 'adopt') return showImport(ws, 'local', { path: skill.path });
     if (action === 'update') return showUpdate(ws, skill);
     if (action === 'history') return showHistory(ws, skill);
-    if (action === 'install') return showModal(`安装「${name}」`, `<p>安装到 ${agents[ws.agent]} 的全局技能目录。</p><label class="skills-field"><span>部署方式</span><select name="mode"><option value="copy">复制文件</option><option value="link">符号链接</option></select></label>`, { label: '确认安装', submit: form => change(ws, 'install', { id, mode: form.get('mode') }, '已安装技能。') });
-    if (action === 'disable') return confirmAction('停用技能', `从 ${agents[ws.agent]} 的安装目录移除「${name}」，技能库中的副本仍保留。`, () => change(ws, 'disable', { id }, '已停用技能。'), { label: '确认停用' });
+    if (action === 'install' && canInstall(skill)) return showModal(`安装「${name}」`, `<p>安装到 ${agents[ws.agent]} 的全局技能目录。</p><label class="skills-field"><span>部署方式</span><select name="mode"><option value="copy">复制文件</option><option value="link">符号链接</option></select></label>`, { label: '确认安装', submit: form => change(ws, 'install', { id, mode: form.get('mode') }, '已安装技能。') });
+    if (action === 'disable' && canDisable(skill)) return confirmAction('停用技能', `从 ${agents[ws.agent]} 的安装目录移除「${name}」，技能库中的副本仍保留。`, () => change(ws, 'disable', { id }, '已停用技能。'), { label: '确认停用' });
     if (action === 'delete') return confirmAction('删除技能', `从 ${agents[ws.agent]} 的技能库删除「${name}」，并移除它的受管安装和预设成员资格。`, () => change(ws, 'delete', { id }, '已删除技能。'), { label: '确认删除', danger: true });
     if (action === 'tags') return showModal(`编辑标签 · ${name}`, field('标签（用逗号分隔）', 'tags', { value: tagsOf(skill).join(', ') }), { label: '保存标签', submit: form => change(ws, 'tags', { id, tags: [...new Set(fieldValue(form, 'tags').split(/[,，]/).map(value => value.trim()).filter(Boolean))] }, '已保存标签。') });
     if (action === 'export') return showModal(`导出「${name}」`, field('服务主机上的绝对路径（.zip 或 .skill）', 'path', { required: true }), { label: '导出技能', submit: form => change(ws, 'export', { id, path: fieldValue(form, 'path') }, result => `已导出到 ${text(result?.path) || fieldValue(form, 'path')}。`, false) });

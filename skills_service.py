@@ -56,6 +56,7 @@ _PUBLIC_ERRORS = {
     "not_found": "Refresh the library and select an existing skill, preset, or version.",
     "duplicate_id": "Choose a unique skill ID or use the explicit update action.",
     "target_exists": "Check the install root for an existing skill. It was not overwritten.",
+    "install_conflict": "A Codex skill with the same name already exists in the global skills directory. Refresh and check the conflicting paths in the skill details.",
     "deployments_active": "Disable affected managed deployments before retrying.",
     "modified": "Local skill files have changed. Preserve your edits before retrying.",
     "external_skill": "External installations are read-only. Import the skill to manage a separate copy.",

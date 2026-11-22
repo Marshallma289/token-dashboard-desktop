@@ -30,7 +30,7 @@ EXCLUDED_DIRS = {".git", ".venv", "__pycache__", ".pytest_cache", "release", "di
 RUNTIME_FILES = (
     "backend.py", "hermes_source.py", "desktop.py", "pricing.py", "VERSION", "requirements-desktop.txt",
     "updater.py", "update_helpers.py", "skills_service.py", "skills_core.py", "skills_sources.py", "skills_backup.py",
-    "skills_github.py", "skills_autosync.py",
+    "skills_github.py", "skills_autosync.py", "skills_upstream.py", "skills_translation.py",
 )
 PORTABLE_FILES = (
     "LICENSE", "THIRD_PARTY_NOTICES.md", "providers.json.example", "VERSION",
@@ -225,7 +225,7 @@ def build(output_dir: Path, *, skip_tests: bool = False) -> tuple[Path, Path]:
     manifest_path.write_text(manifest_text, encoding="utf-8")
     if sys.platform == "win32":
         (package / "build-manifest.json").write_text(manifest_text, encoding="utf-8")
-        with zipfile.ZipFile(archive, "x", compression=zipfile.ZIP_DEFLATED) as handle:
+        with zipfile.ZipFile(archive, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as handle:
             for path in sorted(package.rglob("*")):
                 if path.is_file():
                     handle.write(path, path.relative_to(package.parent).as_posix())

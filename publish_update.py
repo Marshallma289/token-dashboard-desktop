@@ -51,10 +51,11 @@ def main():
         installer = Path(__file__).resolve().parent / name
         assert installer.is_file(), 'Both terminal installers are required'
         upload_files.append(installer)
-    release_body = """修复 Codex 技能导入后的安装状态识别。
+    release_body = """技能简介翻译、GitHub 更新与安装包精简。
 
-- 从普通目录、`.system` 或其他已发现的子目录导入后，技能库会显示已安装状态，详情会显示实际路径。
-- 外部安装保持受保护，发现同名冲突时显示冲突路径并拦截重复安装。
+- Codex 和 Hermes 可分别开启 DeepL 简体中文简介翻译。配置本机环境变量 `DEEPL_AUTH_KEY` 后重启看板，已翻译的简介在本机缓存。
+- 可为受管技能关联公开 GitHub 仓库。开启自动更新后，每天首次启动时检查，跳过有本地修改或由外部安装的技能。
+- 精简命令行工具的打包依赖，减少 Windows 便携包体积。
 
 Windows x64 与 Apple Silicon macOS arm64 共用源码。安装命令见仓库 README；macOS 要求 14 或更新版本，当前采用临时签名，未公证。"""
     release = request('/releases', method='POST', data={'tag_name': tag, 'target_commitish': commit, 'name': f'Codex Token {version} · Build {number}', 'draft': True, 'prerelease': False, 'body': release_body})

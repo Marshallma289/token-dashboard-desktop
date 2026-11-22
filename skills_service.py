@@ -28,13 +28,15 @@ _BACKUP_OPS = frozenset({"backup_create", "backup_list", "backup_restore", "sync
                          "sync_push", "sync_pull", "sync_resolve"})
 _GITHUB_OPS = frozenset({"github_status", "github_connect"})
 _AUTOSYNC_OPS = frozenset({"autosync_status", "autosync_set", "autosync_resume"})
+_AUTOMATION_OPS = frozenset({"skill_automation", "github_source", "github_link", "translate_descriptions"})
 _CORE_OPS = frozenset({"detail", "history", "root", "install", "disable", "delete", "tags", "rollback",
                        "update", "preset_save", "preset_apply", "preset_delete"})
 _READ_OPS = frozenset({"state", "detail", "history", "backup_list", "sync_status", "activity", "activity_export",
-                       "autosync_status"})
-OPS = _CORE_OPS | _SOURCE_OPS | _BACKUP_OPS | _GITHUB_OPS | _AUTOSYNC_OPS | _READ_OPS | {"install_manager"}
+                       "autosync_status", "github_source", "skill_automation"})
+OPS = (_CORE_OPS | _SOURCE_OPS | _BACKUP_OPS | _GITHUB_OPS | _AUTOSYNC_OPS |
+       _AUTOMATION_OPS | _READ_OPS | {"install_manager"})
 _AUDITED_OPS = OPS - _READ_OPS - {"local_preview", "archive_preview", "github_preview", "market",
-                                  "check_updates", "update_preview", "github_status"}
+                                  "check_updates", "update_preview", "github_status", "translate_descriptions"}
 _TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
 _REVISION = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
@@ -101,6 +103,7 @@ _PUBLIC_ERRORS = {
     "github_helper_unavailable": "Update the official GitHub CLI or choose SSH.",
     "autosync_busy": "Wait for automatic sync to finish or restart the desktop app.",
     "autosync_io": "Check the automatic sync settings directory and its permissions.",
+    "github_version_mismatch": "The local files differ from this GitHub version. Check the branch and skill folder.",
 }
 
 
@@ -299,10 +302,13 @@ def check_dependencies() -> None:
     from skills_backup import handle as handle_backup
     from skills_github import handle as handle_github, credential_helper
     from skills_autosync import AutoSyncManager, get_autosync, OPS as autosync_ops
+    from skills_translation import TranslationCache
+    from skills_upstream import UpstreamWorker
 
     if autosync_ops != _AUTOSYNC_OPS or not all(callable(value) for value in (
             SkillLibrary, handle_sources, handle_backup, handle_github, credential_helper, get_autosync,
-            AutoSyncManager.action, AutoSyncManager.start, AutoSyncManager.stop)):
+            AutoSyncManager.action, AutoSyncManager.start, AutoSyncManager.stop, TranslationCache.translate,
+            UpstreamWorker.start, UpstreamWorker.stop)):
         raise RuntimeError("Invalid skills module interfaces")
 
 
@@ -310,6 +316,8 @@ class SkillsService:
     def __init__(self, data_dir: Path) -> None:
         self.data_dir = data_dir.expanduser().resolve()
         self._autosync = None
+        self._upstream = None
+        self._translations = None
         key = os.path.normcase(str(self.data_dir))
         with _locks_guard:
             self._lock = _locks.get(key)
@@ -325,6 +333,15 @@ class SkillsService:
                 self._autosync = get_autosync(self.data_dir)
             return self._autosync
 
+    @property
+    def upstream(self):
+        with self._lock:
+            if self._upstream is None:
+                from skills_upstream import UpstreamWorker
+
+                self._upstream = UpstreamWorker(self.data_dir)
+            return self._upstream
+
     def dispatch(self, request: Mapping[str, Any]) -> Any:
         if set(request) != {"agent", "op", "payload"}:
             raise InvalidSkillsRequest("invalid_body")
@@ -335,6 +352,18 @@ class SkillsService:
             raise InvalidSkillsRequest("invalid_operation")
         if not isinstance(payload, dict) or (op in {"state", "activity", "activity_export"} and payload):
             raise InvalidSkillsRequest("invalid_payload")
+
+        if op == "translate_descriptions":
+            from skills_core import SkillLibrary
+            from skills_translation import TranslationCache
+
+            with self._lock:
+                if self._translations is None:
+                    self._translations = TranslationCache(self.data_dir)
+            try:
+                return self._translations.translate(SkillLibrary(self.data_dir, agent), payload)
+            except (ValueError, OSError) as error:
+                raise InvalidSkillsRequest(_public_error(op, getattr(error, "code", None))) from None
 
         # Reads can inspect several files, so they share the write lock too.
         # The lock covers construction and both agents, across server instances.
@@ -379,6 +408,17 @@ class SkillsService:
         lib = SkillLibrary(self.data_dir, agent)
         if op == "state":
             return lib.state()
+        if op == "skill_automation":
+            from skills_translation import auth_key
+
+            settings = lib.automation(payload or None)
+            if payload.get("github_auto") is True:
+                self.upstream.request_check(agent)
+            return {"settings": settings, "key_available": bool(auth_key()), "upstream": self.upstream.status(agent)}
+        if op in {"github_source", "github_link"}:
+            from skills_upstream import skill_source
+
+            return skill_source(lib, payload, link=op == "github_link")
         if op in _SOURCE_OPS:
             from skills_sources import handle
             return handle(lib, op, payload)
@@ -419,6 +459,8 @@ def cli(argv: list[str] | None = None) -> int:
         payload = json.loads(raw.decode("utf-8"))
         if not isinstance(payload, dict):
             raise ValueError
+        if args.op == "skill_automation" and payload and not args.apply:
+            return emit({"ok": False, "error": "explicit_apply_required"})
         body = json.dumps({"agent": args.agent, "op": args.op, "payload": payload},
                           ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
         if len(body) > MAX_BODY:

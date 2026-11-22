@@ -61,6 +61,7 @@
     preview_expired: '预览已过期，请重新预览。', update_expired: '更新预览已过期，请重新打开预览。',
     connection_changed: '仓库连接已更改，请重新确认是否开启自动同步。', sync_not_connected: '尚未连接备份仓库。',
     autosync_io: '自动同步状态读写失败，请检查本机目录权限。', remote_ahead: '远端有新版本。',
+    'The local files differ from this GitHub version. Check the branch and skill folder.': '本地文件与该 GitHub 版本不一致，请核对分支和技能目录。',
     'A Codex skill with the same name already exists in the global skills directory. Refresh and check the conflicting paths in the skill details.': 'Codex 全局目录已有同名技能。刷新后，在技能详情中查看冲突路径。'
   };
   function apiMessage(error) {
@@ -97,7 +98,8 @@
     agent, view: 'library', data: null, busy: '', loadError: '', notice: '', error: '',
     query: '', source: '', tag: '', filter: 'all', preset: '', updates: new Map(), selection: new Set(),
     market: { query: '', board: 'hot', items: null, pending: false, error: '' },
-    backups: null, sync: null, conflict: null, autoSync: null, resolvedConflict: '', rootInfo: null, readErrors: {}, pending: new Set()
+    backups: null, sync: null, conflict: null, autoSync: null, resolvedConflict: '', rootInfo: null, readErrors: {}, pending: new Set(),
+    automation: null, translations: new Map(), translationError: '', translationRetry: 0
   }]));
   let active = 'codex';
   let host;
@@ -109,6 +111,75 @@
   const selectedSkill = (ws, id, external = false) => ws.data?.skills.find(skill => idOf(skill) === id && isExternal(skill) === external);
   const say = message => { document.getElementById('skillsAnnouncement').textContent = message; };
   function paint(ws) { if (ws === current() && host) render(); }
+  const translationErrors = {
+    translation_key_missing: '未检测到 DEEPL_AUTH_KEY。配置环境变量并重启看板后重试。',
+    translation_auth: 'DeepL 未接受 API 密钥，请检查 DEEPL_AUTH_KEY。',
+    translation_quota: 'DeepL 翻译额度已用完，当前显示原文。',
+    translation_unavailable: '暂时无法连接 DeepL，当前显示原文。'
+  };
+  const translationEnabled = ws => ws.data?.automation?.translate === true;
+  const originalOf = item => text(item.description).slice(0, 2000);
+  const descriptionOf = (ws, item) => translationEnabled(ws) && ws.translations.get(originalOf(item)) || text(item.description);
+  const descriptionAttr = (ws, item) => translationEnabled(ws) && originalOf(item)
+    ? ` data-skill-description="${esc(originalOf(item))}"` : '';
+  const translationNodes = selector => [
+    ...host.querySelectorAll(selector), ...(dialog?.open ? dialog.querySelectorAll(selector) : [])
+  ];
+
+  async function translateVisible(ws) {
+    if (ws !== current() || !translationEnabled(ws) || ws.pending.has('translation') || Date.now() < ws.translationRetry) return;
+    const nodes = translationNodes('[data-skill-description]');
+    const texts = [...new Set(nodes.map(node => node.dataset.skillDescription))]
+      .filter(value => value && !ws.translations.has(value)).slice(0, 16);
+    if (!texts.length) return;
+    ws.pending.add('translation');
+    try {
+      const result = await request(ws.agent, 'translate_descriptions', { texts });
+      ws.translationError = translationErrors[result?.error] || '';
+      if (result?.error) ws.translationRetry = Date.now() + 60000;
+      for (const value of texts) {
+        const translated = Object.hasOwn(result?.translations ?? {}, value) ? text(result.translations[value]) : '';
+        if (translated || !result?.error) ws.translations.set(value, translated);
+      }
+    } catch (_) {
+      ws.translationError = translationErrors.translation_unavailable;
+      ws.translationRetry = Date.now() + 60000;
+    } finally {
+      ws.pending.delete('translation');
+    }
+    if (ws !== current() || !translationEnabled(ws)) return;
+    for (const node of translationNodes('[data-skill-description]')) {
+      const translated = ws.translations.get(node.dataset.skillDescription);
+      if (translated) {
+        node.textContent = translated;
+        if (node.classList.contains('skills-card-desc')) node.title = node.dataset.skillDescription;
+      }
+    }
+    for (const original of translationNodes('[data-skill-original]')) {
+      original.hidden = !ws.translations.get(original.dataset.skillOriginal);
+    }
+    if (ws.view === 'settings') paint(ws);
+    else if (!ws.translationError) void translateVisible(ws);
+  }
+
+  async function readAutomation(ws, quiet = false) {
+    if (ws.pending.has('automation')) return;
+    ws.pending.add('automation');
+    const previous = ws.automation;
+    const hadError = !!ws.readErrors.automation;
+    try {
+      ws.automation = await request(ws.agent, 'skill_automation');
+      delete ws.readErrors.automation;
+      const latest = ws.automation?.upstream;
+      if (latest?.checked_at && previous?.upstream?.checked_at !== latest.checked_at && (latest.updated || latest.linked)) {
+        await loadState(ws);
+      }
+    } catch (error) { ws.readErrors.automation = error.message; }
+    finally {
+      ws.pending.delete('automation');
+      if (!quiet || hadError || ws.readErrors.automation || JSON.stringify(previous) !== JSON.stringify(ws.automation)) paint(ws);
+    }
+  }
 
   async function loadState(ws) {
     if (ws.pending.has('state')) return;
@@ -138,7 +209,7 @@
       if (ws.tag && ws.tag !== '__untagged' && options.tags.includes(ws.tag) && !tagsOf(skill).includes(ws.tag)) return false;
       if (ws.view === 'library' && ws.filter === 'available' && isInstalled(skill)) return false;
       if (ws.view === 'library' && ws.filter === 'updates' && !hasUpdate(ws, skill)) return false;
-      return !query || [idOf(skill), nameOf(skill), text(skill.description), sourceLabel(sourceOf(skill)), ...tagsOf(skill)].some(value => value.toLocaleLowerCase().includes(query));
+      return !query || [idOf(skill), nameOf(skill), text(skill.description), descriptionOf(ws, skill), sourceLabel(sourceOf(skill)), ...tagsOf(skill)].some(value => value.toLocaleLowerCase().includes(query));
     }) };
   }
   const hasUpdate = (ws, skill) => ws.updates.get(idOf(skill))?.status === 'available' || (!ws.updates.has(idOf(skill)) && skill.update_available === true);
@@ -167,7 +238,7 @@
     const selector = ws.view === 'library' && !external ? `<label class="skills-card-select"><input type="checkbox" data-skill-selection="${esc(id)}" aria-label="选择 ${esc(name)}"${ws.selection.has(id) ? ' checked' : ''}${ws.busy ? ' disabled' : ''}></label>` : `<span class="skills-card-icon">${icon('package')}</span>`;
     return `<article class="skills-card">
       <div class="skills-card-body"><div class="skills-card-head">${selector}<h3><button type="button" class="skills-title-btn" data-skill-action="${external ? 'external-detail' : 'detail'}" data-value="${esc(id)}" aria-label="查看 ${esc(name)} 详情">${esc(name)}</button></h3><span class="skills-state${installed && !external ? ' is-installed' : ''}"><i aria-hidden="true"></i>${statusLabel(skill)}</span></div>
-      <p class="skills-card-desc">${esc(text(skill.description) || '暂无描述')}</p>
+      <p class="skills-card-desc"${descriptionAttr(ws, skill)}${descriptionOf(ws, skill) !== text(skill.description) ? ` title="${esc(skill.description)}"` : ''}>${esc(descriptionOf(ws, skill) || '暂无描述')}</p>
       ${tagsOf(skill).length ? `<div class="skills-tags">${tagsOf(skill).slice(0, 4).map(tag).join('')}${tagsOf(skill).length > 4 ? tag(`+${tagsOf(skill).length - 4}`) : ''}</div>` : ''}</div>
       <div class="skills-card-foot"><span class="skills-card-meta" title="${esc(version)}">${esc(sourceLabel(sourceOf(skill)))}${version ? ` <span aria-hidden="true">·</span> ${esc(version)}` : ''}</span><div class="skills-actions">${update ? btn('可更新', 'update', { value: id, tone: 'warning', disabled: !!ws.busy }) : ''}${action}</div></div>
     </article>`;
@@ -248,7 +319,23 @@
     const root = rootPath(ws.rootInfo ?? ws.data?.root);
     return `<section class="skills-section"><header class="skills-section-head"><div><h2>全局技能目录</h2><p>当前工作区：${agents[ws.agent]}</p></div>${btn('读取目录', 'read-root', { glyph: 'refresh', disabled: ws.pending.has('root') })}</header>
       ${note(ws.readErrors.root, 'alert')}<dl class="skills-meta"><div><dt>安装路径</dt><dd><code>${esc(root || '未读取到路径')}</code></dd></div></dl>
-      <div class="skills-actions">${btn('更改目录', 'edit-root', { disabled: !!ws.busy || !root })}${btn('恢复默认目录', 'reset-root', { disabled: !!ws.busy || !root })}</div></section><section class="skills-section"><header class="skills-section-head"><h2>备份仓库</h2><div class="skills-actions">${githubButton(ws)}${btn('查看备份与同步', 'view', { value: 'backup' })}</div></header></section>${renderAutoSync(ws)}${activitySection()}`;
+      <div class="skills-actions">${btn('更改目录', 'edit-root', { disabled: !!ws.busy || !root })}${btn('恢复默认目录', 'reset-root', { disabled: !!ws.busy || !root })}</div></section>${renderAutomation(ws)}<section class="skills-section"><header class="skills-section-head"><h2>备份仓库</h2><div class="skills-actions">${githubButton(ws)}${btn('查看备份与同步', 'view', { value: 'backup' })}</div></header></section>${renderAutoSync(ws)}${activitySection()}`;
+  }
+
+  function renderAutomation(ws) {
+    const state = ws.automation;
+    const settings = state?.settings ?? ws.data?.automation ?? {};
+    const upstream = state?.upstream;
+    const toggle = (id, label, checked, disabled) => `<label class="skills-auto-toggle"><input type="checkbox" role="switch" id="${id}"${checked ? ' checked' : ''}${disabled ? ' disabled' : ''}>${label}</label>`;
+    return `<section class="skills-section">
+      <header class="skills-section-head"><div><h2>简介翻译</h2><p>通过 DeepL 翻译简介，译文保存在本机。</p></div>${toggle('skillsTranslate', '自动翻译', settings.translate, !state || !!ws.busy || !state.key_available && !settings.translate)}</header>
+      ${state?.key_available === false ? note(translationErrors.translation_key_missing) : ''}
+      ${ws.translationError && state?.key_available ? note(ws.translationError, 'alert') : ''}
+    </section><section class="skills-section">
+      <header class="skills-section-head"><div><h2>GitHub 技能更新</h2><p>每天首次启动看板时检查上游，更新未修改的受管技能。</p></div>${toggle('skillsGitHubAuto', '自动更新', settings.github_auto, !state || !!ws.busy)}</header>
+      ${note(ws.readErrors.automation, 'alert')}
+      ${settings.github_auto && upstream?.checked_at ? `<dl class="skills-meta"><div><dt>上次检查</dt><dd>${esc(dateLabel(upstream.checked_at))}</dd></div><div><dt>检查结果</dt><dd>关联 ${esc(upstream.linked ?? 0)} 项，更新 ${esc(upstream.updated ?? 0)} 项，跳过 ${esc(upstream.skipped ?? 0)} 项，失败 ${esc(upstream.failed ?? 0)} 项</dd></div></dl>` : ''}
+    </section>`;
   }
 
   const autoStates = { disabled: '已关闭', idle: '等待变更', debouncing: '等待本地变更结束', pushing: '正在推送', pulling: '正在拉取', retry_wait: '等待重试', paused_conflict: '因冲突暂停', paused: '已暂停', stopping: '正在结束当前一轮', stopped: '已停止' };
@@ -303,6 +390,7 @@
         if (input) { input.value = draftQuery; input.focus({ preventScroll: true }); }
       }
     }
+    void translateVisible(ws);
   }
 
   function showModal(title, content, { submit, label = '确认', danger = false, opener = document.activeElement } = {}) {
@@ -313,6 +401,7 @@
     modal = { ws: current(), submit, busy: false, version: Symbol() };
     dialog.innerHTML = `<form class="skills-dialog-form"><header><h2 id="skillsDialogTitle" tabindex="-1">${esc(title)}</h2>${btn('关闭', 'close', { glyph: 'close' })}</header><div class="skills-dialog-content">${content}<p class="skills-notice skills-notice-error" data-dialog-error role="alert" hidden></p></div>${submit ? `<footer>${btn('取消', 'close')}<button type="submit" class="skills-btn skills-${danger ? 'danger' : 'primary'}">${esc(label)}</button></footer>` : ''}</form>`;
     (submit && !danger && dialog.querySelector('input:not([type="checkbox"]), select, textarea') || dialog.querySelector('#skillsDialogTitle')).focus();
+    void translateVisible(current());
     return modal.version;
   }
   function modalError(error) {
@@ -387,6 +476,7 @@
       readSide(ws, 'root');
       readSide(ws, 'sync_status');
       readSide(ws, 'autosync_status');
+      void readAutomation(ws);
     }
     else if (ws.view === 'market') searchMarket(ws);
   }
@@ -415,7 +505,7 @@
       return;
     }
     if (!result?.preview_id) throw new Error('技能服务未返回有效的导入预览。');
-    const rows = candidates.map((item, index) => `<label class="skills-check-row"><input name="candidate" type="checkbox" value="${index}"><span><strong>${esc(nameOf(item))}</strong><small>${esc(item.description || item.path || '')}</small>${item.path && item.description ? `<small>${esc(item.path)}</small>` : ''}</span></label>`).join('');
+    const rows = candidates.map((item, index) => `<label class="skills-check-row"><input name="candidate" type="checkbox" value="${index}"><span><strong>${esc(nameOf(item))}</strong><small${descriptionAttr(ws, item)}>${esc(descriptionOf(ws, item) || item.path || '')}</small>${item.path && item.description ? `<small>${esc(item.path)}</small>` : ''}</span></label>`).join('');
     showModal(title, `<div class="skills-section-head"><p>发现 ${candidates.length} 项技能</p>${btn('全选', 'select-all', { value: 'candidate' })}</div><div class="skills-check-list">${rows}</div>`, {
       label: '导入所选技能', submit: async form => {
         const ids = form.getAll('candidate').map(index => idOf(candidates[Number(index)])).filter(Boolean);
@@ -440,14 +530,42 @@
       if (!stillOpen()) return;
       const item = { ...skill, ...(result?.skill ?? result?.detail ?? result) };
       const content = text(result?.content ?? item.content ?? item.markdown ?? item.skill_md);
+      const upstream = item.source?.kind === 'github' ? item.source : null;
       const detailRows = [['工作区', agents[ws.agent]], ['状态', statusLabel(item)], ['来源', sourceLabel(sourceOf(item))],
+        ['GitHub 仓库', upstream?.url], ['分支或标签', upstream?.ref], ['仓库内目录', upstream?.subdir],
+        ['自动更新', upstream && item.automatic_update_paused ? '回滚后已暂停，手动应用更新后恢复' : ''],
         ['版本', versionOf(item)], ['库内目录', external ? '' : text(item.path)], ['安装目录', text(item.installed_path)],
         ...list(item.install_conflicts).map(path => ['同名冲突目录', path])];
       showModal(title, `<dl class="skills-meta">${detailRows.filter(([, value]) => value).map(([key, value]) => `<div><dt>${key}</dt><dd>${esc(value)}</dd></div>`).join('')}</dl>
-      ${item.description ? `<p>${esc(item.description)}</p>` : ''}${tagsOf(item).length ? `<div class="skills-tags">${tagsOf(item).map(tag).join('')}</div>` : ''}
+      ${item.description ? `<p${descriptionAttr(ws, item)}>${esc(descriptionOf(ws, item))}</p>` : ''}
+      ${item.description && translationEnabled(ws) ? `<details class="skills-document" data-skill-original="${esc(originalOf(item))}"${ws.translations.get(originalOf(item)) ? '' : ' hidden'}><summary>简介原文</summary><pre>${esc(item.description)}</pre></details>` : ''}
+      ${tagsOf(item).length ? `<div class="skills-tags">${tagsOf(item).map(tag).join('')}</div>` : ''}
       ${content ? `<details class="skills-document" open><summary>SKILL.md</summary><pre>${esc(content)}</pre></details>` : ''}
       ${item.readme_md ? `<details class="skills-document"><summary>README.md</summary><pre>${esc(item.readme_md)}</pre></details>` : ''}
-      <div class="skills-actions">${external ? btn('导入库', 'adopt', { value: id, disabled: !skill.path }) : `${btn('编辑标签', 'tags', { value: id, glyph: 'tag' })}${btn('版本历史', 'history', { value: id, glyph: 'clock' })}${btn('预览更新', 'update', { value: id })}${btn('导出', 'export', { value: id, glyph: 'download' })}${btn('删除', 'delete', { value: id, tone: 'danger-quiet' })}`}</div>`);
+      <div class="skills-actions">${external ? `${btn('导入库', 'adopt', { value: id, disabled: !skill.path })}${btn('查找 GitHub 来源', 'external-github-source', { value: id })}` : `${btn('编辑标签', 'tags', { value: id, glyph: 'tag' })}${btn('版本历史', 'history', { value: id, glyph: 'clock' })}${btn('预览更新', 'update', { value: id })}${btn(upstream ? '更改 GitHub 来源' : '关联 GitHub', 'github-source', { value: id })}${btn('导出', 'export', { value: id, glyph: 'download' })}${btn('删除', 'delete', { value: id, tone: 'danger-quiet' })}`}</div>`);
+    });
+  }
+
+  function showGitHubSource(ws, skill, external) {
+    const id = idOf(skill);
+    const title = `GitHub 来源 · ${nameOf(skill)}`;
+    return modalRead(ws, title, async stillOpen => {
+      const { source } = await request(ws.agent, 'github_source', { id });
+      if (!stillOpen()) return;
+      if (external) {
+        if (source) showImport(ws, 'github', source);
+        else showModal(title, `<p>安装记录中没有可用的 GitHub 来源。</p>${btn('手动从 GitHub 导入', 'import-mode', { value: 'github' })}`);
+        return;
+      }
+      showModal(title, `<p>关联时会核对库内文件与所选 GitHub 版本。</p>
+        ${field('GitHub 仓库或技能链接', 'url', { value: source?.url, hint: 'https://github.com/owner/repo', required: true })}
+        <div class="skills-form-columns">${field('分支或标签（可选）', 'ref', { value: source?.ref })}${field('子目录（可选）', 'subdir', { value: source?.subdir })}</div>`, {
+        label: '核对并关联', submit: form => {
+          const payload = { id, url: fieldValue(form, 'url') };
+          for (const key of ['ref', 'subdir']) if (fieldValue(form, key)) payload[key] = fieldValue(form, key);
+          return change(ws, 'github_link', payload, '已关联 GitHub 来源。');
+        }
+      });
     });
   }
   function showHistory(ws, skill) {
@@ -757,12 +875,13 @@
       if (!version) return;
       return confirmAction('回滚技能版本', `将 ${agents[ws.agent]} 中的「${nameOf(skill)}」回滚到版本 ${version}。`, () => change(ws, 'rollback', { id: idOf(skill), version }, '已回滚版本。'), { label: '确认回滚', danger: true });
     }
-    const external = action === 'external-detail' || action === 'adopt';
+    const external = ['external-detail', 'adopt', 'external-github-source'].includes(action);
     const skill = selectedSkill(ws, value, external);
     if (!skill) return;
     const id = idOf(skill);
     const name = nameOf(skill);
     if (action === 'detail' || action === 'external-detail') return showDetail(ws, skill, external);
+    if (action === 'github-source' || action === 'external-github-source') return showGitHubSource(ws, skill, external);
     if (action === 'adopt') return showImport(ws, 'local', { path: skill.path });
     if (action === 'update') return showUpdate(ws, skill);
     if (action === 'history') return showHistory(ws, skill);
@@ -799,11 +918,36 @@
       if (event.target.id === 'skillsSearch') {
         ws.query = event.target.value;
         host.querySelector('#skillsResults').innerHTML = renderResults(ws);
+        void translateVisible(ws);
         say(`当前筛选匹配 ${getResults(ws).items.length} 项技能。`);
       }
     });
     host.addEventListener('change', event => {
       const ws = current();
+      const automation = { skillsTranslate: 'translate', skillsGitHubAuto: 'github_auto' }[event.target.id];
+      if (automation) {
+        const input = event.target;
+        const enabled = input.checked;
+        input.checked = ws.automation?.settings?.[automation] === true;
+        const name = automation === 'translate' ? '自动翻译' : 'GitHub 自动更新';
+        const apply = async () => {
+          const result = await change(ws, 'skill_automation', { [automation]: enabled }, `已${enabled ? '开启' : '关闭'}${name}。`, false);
+          ws.automation = result;
+          if (ws.data) ws.data.automation = result.settings;
+          ws.translationRetry = 0;
+          ws.translationError = '';
+          paint(ws);
+        };
+        if (enabled) {
+          const message = automation === 'translate' ? '看板会把待翻译的技能简介发给 DeepL，按你的 API 套餐计算用量。'
+            : '看板会从已关联的公开仓库拉取新版本并更新未修改的受管技能。每次更新保留版本记录。';
+          confirmAction(`开启${name}`, message, apply, { label: '确认开启' });
+        } else {
+          input.disabled = true;
+          apply().catch(error => { ws.error = error.message; paint(ws); });
+        }
+        return;
+      }
       if (event.target.id === 'skillsAutoSync') {
         const input = event.target;
         const enabled = input.checked;
@@ -895,7 +1039,10 @@
     loadState(current());
     setInterval(() => {
       const ws = current();
-      if (!host.closest('[hidden]') && !document.hidden && ws.view === 'settings' && !dialog.open && !ws.busy) readSide(ws, 'autosync_status', true);
+      if (host.closest('[hidden]') || document.hidden || dialog.open || ws.busy) return;
+      if (ws.view === 'settings') readSide(ws, 'autosync_status', true);
+      if (ws.view === 'settings' || ws.data?.automation?.github_auto) void readAutomation(ws, true);
+      void translateVisible(ws);
     }, 8000);
   }
 

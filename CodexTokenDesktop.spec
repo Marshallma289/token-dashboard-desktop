@@ -9,6 +9,10 @@ platform_imports = ['webview.platforms.cocoa'] if is_macos else [
 ]
 icon_path = 'assets/app-icon.icns' if is_macos else 'assets/app-icon.ico'
 version = Path('VERSION').read_text(encoding='utf-8').strip()
+skills_server_modules = [
+    'skills_core', 'skills_sources', 'skills_backup', 'skills_github',
+    'skills_autosync', 'skills_upstream', 'skills_translation',
+]
 
 # These renderers are not used by either supported desktop package. Keep the
 # WinForms/MSHTML fallback on Windows: WinForms hosts EdgeChromium as well.
@@ -34,14 +38,12 @@ else:
     ]
 
 a = Analysis(
-    ['desktop.py', 'skills_service.py'],
+    ['desktop.py'],
     pathex=[],
     binaries=[],
     datas=[('web', 'web'), ('VERSION', '.'), ('build-info.json', '.'), ('LICENSE', '.'), ('THIRD_PARTY_NOTICES.md', '.'),
            ('assets/codex-token-skill-manager', 'assets/codex-token-skill-manager')],
-    hiddenimports=['webview', *platform_imports, 'hermes_source',
-                   'skills_service', 'skills_core', 'skills_sources', 'skills_backup',
-                   'skills_github', 'skills_autosync'],
+    hiddenimports=['webview', *platform_imports, 'hermes_source', 'skills_service', *skills_server_modules],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -78,11 +80,13 @@ if not is_macos:
     a.binaries = [entry for entry in a.binaries if retain_runtime_resource(entry)]
     a.datas = [entry for entry in a.datas if retain_runtime_resource(entry)]
 
-pyz = PYZ(a.pure)
+# Both executables use the native files in the shared directory. The CLI only
+# sends loopback HTTP requests, so omit the server modules from its own PYZ.
+cli_analysis = Analysis(['skills_service.py'], excludes=skills_server_modules)
 
 exe = EXE(
-    pyz,
-    [entry for entry in a.scripts if entry[0] != 'skills_service'],
+    PYZ(a.pure),
+    a.scripts,
     [],
     exclude_binaries=True,
     name='CodexTokenDesktop',
@@ -99,8 +103,8 @@ exe = EXE(
     entitlements_file=None,
 )
 skills_cli = EXE(
-    pyz,
-    [entry for entry in a.scripts if entry[0] != 'desktop'],
+    PYZ(cli_analysis.pure),
+    cli_analysis.scripts,
     [],
     exclude_binaries=True,
     name='CodexTokenSkills',
@@ -114,6 +118,8 @@ coll = COLLECT(
     skills_cli,
     a.binaries,
     a.datas,
+    cli_analysis.binaries,
+    cli_analysis.datas,
     strip=False,
     upx=not is_macos,
     upx_exclude=[],

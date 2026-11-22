@@ -32,8 +32,8 @@ class PackagingDependencyTests(unittest.TestCase):
     def evaluate_spec(self, platform, maxsize):
         arguments = {}
 
-        def analysis(*args, **kwargs):
-            arguments.update(kwargs)
+        def analysis(scripts, **kwargs):
+            arguments[tuple(scripts)] = kwargs
             entries = [(name, "source", "BINARY") for name in RESOURCES]
             return SimpleNamespace(pure=[], scripts=[], binaries=entries[:], datas=entries[:])
 
@@ -47,7 +47,36 @@ class PackagingDependencyTests(unittest.TestCase):
         code = compile(SPEC.read_bytes(), str(SPEC), "exec")
         with patch.object(sys, "platform", platform), patch.object(sys, "maxsize", maxsize), patch.object(Path, "read_text", return_value="1.7.0"):
             exec(code, namespace)
-        return namespace["a"], arguments
+        return namespace["a"], arguments[("desktop.py",)]
+
+    def test_cli_has_an_independent_dependency_graph(self):
+        analyses = []
+        archives = []
+        executables = {}
+
+        def analysis(scripts, **kwargs):
+            analysed = SimpleNamespace(pure=object(), scripts=[], binaries=[], datas=[])
+            analyses.append((tuple(scripts), kwargs, analysed))
+            return analysed
+
+        def pyz(pure):
+            archive = object()
+            archives.append((pure, archive))
+            return archive
+
+        def exe(archive, *args, name, **kwargs):
+            executables[name] = archive
+
+        namespace = {"Analysis": analysis, "PYZ": pyz, "EXE": exe,
+                     "COLLECT": lambda *args, **kwargs: None}
+        with patch.object(sys, "platform", "win32"), patch.object(Path, "read_text", return_value="1.8.2"):
+            exec(compile(SPEC.read_bytes(), str(SPEC), "exec"), namespace)
+
+        self.assertEqual([scripts for scripts, _, _ in analyses], [("desktop.py",), ("skills_service.py",)])
+        self.assertTrue({"skills_core", "skills_backup", "skills_upstream", "skills_translation"}.issubset(
+            analyses[1][1]["excludes"]))
+        self.assertEqual(archives, [(analyses[0][2].pure, executables["CodexTokenDesktop"]),
+                                    (analyses[1][2].pure, executables["CodexTokenSkills"])])
 
     def test_windows_keeps_native_desktop_and_application_import_paths(self):
         analysis, arguments = self.evaluate_spec("win32", 2**63 - 1)

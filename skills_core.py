@@ -520,8 +520,7 @@ class SkillLibrary:
         origin = Path(rec['origin']) if rec['origin'] else None
         # The import preview stages local files before import_path. In those
         # records origin is temporary, but source retains the scanned location.
-        local = next((item['source'] for item in reversed(rec['history'])
-                      if isinstance(item['source'], dict) and item['source'].get('kind') == 'local'), {})
+        local = self._local_source(rec) or {}
         source_path, subdir = local.get('path'), local.get('subdir')
         source = Path(source_path) if isinstance(source_path, str) and isinstance(subdir, str) else None
         names = {rec['id'].casefold(), rec['name'].casefold()}
@@ -551,6 +550,7 @@ class SkillLibrary:
             'mode': rec['deploy']['mode'] if rec['deploy'] else None,
             'path': str(self._files / rec['id']), 'installed_path': str(root / rec['id']) if installed else external,
             'installed_externally': external is not None, 'install_conflicts': conflicts,
+            'automatic_update_paused': rec['history'][-1]['reason'] == 'rollback',
         }
 
     def _externals(self, root, owned=()):
@@ -599,7 +599,59 @@ class SkillLibrary:
                    for rec in active]
         records.extend(row for row in externals if root / row['relative_path'].partition('/')[0] not in owned)
         records.sort(key=lambda rec: (rec['name'].casefold(), rec['id']))
-        return {'skills': records, 'presets': self._presets(data), 'root': str(root)}
+        return {'skills': records, 'presets': self._presets(data), 'root': str(root),
+                'automation': data.get('automation', {})}
+
+    def automation(self, changes=None):
+        defaults = {'translate': False, 'github_auto': False}
+        if changes is None and info(self._db) is None:
+            return defaults
+        if changes is not None:
+            require(changes and set(changes) <= defaults.keys() and
+                    all(type(value) is bool for value in changes.values()),
+                    'invalid_input', 'Invalid skill automation settings')
+        with self._locked(write=changes is not None) as (data, _, _):
+            settings = defaults | data.get('automation', {})
+            if changes is not None:
+                settings.update(changes)
+                data['automation'] = settings
+            return settings
+
+    def github_check_status(self):
+        if info(self._db) is None:
+            return {}
+        with self._locked() as (data, _, _):
+            return data.get('github_check', {}).get('last', {})
+
+    def begin_github_check(self, day):
+        with self._locked(write=True) as (data, _, _):
+            if data.get('automation', {}).get('github_auto') is not True:
+                return False
+            check = data.setdefault('github_check', {})
+            if check.get('day') == day:
+                return False
+            check['day'] = day
+            return True
+
+    def finish_github_check(self, day, result):
+        with self._locked(write=True) as (data, _, _):
+            check = data.get('github_check', {})
+            if check.get('day') != day:
+                return
+            if result is None:
+                check['day'] = check.get('last', {}).get('day')
+            else:
+                check['last'] = {'day': day, **result}
+
+    @staticmethod
+    def _local_source(rec):
+        sources = (item.get('local_source', item['source']) for item in reversed(rec['history']))
+        return next((source for source in sources if isinstance(source, dict) and source.get('kind') == 'local'), None)
+
+    def source_origin(self, skill_id):
+        with self._locked() as (data, _, _):
+            rec = self._managed(data, skill_id)
+            return self._local_source(rec) or rec['origin']
 
     def state(self):
         with self._locked() as (data, peer, txn):
@@ -684,9 +736,17 @@ class SkillLibrary:
             return self._ingest(data, root, txn, skill_id, path, provenance, reason='import',
                                 origin=rec['origin'] if own else str(path))
 
-    def _replace(self, data, peer, root, txn, skill_id, path, source, validate_current=None):
+    def _replace(self, data, peer, root, txn, skill_id, path, source, validate_current=None, *,
+                 automatic=False):
         rec = self._managed(data, skill_id)
         destination = self._files / skill_id
+        if automatic:
+            require(data.get('automation', {}).get('github_auto') is True,
+                    'automation_off', 'GitHub auto-update has been turned off')
+            require(rec['history'][-1]['reason'] != 'rollback',
+                    'modified', 'A rollback paused automatic updates for this skill')
+            require(not rec['deploy'] or info(root / skill_id) is not None,
+                    'modified', 'The managed deployment is missing')
         if validate_current is not None:
             validate_current(destination, self._record(root, rec))
         path = self._input(path, peer)
@@ -694,10 +754,32 @@ class SkillLibrary:
                             rec['source'] if source is None else serial_source(source),
                             reason='update', origin=rec['origin'])
 
-    def replace_skill(self, skill_id, path, source=None, *, validate_current=None):
+    def replace_skill(self, skill_id, path, source=None, *, validate_current=None, automatic=False):
         """Replace content for an existing ID; callback runs inside the non-reentrant lock."""
         with self._locked(write=True) as (data, peer, txn):
-            return self._replace(data, peer, self._root(data, peer), txn, skill_id, path, source, validate_current)
+            return self._replace(data, peer, self._root(data, peer), txn, skill_id, path, source, validate_current,
+                                 automatic=automatic)
+
+    def link_github(self, skill_id, source, validate_current, *, automatic=False):
+        """Record a verified source while keeping the existing files and deployment."""
+        with self._locked(write=True) as (data, peer, _):
+            rec = self._managed(data, skill_id)
+            root = self._root(data, peer)
+            current = self._files / skill_id
+            if automatic:
+                require(data.get('automation', {}).get('github_auto') is True,
+                        'automation_off', 'GitHub auto-update has been turned off')
+                require(rec['history'][-1]['reason'] != 'rollback',
+                        'modified', 'A rollback paused automatic updates for this skill')
+            validate_current(current, self._record(root, rec))
+            self._verify_tree(current, rec['digest'], rec['identity'])
+            source = serial_source(source)
+            rec['source'] = source
+            version = rec['history'][-1]
+            if isinstance(version['source'], dict) and version['source'].get('kind') == 'local':
+                version['local_source'] = version['source']
+            version['source'] = source
+            return self._record(root, rec)
 
     @staticmethod
     def _error(exc):

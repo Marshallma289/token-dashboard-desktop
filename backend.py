@@ -28,11 +28,11 @@ import webbrowser
 from dataclasses import dataclass, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pricing import DEFAULT_PRICING, PricingCatalog, canonical_model, validate_pricing_rules
+from pricing import PricingCatalog, canonical_model, validate_pricing_rules
 from skills_service import MAX_BODY, InvalidSkillsRequest, SkillsService, SkillsSyncConflict, local_data_dir
 
 
@@ -4351,7 +4351,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                          "/cache-metrics.js": "cache-metrics.js",
                          "/layout.js": "layout.js",
                          "/analytics.js": "analytics.js", "/data-settings.js": "data-settings.js",
-                         "/skills.js": "skills.js", "/skills.css": "skills.css",
+                         "/skills.js": "skills.js",
                          "/dashboard.css": "dashboard.css",
                          "/styles.css": "styles.css"}
         if route in static_routes:
@@ -4595,6 +4595,14 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         self.dashboard_host = address[0]
         self.skills_service = SkillsService(skills_data_dir if skills_data_dir is not None else local_data_dir())
         super().__init__(address, DashboardHandler)
+
+    def serve_forever(self, poll_interval=0.5):
+        upstream = self.skills_service.upstream
+        upstream.start()
+        try:
+            super().serve_forever(poll_interval)
+        finally:
+            upstream.stop()
 
 
 def create_server(service: DashboardService, host: str = "127.0.0.1", port: int = 8765,

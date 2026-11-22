@@ -9,7 +9,6 @@ import json
 import os
 import re
 import secrets
-import shutil
 import ssl
 import stat
 import struct
@@ -404,14 +403,22 @@ def _json(raw):
         raise SourceError("provider_format", "Provider returned invalid JSON.") from exc
 
 
+def _github_head(source):
+    repo = source["url"].split("github.com/", 1)[1]
+    params = {"per_page": 1}
+    if source["ref"]:
+        params["sha"] = source["ref"]
+    commits = _json(_fetch(f"https://api.github.com/repos/{repo}/commits?{urlencode(params)}", MiB))
+    revision = commits[0].get("sha") if isinstance(commits, list) and commits and isinstance(commits[0], dict) else None
+    if not isinstance(revision, str) or not _SHA.fullmatch(revision):
+        _fail("provider_format", "GitHub did not return a valid commit SHA.")
+    return revision.lower()
+
+
 def _github_checkout(source, work, revision=None):
     repo = source["url"].split("github.com/", 1)[1]
     if revision is None:
-        params = {"per_page": 1}
-        if source["ref"]:
-            params["sha"] = source["ref"]
-        commits = _json(_fetch(f"https://api.github.com/repos/{repo}/commits?{urlencode(params)}", MiB))
-        revision = commits[0].get("sha") if isinstance(commits, list) and commits and isinstance(commits[0], dict) else None
+        revision = _github_head(source)
     if not isinstance(revision, str) or not _SHA.fullmatch(revision):
         _fail("provider_format", "GitHub did not return a valid commit SHA.")
     archive = work / "download.zip"
@@ -537,18 +544,12 @@ def _subdir(root, rel):
 
 
 def _metadata(root, fallback):
+    from skills_core import metadata
+
     with _regular_file(root / "SKILL.md") as (file, _):
         text = file.read(16 * 1024).decode("utf-8-sig", "replace")
-    parts = re.split(r"^---[ \t]*\r?$", text, maxsplit=2, flags=re.M)
-    info = {}
-    if len(parts) == 3 and not parts[0]:
-        for key in ("name", "description"):
-            match = re.search(rf"^{key}:[ \t]*([^\r\n]*)", parts[1], re.M)
-            if match:
-                value = match[1].strip().strip("\"'")
-                if value not in ("|", ">", "|-", ">-", "|+", ">+"):
-                    info[key] = value
-    return (info.get("name") or fallback)[:128], info.get("description", "")[:600]
+    info = metadata(fallback, text)
+    return info["name"][:128], info["description"][:600]
 
 
 def _fallback(source, rel, root):

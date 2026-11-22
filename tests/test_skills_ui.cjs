@@ -41,7 +41,7 @@ async function main() {
     const url = `http://127.0.0.1:${port}`;
     server = spawn(process.env.PYTHON || 'python', ['-B', 'backend.py', 'serve', '--db', path.join(root, 'usage.sqlite'), '--root', logs, '--hermes-db', path.join(root, 'no-hermes.sqlite'), '--skills-data-dir', path.join(root, 'library'), '--port', String(port), '--no-open'], {
       cwd: path.resolve(__dirname, '..'),
-      env: { ...process.env, CODEX_HOME: path.join(root, 'codex'), HERMES_HOME: path.join(root, 'hermes'), PYTHONUTF8: '1' }, stdio: ['ignore', 'pipe', 'pipe']
+      env: { ...process.env, CODEX_HOME: path.join(root, 'codex'), HERMES_HOME: path.join(root, 'hermes'), DEEPL_AUTH_KEY: 'fixture:fx', PYTHONUTF8: '1' }, stdio: ['ignore', 'pipe', 'pipe']
     });
     let serverLog = '';
     server.stdout.on('data', value => { serverLog += value; });
@@ -227,6 +227,50 @@ async function main() {
     await wait(ws.getByText('正在结束当前一轮'));
     assert.equal(await toggle.isEnabled(), false);
     assert.deepEqual(calls.filter(call => call.op === 'autosync_set').at(-1).payload, { enabled: false });
+
+    await page.route('**/api/skills', async route => {
+      const { op, payload } = route.request().postDataJSON();
+      if (op !== 'translate_descriptions') return route.fallback();
+      assert.ok(payload.texts.every(value => typeof value === 'string'));
+      return route.fulfill({ json: { ok: true, result: { translations: { 'Browser regression fixture': '浏览器回归测试技能' } } } });
+    });
+    const translate = ws.getByRole('switch', { name: '自动翻译' });
+    const upstream = ws.getByRole('switch', { name: '自动更新' });
+    await wait(ws.getByText('每天首次启动看板时检查上游，更新未修改的受管技能。'));
+    await translate.click();
+    await dialog.getByRole('button', { name: '确认开启' }).click();
+    await dialog.waitFor({ state: 'hidden' });
+    assert.equal(await translate.isChecked(), true);
+    assert.equal(await upstream.isChecked(), false);
+    await page.waitForFunction(() => document.activeElement?.id === 'skillsTranslate');
+    if (process.env.SKILLS_QA_DIR) {
+      await page.screenshot({ path: path.join(process.env.SKILLS_QA_DIR, 'skill-automation-settings.png'), fullPage: true });
+      await page.setViewportSize({ width: 1280, height: 760 });
+      await page.screenshot({ path: path.join(process.env.SKILLS_QA_DIR, 'skill-automation-desktop.png'), fullPage: true });
+      await page.setViewportSize({ width: 375, height: 722 });
+    }
+    await section('技能库');
+    await wait(ws.getByText('浏览器回归测试技能', { exact: true }));
+    await ws.getByLabel('搜索技能').fill('回归测试');
+    const beta = ws.getByRole('button', { name: '查看 catalog-beta 详情' });
+    await beta.click();
+    await wait(dialog.getByText('浏览器回归测试技能', { exact: true }));
+    await dialog.getByText('简介原文').click();
+    await wait(dialog.getByText('Browser regression fixture', { exact: true }));
+
+    const git = path.join(input, '.git');
+    await fs.mkdir(git);
+    await fs.writeFile(path.join(git, 'config'), '[remote "origin"]\n  url = https://github.com/fixture-user/skills.git\n');
+    await fs.writeFile(path.join(git, 'HEAD'), 'ref: refs/heads/main\n');
+    await dialog.getByRole('button', { name: '关联 GitHub' }).click();
+    assert.equal(await dialog.getByLabel('GitHub 仓库或技能链接').inputValue(), 'https://github.com/fixture-user/skills');
+    assert.equal(await dialog.getByLabel('子目录（可选）').inputValue(), 'catalog-beta');
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    await page.keyboard.press('Escape');
+    await ws.getByRole('button', { name: 'Hermes', exact: true }).click();
+    await section('设置');
+    await wait(translate);
+    assert.equal(await translate.isChecked(), false);
     assert.ok(calls.every(call => !call.op.includes('.')));
     assert.deepEqual(errors, []);
     console.log('Skills UI browser regression passed (local integration + simulated sync/GitHub).');

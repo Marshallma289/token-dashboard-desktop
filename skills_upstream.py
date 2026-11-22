@@ -170,7 +170,7 @@ def skill_source(lib, payload, *, link=False):
     if hint and all(source.get(field, "") == hint.get(field, "") for field in ("url", "ref", "subdir")):
         source = dict(source, revision=hint.get("revision"))
     with TemporaryDirectory(prefix="skills-upstream-") as temp:
-        repo, revision = sources._github_checkout(source, Path(temp), source.get("revision"))
+        repo, revision = sources._github_checkout(source, Path(temp).resolve(), source.get("revision"))
         _, incoming = _snapshot_source(source, repo, revision)
         return {"skill": _link(lib, row, incoming)}
 
@@ -205,7 +205,7 @@ def run_updates(lib, cancelled=lambda: False):
         if cancelled():
             break
         with TemporaryDirectory(prefix="skills-upstream-") as temp:
-            work = Path(temp)
+            work = Path(temp).resolve()
             try:
                 head = key[2] or sources._github_head(rows[0][1])
                 if all(tracked and source.get("revision") == head for _, source, tracked in rows):

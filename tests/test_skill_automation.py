@@ -1,11 +1,13 @@
 import json
+import os
 import tempfile
 import unittest
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from skills_core import SkillLibrary
+from skills_core import SkillLibrary, link_directory
 from skills_service import SkillsService
 import skills_sources
 from skills_upstream import UpstreamWorker, run_updates
@@ -126,7 +128,14 @@ class SkillAutomationTests(unittest.TestCase):
         self.call("skill_automation", github_auto=True)
         deployed = self.base / "codex" / "skills" / "sample" / "SKILL.md"
         self.write_skill(self.remote, "Read and write a spreadsheet.")
+        temp_root = self.base / "real-temp"
+        temp_root.mkdir()
+        temp_alias = temp_root
+        if os.name != "nt":
+            temp_alias = self.base / "temp-alias"
+            link_directory(temp_root, temp_alias)
         with (patch.object(skills_sources, "_github_head", return_value="b" * 40),
+              patch("skills_upstream.TemporaryDirectory", return_value=nullcontext(str(temp_alias))),
               patch.object(skills_sources, "_github_checkout", return_value=(self.base / "repo", "b" * 40))):
             self.write_skill(deployed.parent, "My edits.")
             self.assertEqual(run_updates(self.lib)["skipped"], 1)

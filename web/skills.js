@@ -516,8 +516,8 @@
       }
     });
   }
-  async function modalRead(ws, title, task) {
-    const token = showModal(title, loading('正在读取…'));
+  async function modalRead(ws, title, task, pendingMessage = '正在读取…') {
+    const token = showModal(title, loading(pendingMessage));
     try { await task(() => dialog.open && modal?.version === token && modal?.ws === ws); }
     catch (error) { if (dialog.open && modal?.version === token) { dialog.querySelector('.skills-loading')?.remove(); modalError(error); } }
   }
@@ -544,6 +544,37 @@
       ${item.readme_md ? `<details class="skills-document"><summary>README.md</summary><pre>${esc(item.readme_md)}</pre></details>` : ''}
       <div class="skills-actions">${external ? `${btn('导入库', 'adopt', { value: id, disabled: !skill.path })}${btn('查找 GitHub 来源', 'external-github-source', { value: id })}` : `${btn('编辑标签', 'tags', { value: id, glyph: 'tag' })}${btn('版本历史', 'history', { value: id, glyph: 'clock' })}${btn('预览更新', 'update', { value: id })}${btn(upstream ? '更改 GitHub 来源' : '关联 GitHub', 'github-source', { value: id })}${btn('导出', 'export', { value: id, glyph: 'download' })}${btn('删除', 'delete', { value: id, tone: 'danger-quiet' })}`}</div>`);
     });
+  }
+
+  function discoverGitHubSource(ws, skill) {
+    const id = idOf(skill);
+    const title = `GitHub 来源 · ${nameOf(skill)}`;
+    const manual = btn('手动指定来源', 'github-source-manual', { value: id });
+    return modalRead(ws, title, async stillOpen => {
+      let result;
+      try {
+        result = await request(ws.agent, 'github_discover', { id });
+      } catch (error) {
+        if (stillOpen()) showModal(title, `${note(error.message, 'alert')}<div class="skills-actions">${btn('重试查找', 'github-source', { value: id })}${manual}</div>`);
+        return;
+      }
+      if (!stillOpen()) return;
+      const matches = list(result?.matches);
+      const incomplete = result?.incomplete ? note('部分来源暂时无法核对，可重试查找。') : '';
+      if (!matches.length || !result?.preview_id) {
+        showModal(title, `<p>未找到与本地文件一致的公开 GitHub 版本。</p>${incomplete}<div class="skills-actions">${result?.incomplete ? btn('重试查找', 'github-source', { value: id }) : ''}${manual}</div>`);
+        return;
+      }
+      const rows = matches.map((source, index) => `<label class="skills-check-row"><input type="radio" name="candidate" value="${index}"${matches.length === 1 ? ' checked' : ''} required><span><strong>${esc(text(source.url).replace(/^https:\/\/github\.com\//, ''))}</strong><small>${esc(source.ref || '默认分支')} · ${esc(source.subdir || '仓库根目录')}</small><small>提交 ${esc(text(source.revision).slice(0, 12))}</small></span></label>`).join('');
+      showModal(title, `<p>${matches.length === 1 ? '找到一项与本地文件一致的 GitHub 来源。' : `找到 ${matches.length} 项与本地文件一致的 GitHub 来源，请选择要跟踪的仓库。`}</p>${incomplete}
+        <div class="skills-check-list" role="radiogroup" aria-label="GitHub 来源">${rows}</div><div class="skills-actions">${manual}</div>`, {
+        label: '确认关联', submit: form => {
+          const selected = fieldValue(form, 'candidate');
+          if (selected === '' || !matches[Number(selected)]) throw new Error('请选择 GitHub 来源。');
+          return change(ws, 'github_link_discovered', { id, preview_id: result.preview_id, candidate: Number(selected) }, '已关联 GitHub 来源。');
+        }
+      });
+    }, '正在查找并核对 GitHub 来源…');
   }
 
   function showGitHubSource(ws, skill, external) {
@@ -881,7 +912,8 @@
     const id = idOf(skill);
     const name = nameOf(skill);
     if (action === 'detail' || action === 'external-detail') return showDetail(ws, skill, external);
-    if (action === 'github-source' || action === 'external-github-source') return showGitHubSource(ws, skill, external);
+    if (action === 'github-source' && skill.source?.kind !== 'github') return discoverGitHubSource(ws, skill);
+    if (['github-source', 'github-source-manual', 'external-github-source'].includes(action)) return showGitHubSource(ws, skill, external);
     if (action === 'adopt') return showImport(ws, 'local', { path: skill.path });
     if (action === 'update') return showUpdate(ws, skill);
     if (action === 'history') return showHistory(ws, skill);

@@ -171,6 +171,24 @@ class SkillSourcesTest(unittest.TestCase):
         package.write_bytes(b"bad zip")
         self.assertEqual(self.call("archive_preview", path=str(package))["code"], "unsafe_archive")
 
+    def test_github_only_ignores_symlinks_outside_skill_directories(self):
+        def link(name):
+            entry = zipfile.ZipInfo(name)
+            entry.create_system = 3
+            entry.external_attr = (stat.S_IFLNK | 0o777) << 16
+            return entry
+
+        target = self.base / "checkout"
+        skill = ("repo/skills/demo/SKILL.md", doc("demo"))
+        unrelated = (link("repo/CLAUDE.md"), "../untrusted")
+        sources._unzip(io.BytesIO(archive_bytes([skill, unrelated])), target, github=True)
+        self.assertEqual(sources._metadata(target / "repo" / "skills" / "demo", "demo")[0], "demo")
+        self.assertFalse(os.path.lexists(target / "repo" / "CLAUDE.md"))
+        for extra in [(link("repo/skills/demo/script"), "../untrusted"), ("repo/CLAUDE.md/nested", "x")]:
+            with self.assertRaises(sources.SourceError) as raised:
+                sources._unzip(io.BytesIO(archive_bytes([skill, unrelated, extra])), self.base / "wrong", github=True)
+            self.assertEqual(raised.exception.code, "unsafe_archive")
+
     def test_updates_preview_confirmation_replay_and_export(self):
         directory = self.skill("demo")
         (directory / "remove.txt").write_text("remove me", encoding="utf-8")

@@ -106,6 +106,52 @@ class SkillAutomationTests(unittest.TestCase):
         self.assertEqual(checkout.call_args.args[2], "a" * 40)
         self.assertEqual(self.lib.state()["skills"][0]["source"], str(self.source))
 
+    def test_discovers_public_sources_without_url_and_only_links_on_confirmation(self):
+        self.lib.import_path(self.source)
+        mirror = self.base / "mirror"
+        self.write_skill(mirror / "deep" / "exact-match", "Read a spreadsheet.")
+        wrong = self.base / "wrong"
+        self.write_skill(wrong / "sample", "Read a spreadsheet.")
+        (wrong / "sample" / "different.txt").write_text("Other files.", encoding="utf-8")
+        repos = {"example/skills": (self.base / "repo", "a" * 40), "example/mirror": (mirror, "b" * 40),
+                 "example/sample": (wrong, "c" * 40)}
+
+        def checkout(source, work, revision):
+            return repos[source["url"].removeprefix("https://github.com/")]
+
+        with (patch.object(skills_sources, "_market", return_value={"items": [
+                  {"url": self.gh["url"], "skill_id": "sample", "name": "sample"},
+                  {"url": "https://github.com/example/mirror", "skill_id": "sample", "name": "sample"}]}),
+              patch.object(skills_sources, "_github_search_repos", return_value=[
+                  self.gh["url"], "https://github.com/example/sample"]) as github_search,
+              patch.object(skills_sources, "_github_checkout", side_effect=checkout) as fetch_repo):
+            result = self.call("github_discover", id="sample")
+            github_search.assert_called_once_with("sample", 6)
+            self.assertEqual(fetch_repo.call_count, 3)
+            self.assertEqual([candidate["subdir"] for candidate in result["matches"]],
+                             ["skills/sample", "deep/exact-match"])
+            self.assertEqual(self.lib.state()["skills"][0]["source"], str(self.source))
+            with self.assertRaises(ValueError):
+                self.call("github_link_discovered", id="sample", preview_id=result["preview_id"], candidate=-1)
+            linked = self.call("github_link_discovered", id="sample", preview_id=result["preview_id"], candidate=1)
+            self.assertEqual(linked["skill"]["source"], result["matches"][1])
+            self.assertEqual(fetch_repo.call_count, 3)
+            with self.assertRaises(ValueError):
+                self.call("github_link_discovered", id="sample", preview_id=result["preview_id"], candidate=0)
+
+    def test_source_discovery_uses_known_origin_before_public_search(self):
+        self.lib.import_path(self.source, source={**self.gh, "digest":
+                             skills_sources._digest(skills_sources._manifest(self.source))})
+        with (patch.object(skills_sources, "_github_checkout", return_value=(self.base / "repo", "a" * 40)),
+              patch("skills_upstream._search_repositories") as public_search):
+            preview = self.call("github_discover", id="sample")
+            self.assertEqual(len(preview["matches"]), 1)
+            public_search.assert_not_called()
+        row = self.lib.state()["skills"][0]
+        self.write_skill(Path(row["path"]), "Different local content.")
+        with self.assertRaises(ValueError):
+            self.call("github_link_discovered", id="sample", preview_id=preview["preview_id"], candidate=0)
+
     def test_hermes_hub_hint_uses_install_path(self):
         lib = SkillLibrary(self.lib.data_dir, "hermes")
         root = self.base / "hermes" / "skills"

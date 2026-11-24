@@ -28,11 +28,12 @@ _BACKUP_OPS = frozenset({"backup_create", "backup_list", "backup_restore", "sync
                          "sync_push", "sync_pull", "sync_resolve"})
 _GITHUB_OPS = frozenset({"github_status", "github_connect"})
 _AUTOSYNC_OPS = frozenset({"autosync_status", "autosync_set", "autosync_resume"})
-_AUTOMATION_OPS = frozenset({"skill_automation", "github_source", "github_link", "translate_descriptions"})
+_AUTOMATION_OPS = frozenset({"skill_automation", "github_source", "github_link", "github_discover",
+                             "github_link_discovered", "translate_descriptions"})
 _CORE_OPS = frozenset({"detail", "history", "root", "install", "disable", "delete", "tags", "rollback",
                        "update", "preset_save", "preset_apply", "preset_delete"})
 _READ_OPS = frozenset({"state", "detail", "history", "backup_list", "sync_status", "activity", "activity_export",
-                       "autosync_status", "github_source", "skill_automation"})
+                       "autosync_status", "github_source", "github_discover", "skill_automation"})
 OPS = (_CORE_OPS | _SOURCE_OPS | _BACKUP_OPS | _GITHUB_OPS | _AUTOSYNC_OPS |
        _AUTOMATION_OPS | _READ_OPS | {"install_manager"})
 _AUDITED_OPS = OPS - _READ_OPS - {"local_preview", "archive_preview", "github_preview", "market",
@@ -415,6 +416,10 @@ class SkillsService:
             if payload.get("github_auto") is True:
                 self.upstream.request_check(agent)
             return {"settings": settings, "key_available": bool(auth_key()), "upstream": self.upstream.status(agent)}
+        if op in {"github_discover", "github_link_discovered"}:
+            from skills_upstream import discover_github
+
+            return discover_github(lib, payload, confirm=op == "github_link_discovered")
         if op in {"github_source", "github_link"}:
             from skills_upstream import skill_source
 

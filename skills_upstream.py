@@ -1,10 +1,12 @@
 """Associate verified skill copies with GitHub and refresh tracked versions."""
 
+from concurrent.futures import ThreadPoolExecutor
 from configparser import RawConfigParser, Error as ConfigError
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 from tempfile import TemporaryDirectory
 from threading import Event, Lock, Thread
@@ -173,6 +175,112 @@ def skill_source(lib, payload, *, link=False):
         repo, revision = sources._github_checkout(source, Path(temp).resolve(), source.get("revision"))
         _, incoming = _snapshot_source(source, repo, revision)
         return {"skill": _link(lib, row, incoming)}
+
+
+_DISCOVERY_REPOS = 6
+_DISCOVERY_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+
+
+def _market_repos(slug):
+    items = sources._market({"query": slug, "limit": 30})["items"]
+    return [item["url"] for item in items if slug in (item["skill_id"].casefold(), item["name"].casefold())]
+
+
+def _repository_matches(source, manifest, *, exact_path=False):
+    with TemporaryDirectory(prefix="skills-discover-") as temp:
+        root, revision = sources._github_checkout(source, Path(temp).resolve(), source.get("revision"))
+        base = sources._subdir(root, source["subdir"])
+        matches = []
+        for directory, path, files, is_skill in sources._walk(base, stop_at_skill=exact_path):
+            if not is_skill:
+                if exact_path:
+                    break
+                continue
+            doc = next(file for file, rel in files if rel.rsplit("/", 1)[-1] == "SKILL.md")
+            if sources._checked_stat(doc).st_size != manifest["SKILL.md"][1]:
+                continue
+            if sources._manifest(directory) == manifest:
+                subdir = "/".join(part for part in (source["subdir"], path) if part)
+                matches.append(dict(source, subdir=subdir, revision=revision))
+                if len(matches) >= sources.MAX_CANDIDATES:
+                    break
+        return matches
+
+
+def _search_repositories(slug, manifest):
+    matches, incomplete = [], False
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        providers = [pool.submit(_market_repos, slug),
+                     pool.submit(sources._github_search_repos, slug, _DISCOVERY_REPOS)]
+        results = []
+        for provider in providers:
+            try:
+                results.append(provider.result())
+            except (ValueError, OSError):
+                results.append([])
+                incomplete = True
+        # Alternate providers so marketplace results cannot crowd out GitHub repository-name matches.
+        urls = {}
+        for index in range(max(map(len, results))):
+            for result in results:
+                if index < len(result):
+                    spec = sources._github_spec({"url": result[index]})
+                    urls.setdefault(spec["url"], spec)
+        repos = list(urls.values())[:_DISCOVERY_REPOS]
+        checks = [pool.submit(_repository_matches, repo, manifest) for repo in repos]
+        for check in checks:
+            try:
+                matches.extend(check.result())
+            except (ValueError, OSError):
+                incomplete = True
+    return matches[:sources.MAX_CANDIDATES], incomplete
+
+
+def discover_github(lib, payload, *, confirm=False):
+    expected = {"id", "preview_id", "candidate"} if confirm else {"id"}
+    if set(payload) != expected:
+        raise SkillError("invalid_payload", "Enter a skill ID and a preview selection when confirming")
+    sid = sources._string(payload, "id", limit=256)
+    state = lib.state()
+    row = next((item for item in state["skills"] if item["id"] == sid), None)
+    if row is None:
+        raise SkillError("not_found", "Unknown skill")
+    if row["external"]:
+        raise SkillError("external_skill", "Import a copy before managing its source")
+    if confirm:
+        selected = payload["candidate"]
+
+        def validate(preview):
+            if preview["id"] != sid or type(selected) is not int or not 0 <= selected < len(preview["matches"]):
+                raise SkillError("invalid_payload", "Select a valid result for this skill")
+
+        preview = sources._claim(lib, payload, "preview_id", "github_discovery", validate)
+        incoming = preview["matches"][selected]
+        # The preview already verified the immutable commit. Recheck local bytes and source at commit time.
+        return {"skill": lib.link_github(sid, incoming, _guard(preview["before"], incoming["digest"]))}
+
+    manifest = sources._manifest(Path(row["path"]))
+    stored = row["source"]
+    tracked = stored if isinstance(stored, dict) and stored.get("kind") == "github" else None
+    hint = tracked or Discovery(lib, Path(state["root"])).hint(row)
+    matches, incomplete = [], False
+    if hint is not None:
+        try:
+            matches = _repository_matches(hint, manifest, exact_path=True)
+        except (ValueError, OSError):
+            incomplete = True
+    if not matches:
+        slug = next((name.casefold() for name in (row["name"], sid) if _DISCOVERY_SLUG.fullmatch(name)), None)
+        if slug:
+            matches, search_incomplete = _search_repositories(slug, manifest)
+            incomplete |= search_incomplete
+    preview_id = None
+    if matches:
+        checksum = sources._digest(manifest)
+        for candidate in matches:
+            candidate["digest"] = checksum
+        preview_id = sources._keep(lib, "github_discovery", {"id": sid, "before": stored, "matches": matches})
+    return {"matches": matches, "preview_id": preview_id, "incomplete": incomplete}
 
 
 def run_updates(lib, cancelled=lambda: False):

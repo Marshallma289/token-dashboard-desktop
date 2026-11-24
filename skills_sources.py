@@ -162,7 +162,7 @@ def _zip_directory(file):
         _fail("unsafe_archive", "ZIP entry count does not match its central directory.")
 
 
-def _unzip(file, target):
+def _unzip(file, target, *, github=False):
     # Check the entire namespace and declared sizes before opening any member.
     try:
         _zip_directory(file)
@@ -171,21 +171,31 @@ def _unzip(file, target):
             if len(infos) > MAX_ENTRIES:
                 _fail("limit", "Archive contains too many entries.")
             paths, entries, total = {}, set(), 0
+            skipped = set()
+            # GitHub repositories can have unrelated symlinks (e.g. at the repo root).
+            # Keep their namespace reserved, but never extract them or omit links within a skill.
+            skill_dirs = {tuple(map(_key, info.orig_filename.split("/")[:-1]))
+                          for info in infos if github and info.orig_filename.rsplit("/", 1)[-1] == "SKILL.md"}
             for info in infos:
                 directory = info.is_dir()
                 name = info.orig_filename
                 parts = _parts(name[:-1] if directory else name)
                 mode = stat.S_IFMT(info.external_attr >> 16)
-                if (mode not in (0, stat.S_IFDIR if directory else stat.S_IFREG)
+                canonical_path = tuple(map(_key, parts))
+                safe_link = (github and not directory and mode == stat.S_IFLNK
+                             and not any(canonical_path[:i] in skill_dirs for i in range(len(parts))))
+                if ((not safe_link and mode not in (0, stat.S_IFDIR if directory else stat.S_IFREG))
                         or info.external_attr & 0x400 or (directory and info.file_size)
                         or info.flag_bits & 1 or info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)):
                     _fail("unsafe_archive", "Links, special files, encryption and unsupported compression are not allowed.")
                 if parts in entries:
                     _fail("unsafe_archive", "Archive contains duplicate paths.")
                 entries.add(parts)
+                if safe_link:
+                    skipped.add(info)
                 for index in range(1, len(parts) + 1):
                     prefix = parts[:index]
-                    canonical = tuple(map(_key, prefix))
+                    canonical = canonical_path[:index]
                     value = (prefix, directory or index < len(parts))
                     if paths.setdefault(canonical, value) != value:
                         _fail("unsafe_archive", "Archive paths collide by case, Unicode spelling, or file type.")
@@ -195,6 +205,8 @@ def _unzip(file, target):
                     _fail("limit", "Archive exceeds entry, expansion, or compression ratio limits.")
             target.mkdir()
             for info in infos:
+                if info in skipped:
+                    continue
                 dest = target.joinpath(*info.orig_filename.rstrip("/").split("/"))
                 if info.is_dir():
                     dest.mkdir(parents=True, exist_ok=True)
@@ -403,6 +415,25 @@ def _json(raw):
         raise SourceError("provider_format", "Provider returned invalid JSON.") from exc
 
 
+def _github_search_repos(slug, limit):
+    params = urlencode({"q": f"{slug} in:name", "per_page": limit})
+    result = _json(_fetch(f"https://api.github.com/search/repositories?{params}", 2 * MiB))
+    items = result.get("items") if isinstance(result, dict) else None
+    if not isinstance(items, list):
+        _fail("provider_format", "GitHub did not return a repository list.")
+    repos = []
+    for item in items[:limit]:
+        name = item.get("full_name") if isinstance(item, dict) else None
+        if not isinstance(name, str) or name.count("/") != 1:
+            continue
+        try:
+            owner, repo = _repo_name(*name.split("/"))
+        except SourceError:
+            continue
+        repos.append(f"https://github.com/{owner}/{repo}")
+    return repos
+
+
 def _github_head(source):
     repo = source["url"].split("github.com/", 1)[1]
     params = {"per_page": 1}
@@ -426,7 +457,7 @@ def _github_checkout(source, work, revision=None):
         _fetch(f"https://codeload.github.com/{repo}/zip/{revision}", MAX_ARCHIVE, dst)
     target = work / "unpacked"
     with archive.open("rb") as file:
-        _unzip(file, target)
+        _unzip(file, target, github=True)
     wrappers = list(target.iterdir())
     if len(wrappers) != 1 or not wrappers[0].is_dir():
         _fail("unsafe_archive", "GitHub archive must have one top-level directory.")

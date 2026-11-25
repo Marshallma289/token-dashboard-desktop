@@ -108,6 +108,8 @@ CSV 新增 `speed_output_tokens`、`speed_duration_ms`、`speed_sample_count`、
 
 [下载桌面版](https://github.com/Marshallma289/token-dashboard-desktop/releases/latest) · [构建记录](https://github.com/Marshallma289/token-dashboard-desktop/actions/workflows/build-desktop.yml) · [问题反馈](https://github.com/Marshallma289/token-dashboard-desktop/issues)
 
+首次打开没有用量时，点侧栏底部的「查看数据源」，分别核对 Codex 和 Hermes 的读取路径、已保存记录和提示。默认 `archived_sessions` 尚未创建是正常状态；手动指定的路径缺失或实际读取失败会单独标记。
+
 > 看板统计的是本机日志，费用是参考估算，不等同于 OpenAI 或第三方供应商账单，也不代表订阅额度消耗。
 
 ## 终端一键安装（推荐）

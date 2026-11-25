@@ -855,6 +855,39 @@
     }
   }
 
+  function renderSourceDiagnostics(sources) {
+    const statusLabels = {
+      pending: '等待首次扫描', not_configured: '未检测到数据源', empty: '可读，暂无用量',
+      loaded: '已读取', partial: '部分读取异常', error: '读取异常'
+    };
+    const statusHints = {
+      pending: '等待自动扫描，或点下方「立即扫描」。',
+      not_configured: '先启动对应工具并发起一次请求，再核对下面的路径。',
+      empty: '路径可读但还没有用量。发起一次请求后，再刷新诊断。',
+      partial: '已经保存的用量不会丢失。请检查下方路径、权限和日志格式，再扫描。',
+      error: '请检查下方路径、权限和文件格式，再扫描；已有历史仍会保留。'
+    };
+    const pathLabels = {
+      pending: '未扫描', readable: '可读', optional_missing: '尚无归档（正常）',
+      not_configured: '尚不存在', missing: '路径不存在', unreadable: '无法读取', invalid: '格式或路径类型不符'
+    };
+    const roles = { sessions: '会话日志', archive: '归档日志', state_db: '主数据库', profile: '配置数据库' };
+    return sources.filter(source => ['codex', 'hermes'].includes(source.kind)).map(source => {
+      const title = source.kind === 'codex' ? 'Codex' : 'Hermes';
+      const paths = Array.isArray(source.paths) ? source.paths : [];
+      const hint = statusHints[source.status];
+      const locationHint = source.kind === 'codex' ? '非默认位置请核对启动环境的 CODEX_HOME。' : '非默认位置请核对 HERMES_HOME，或用 --hermes-db 指定数据库。';
+      const rows = paths.map(item => {
+        const count = item.records_seen !== undefined ? ` · ${knownNumber(item.records_seen)} 条源记录`
+          : item.files_seen !== undefined ? ` · ${knownNumber(item.files_seen)} 个 JSONL` : '';
+        const state = pathLabels[item.status] || '状态未知';
+        const colorClass = item.status === 'readable' ? ' is-available' : ['unreadable', 'invalid', 'missing'].includes(item.status) ? ' is-unavailable' : '';
+        return `<li><span>${esc(roles[item.role] || '路径')} · ${esc(item.path)}${esc(count)}</span><b class="root-state${colorClass}">${esc(state)}</b></li>`;
+      }).join('');
+      return `<section class="diagnostic-source"><h3>${title} · ${esc(statusLabels[source.status] || '状态未知')}</h3><p>已保存 ${knownNumber(source.available_records)} 条用量记录${source.scan_errors ? ` · 扫描异常 ${knownNumber(source.scan_errors)}` : ''}</p>${hint ? `<p class="analytics-muted">${esc(hint)}${esc(locationHint)}</p>` : ''}${rows ? `<ul>${rows}</ul>` : ''}</section>`;
+    }).join('');
+  }
+
   function renderDiagnostics(error = '') {
     const body = state.diagnostics || {};
     const health = body.scan || {};
@@ -868,7 +901,7 @@
     const lastStarted = get(lastScan, 'started_at', 'startedAt', 'at', 'finished_at', 'completed_at');
     const duration = get(scan, 'last_duration_ms', 'duration_ms') ?? get(lastScan, 'duration_ms', 'duration_ms_total');
     const explicitExceptions = get(scan, 'exception_count', 'error_count') ?? get(lastScan, 'exception_count', 'error_count', 'failed_files');
-    const exceptionCount = explicitExceptions !== undefined ? explicitExceptions : ['parse_errors', 'incomplete_files', 'unavailable_roots'].reduce((sum, key) => sum + numeric(get(lastScan, key)), 0);
+    const exceptionCount = explicitExceptions !== undefined ? explicitExceptions : ['parse_errors', 'incomplete_files', 'unavailable_roots', 'hermes_source_errors'].reduce((sum, key) => sum + numeric(get(lastScan, key)), 0);
     $('#diagnosticsFacts').innerHTML = [
       ['扫描状态', scanStateLabel(scanState || (error ? 'error' : ''))],
       ['最近扫描', lastStarted ? timestamp(lastStarted) : '—'],
@@ -877,7 +910,7 @@
       ['异常文件 / 错误', knownNumber(exceptionCount)],
       ['现代格式日志', knownNumber(get(formats, 'modern'))], ['旧版格式日志', knownNumber(get(formats, 'legacy'))]
     ].map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`).join('');
-    $('#diagnosticsRoots').innerHTML = roots.length ? `<h3>扫描目录</h3><ul>${roots.map(root => `<li><span>${esc(get(root, 'path'))}</span><b class="root-state ${root.available ? 'is-available' : 'is-unavailable'}">${root.available ? '可用' : '不可用'}</b></li>`).join('')}</ul>` : '<p class="analytics-muted">暂无扫描目录信息。</p>';
+    $('#diagnosticsRoots').innerHTML = Array.isArray(body.sources) ? renderSourceDiagnostics(body.sources) : roots.length ? `<h3>扫描目录</h3><ul>${roots.map(root => `<li><span>${esc(get(root, 'path'))}</span><b class="root-state ${root.available ? 'is-available' : 'is-unavailable'}">${root.available ? '可用' : '不可用'}</b></li>`).join('')}</ul>` : error ? '<p class="analytics-muted">无法读取诊断。请从本机回环地址打开看板，再点「刷新诊断」。</p>' : '<p class="analytics-muted">暂无扫描目录信息。</p>';
     if (document.activeElement !== $('#autoScanEnabled')) $('#autoScanEnabled').checked = Boolean(options.auto_scan);
     if (document.activeElement !== $('#scanInterval')) $('#scanInterval').value = get(options, 'interval_seconds') ?? '';
     const storage = body.storage && typeof body.storage === 'object' ? body.storage : {};
@@ -1222,6 +1255,11 @@
       if (row) { event.preventDefault(); row.click(); }
     });
     $('#exportRequests').addEventListener('click', exportRequestPage);
+    $('#viewSourcesButton')?.addEventListener('click', () => {
+      if (window.CodexDashboardLayout) window.CodexDashboardLayout.showView('pricing', 'diagnostics');
+      $('#diagnosticsTitle')?.focus();
+      fetchDiagnostics();
+    });
     $('#diagnosticsRefresh').addEventListener('click', fetchDiagnostics);
     $('#saveScanOptions').addEventListener('click', saveScanOptions);
     $('#scanNow').addEventListener('click', scanNow);

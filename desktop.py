@@ -212,6 +212,7 @@ class DesktopRuntime:
             db_path or _configured_database(),
             providers_path=providers_path,
             hermes_db=resolve_hermes_paths(hermes_db)[0],
+            hermes_explicit=hermes_db is not None or bool(os.environ.get("HERMES_HOME")),
         )
         self._owns_database = database is None
         self._data_dir = data_dir

@@ -676,6 +676,9 @@
     if (scanState === 'starting' || scanState === 'scanning' || scanState === 'running') {
       return { status: 'starting', message: '扫描中', title: timestamp ? `数据扫描进行中 · ${timestamp}` : '数据扫描进行中' };
     }
+    if (body.usage_records === 0) {
+      return { status: 'ok', message: '暂无用量', title: '尚未读到用量。选择「查看数据源」检查路径，或先在 Codex / Hermes 发起一次请求。' };
+    }
     return { status: 'ok', message: '数据已更新', title: timestamp || '数据扫描状态正常' };
   }
 

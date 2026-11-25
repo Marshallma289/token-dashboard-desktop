@@ -73,6 +73,8 @@ jobs:
       - name: Install build dependencies
         run: python -m pip install -r requirements-build.txt
       - name: Validate and build from clean staging
+        env:
+          CODEX_TOKEN_GUI_SMOKE_REPEAT: ${{ github.head_ref == 'dot/release-1.8.5-macos-diagnostics' && '1' || '0' }}
         run: python build_desktop.py --output-dir release
       - name: Retain packages and source manifests
         uses: actions/upload-artifact@v7

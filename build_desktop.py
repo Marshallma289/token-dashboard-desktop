@@ -236,21 +236,27 @@ def build(output_dir: Path, *, skip_tests: bool = False) -> tuple[Path, Path]:
                 or desktop_dependencies.get("frozen") is not True
                 or desktop_dependencies.get("renderer") != "edgechromium"):
             raise RuntimeError("Packaged desktop dependency probe did not pass.")
-    gui_report_path = build_root / "gui-smoke-report.json"
-    run_packaged_gui_smoke(executable, stage, test_env, gui_report_path)
-    try:
-        gui_smoke_test = json.loads(gui_report_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
-        raise RuntimeError("Packaged GUI smoke test did not write a valid report.") from error
     renderer = "edgechromium" if sys.platform == "win32" else "wkwebview"
-    if (not isinstance(gui_smoke_test, dict)
-            or gui_smoke_test.get("status") != "passed"
-            or gui_smoke_test.get("frozen") is not True
-            or gui_smoke_test.get("gui_tested") is not True
-            or gui_smoke_test.get("renderer") != renderer
-            or gui_smoke_test.get("app_version") != version
-            or gui_smoke_test.get("rendered_total_tokens") != 173):
-        raise RuntimeError(f"Packaged GUI smoke test did not pass: {gui_smoke_test!r}")
+    smoke_reports = [build_root / "gui-smoke-report.json"]
+    repeat_smoke = sys.platform == "darwin" and os.environ.get("CODEX_TOKEN_GUI_SMOKE_REPEAT") == "1"
+    if repeat_smoke:
+        smoke_reports.extend(build_root / f"gui-smoke-report-{attempt}.json" for attempt in range(2, 6))
+    for gui_report_path in smoke_reports:
+        run_packaged_gui_smoke(executable, stage, test_env, gui_report_path)
+        try:
+            gui_smoke_test = json.loads(gui_report_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise RuntimeError("Packaged GUI smoke test did not write a valid report.") from error
+        if (not isinstance(gui_smoke_test, dict)
+                or gui_smoke_test.get("status") != "passed"
+                or gui_smoke_test.get("frozen") is not True
+                or gui_smoke_test.get("gui_tested") is not True
+                or gui_smoke_test.get("renderer") != renderer
+                or gui_smoke_test.get("app_version") != version
+                or gui_smoke_test.get("rendered_total_tokens") != 173):
+            raise RuntimeError(f"Packaged GUI smoke test did not pass: {gui_smoke_test!r}")
+        if repeat_smoke:
+            print(gui_report_path.with_suffix(".trace").read_text(encoding="utf-8"), flush=True)
     files = file_manifest(package)
     manifest = {
         "self_test": self_test,

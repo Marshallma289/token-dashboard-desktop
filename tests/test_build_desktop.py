@@ -168,11 +168,13 @@ class BuildDesktopTests(unittest.TestCase):
                     report_path = Path(command[command.index("--self-test-report") + 1])
                     report_path.write_text(json.dumps(SELF_TEST_REPORT), encoding="utf-8")
                 elif "--gui-smoke-test" in command:
-                    Path(command[-1]).write_text(json.dumps({**GUI_SMOKE_REPORT, "renderer": "wkwebview"}), encoding="utf-8")
+                    report = Path(command[-1])
+                    report.write_text(json.dumps({**GUI_SMOKE_REPORT, "renderer": "wkwebview"}), encoding="utf-8")
+                    report.with_suffix(".trace").write_text("Native event loop returned\n", encoding="utf-8")
                 elif command[0] == "ditto":
                     Path(command[-1]).write_bytes(b"fake archive")
 
-            with patch.object(builder, "SOURCE_DIR", source), patch.object(builder.sys, "platform", "darwin"), patch.object(builder.platform, "machine", return_value="arm64"), patch.object(builder, "run", side_effect=fake_run):
+            with patch.object(builder, "SOURCE_DIR", source), patch.object(builder.sys, "platform", "darwin"), patch.object(builder.platform, "machine", return_value="arm64"), patch.object(builder, "run", side_effect=fake_run), patch.dict(builder.os.environ, {"CODEX_TOKEN_GUI_SMOKE_REPEAT": "1"}):
                 archive, manifest_path = builder.build(root / "release", skip_tests=True)
             self.assertEqual(sum(command[0] == "sips" for command, _, _ in calls), 10)
             self.assertEqual(sum(command[0] == "iconutil" for command, _, _ in calls), 1)
@@ -181,6 +183,11 @@ class BuildDesktopTests(unittest.TestCase):
             self_test_calls = [command for command, _, _ in calls if "--self-test" in command]
             self.assertEqual(len(self_test_calls), 1)
             self.assertIn("--self-test-report", self_test_calls[0])
+            smoke_reports = [Path(command[-1]).name for command, _, _ in calls if "--gui-smoke-test" in command]
+            self.assertEqual(smoke_reports, [
+                "gui-smoke-report.json", "gui-smoke-report-2.json", "gui-smoke-report-3.json",
+                "gui-smoke-report-4.json", "gui-smoke-report-5.json",
+            ])
             package = Path(command[-2])
             self.assertFalse((package / "build-manifest.json").exists())
             self.assertTrue(archive.is_file())

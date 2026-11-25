@@ -791,6 +791,7 @@ def run_gui_smoke_test(mark=lambda _: None) -> Mapping[str, Any]:
     mark("Importing webview")
     import webview
 
+    mark("Creating temporary dashboard profile")
     with tempfile.TemporaryDirectory(prefix="codex-token-gui-smoke-") as folder:
         root = Path(folder).resolve()
         with _gui_smoke_profile(root) as sessions:
@@ -876,6 +877,7 @@ def _gui_smoke_diagnostics(report_path: Path | None):
             trace.flush()
 
         mark("Native GUI smoke process entered Python")
+        mark("Arming Python traceback watchdog")
         faulthandler.dump_traceback_later(55, file=trace)
         try:
             yield mark

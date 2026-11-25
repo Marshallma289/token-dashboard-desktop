@@ -855,6 +855,24 @@ def probe_desktop_dependencies() -> Mapping[str, Any]:
             "renderer": renderer, "imports": imports, "gui_tested": False}
 
 
+@contextmanager
+def _gui_smoke_diagnostics(report_path: Path | None):
+    """Capture frozen windowed Python stacks before the build kills a hung process."""
+    if report_path is None:
+        yield
+        return
+    import faulthandler
+
+    with report_path.with_suffix(".trace").open("w", encoding="utf-8") as trace:
+        trace.write("Native GUI smoke process entered Python.\n")
+        trace.flush()
+        faulthandler.dump_traceback_later(55, file=trace)
+        try:
+            yield
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+
+
 def main() -> int:
     if "--gui-smoke-test" in sys.argv:
         import argparse
@@ -862,10 +880,11 @@ def main() -> int:
         parser.add_argument("--gui-smoke-test", action="store_true")
         parser.add_argument("--gui-smoke-report", type=Path)
         args = parser.parse_args()
-        try:
-            report, code = run_gui_smoke_test(), 0
-        except Exception as error:
-            report, code = {"status": "failed", "gui_tested": False, "error": str(error)}, 1
+        with _gui_smoke_diagnostics(args.gui_smoke_report):
+            try:
+                report, code = run_gui_smoke_test(), 0
+            except Exception as error:
+                report, code = {"status": "failed", "gui_tested": False, "error": str(error)}, 1
         output = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
         if args.gui_smoke_report:
             args.gui_smoke_report.write_text(output, encoding="utf-8")

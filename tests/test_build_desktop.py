@@ -277,5 +277,17 @@ class BuildDesktopTests(unittest.TestCase):
                 self.assertFalse(list((root / "release").glob("*.zip")))
 
 
+class GuiSmokeTimeoutDiagnosticsTests(unittest.TestCase):
+    def test_timeout_includes_child_trace_for_native_deadlock(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            report = root / "gui-smoke-report.json"
+            report.with_suffix(".trace").write_text(
+                "Current thread: blocked in Cocoa callback", encoding="utf-8"
+            )
+            with patch.object(builder, "run", side_effect=subprocess.TimeoutExpired("smoke", 90)):
+                with self.assertRaisesRegex(RuntimeError, "blocked in Cocoa callback"):
+                    builder.run_packaged_gui_smoke(root / "app", root, {}, report)
+
 if __name__ == "__main__":
     unittest.main()

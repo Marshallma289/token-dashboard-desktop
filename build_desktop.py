@@ -122,6 +122,19 @@ def file_manifest(package: Path) -> list[dict[str, str | int]]:
     return records
 
 
+def run_packaged_gui_smoke(executable, stage, test_env, report_path):
+    try:
+        run([str(executable), "--gui-smoke-test", "--gui-smoke-report", str(report_path)],
+            stage, test_env, timeout=90)
+    except subprocess.TimeoutExpired as error:
+        trace_path = report_path.with_suffix(".trace")
+        detail = trace_path.read_text(encoding="utf-8", errors="replace") if trace_path.is_file() else "no child trace"
+        raise RuntimeError(f"Packaged GUI smoke test timed out after 90 seconds.\n{detail}") from error
+    except subprocess.CalledProcessError as error:
+        detail = report_path.read_text(encoding="utf-8", errors="replace").strip() if report_path.is_file() else "no report"
+        raise RuntimeError(f"Packaged GUI smoke test exited with {error.returncode}: {detail}") from error
+
+
 def build(output_dir: Path, *, skip_tests: bool = False) -> tuple[Path, Path]:
     if sys.platform not in {"win32", "darwin"}:
         raise RuntimeError("Desktop packaging requires a native Windows or macOS host.")
@@ -202,14 +215,7 @@ def build(output_dir: Path, *, skip_tests: bool = False) -> tuple[Path, Path]:
                 or desktop_dependencies.get("renderer") != "edgechromium"):
             raise RuntimeError("Packaged desktop dependency probe did not pass.")
     gui_report_path = build_root / "gui-smoke-report.json"
-    try:
-        run([str(executable), "--gui-smoke-test", "--gui-smoke-report", str(gui_report_path)],
-            stage, test_env, timeout=90)
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError("Packaged GUI smoke test timed out after 90 seconds.") from error
-    except subprocess.CalledProcessError as error:
-        detail = gui_report_path.read_text(encoding="utf-8", errors="replace").strip() if gui_report_path.is_file() else "no report"
-        raise RuntimeError(f"Packaged GUI smoke test exited with {error.returncode}: {detail}") from error
+    run_packaged_gui_smoke(executable, stage, test_env, gui_report_path)
     try:
         gui_smoke_test = json.loads(gui_report_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:

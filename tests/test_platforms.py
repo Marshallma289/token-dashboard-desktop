@@ -42,9 +42,16 @@ class DesktopPlatformTests(unittest.TestCase):
             webview = types.ModuleType('webview')
             webview.create_window = Mock(return_value=Mock())
             webview.start = Mock()
-            with self.subTest(platform=platform), patch.object(sys, 'platform', platform), patch.dict(sys.modules, {'webview': webview}), patch.object(desktop, 'DesktopRuntime') as runtime, patch.object(desktop, '_wait_for_webview_cleanup'), patch.object(desktop, '_record_clean_exit'):
+            platforms = types.ModuleType('webview.platforms')
+            platforms.cocoa = types.SimpleNamespace(BrowserView=types.SimpleNamespace())
+            modules = {'webview': webview, 'webview.platforms': platforms}
+            with self.subTest(platform=platform), patch.object(sys, 'platform', platform), \
+                    patch.dict(sys.modules, modules), patch.object(desktop, 'DesktopRuntime') as runtime, \
+                    patch.object(desktop, '_wait_for_webview_cleanup'), patch.object(desktop, '_record_clean_exit'), \
+                    patch.object(desktop, '_show_startup_error') as startup_error:
                 runtime.return_value.start.return_value = 'http://127.0.0.1:12345/?desktop=1'
                 self.assertEqual(desktop.main(), 0)
+                startup_error.assert_not_called()
                 self.assertEqual(webview.start.call_args.kwargs['gui'], renderer)
                 self.assertTrue(webview.start.call_args.kwargs['private_mode'])
                 self.assertEqual(webview.create_window.call_args.kwargs['width'], 1440)

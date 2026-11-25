@@ -32,6 +32,17 @@ def release_notes(version, readme=None):
     return '\n\n'.join(part for part in (details, compatibility) if part)
 
 
+def gui_smoke_verified(info):
+    result = info.get('gui_smoke_test')
+    if not isinstance(result, dict):
+        return False
+    expected = result.get('expected_tokens')
+    displayed = result.get('displayed_tokens')
+    return (result.get('status') == 'passed' and result.get('frozen') is True
+            and result.get('gui_tested') is True and type(expected) is int and expected > 0
+            and type(displayed) is int and displayed == expected)
+
+
 def main():
     root = Path(sys.argv[1])
     commit = os.environ['GITHUB_SHA']
@@ -46,6 +57,8 @@ def main():
     for path in manifests:
         info = json.loads(path.read_text(encoding='utf-8'))
         assert info['source_commit'] == commit and info['validation'] == 'unittest-and-node-check-passed'
+        if not gui_smoke_verified(info):
+            raise ValueError(f'Usable native GUI smoke test required: {path.name}')
         key = {('win32', 'x64'): 'windows-x64', ('darwin', 'arm64'): 'macos-arm64'}[(info['platform'], info['architecture'])]
         assert key not in records
         archive = path.with_name(path.name.replace('.build-manifest.json', '.zip'))

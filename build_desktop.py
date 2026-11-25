@@ -89,6 +89,25 @@ def source_digest(source: Path) -> str:
 
 def run(command: list[str], cwd: Path, env: dict[str, str] | None = None, *, timeout: int | None = None) -> None:
     print("Running: " + " ".join(command), flush=True)
+    if sys.platform == "darwin" and "--gui-smoke-test" in command and timeout == 90:
+        sample_path = Path(command[-1]).with_suffix(".native.txt")
+        with subprocess.Popen(command, cwd=cwd, env=env) as child:
+            try:
+                code = child.wait(timeout=65)
+            except subprocess.TimeoutExpired:
+                try:
+                    subprocess.run(["/usr/bin/sample", str(child.pid), "3", "1", "-file", str(sample_path)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8, check=False)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+                try:
+                    code = child.wait(timeout=17)
+                except subprocess.TimeoutExpired as error:
+                    child.kill()
+                    raise subprocess.TimeoutExpired(command, timeout) from error
+            if code:
+                raise subprocess.CalledProcessError(code, command)
+        return
     subprocess.run(command, cwd=cwd, env=env, check=True, timeout=timeout)
 
 
@@ -120,6 +139,22 @@ def file_manifest(package: Path) -> list[dict[str, str | int]]:
                     digest.update(block)
             records.append({"path": name, "sha256": digest.hexdigest(), "size_bytes": path.stat().st_size})
     return records
+
+
+def run_packaged_gui_smoke(executable, stage, test_env, report_path):
+    try:
+        run([str(executable), "--gui-smoke-test", "--gui-smoke-report", str(report_path)],
+            stage, test_env, timeout=90)
+    except subprocess.TimeoutExpired as error:
+        trace_path = report_path.with_suffix(".trace")
+        detail = trace_path.read_text(encoding="utf-8", errors="replace") if trace_path.is_file() else "no child trace"
+        report = report_path.read_text(encoding="utf-8", errors="replace").strip() if report_path.is_file() else "no final report"
+        sample_path = report_path.with_suffix(".native.txt")
+        sample = sample_path.read_text(encoding="utf-8", errors="replace") if sample_path.is_file() else "no native sample"
+        raise RuntimeError(f"Packaged GUI smoke test timed out after 90 seconds.\n{detail}\nFinal report: {report}\n{sample[:18000]}") from error
+    except subprocess.CalledProcessError as error:
+        detail = report_path.read_text(encoding="utf-8", errors="replace").strip() if report_path.is_file() else "no report"
+        raise RuntimeError(f"Packaged GUI smoke test exited with {error.returncode}: {detail}") from error
 
 
 def build(output_dir: Path, *, skip_tests: bool = False) -> tuple[Path, Path]:
@@ -201,28 +236,27 @@ def build(output_dir: Path, *, skip_tests: bool = False) -> tuple[Path, Path]:
                 or desktop_dependencies.get("frozen") is not True
                 or desktop_dependencies.get("renderer") != "edgechromium"):
             raise RuntimeError("Packaged desktop dependency probe did not pass.")
-    gui_report_path = build_root / "gui-smoke-report.json"
-    try:
-        run([str(executable), "--gui-smoke-test", "--gui-smoke-report", str(gui_report_path)],
-            stage, test_env, timeout=90)
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError("Packaged GUI smoke test timed out after 90 seconds.") from error
-    except subprocess.CalledProcessError as error:
-        detail = gui_report_path.read_text(encoding="utf-8", errors="replace").strip() if gui_report_path.is_file() else "no report"
-        raise RuntimeError(f"Packaged GUI smoke test exited with {error.returncode}: {detail}") from error
-    try:
-        gui_smoke_test = json.loads(gui_report_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
-        raise RuntimeError("Packaged GUI smoke test did not write a valid report.") from error
     renderer = "edgechromium" if sys.platform == "win32" else "wkwebview"
-    if (not isinstance(gui_smoke_test, dict)
-            or gui_smoke_test.get("status") != "passed"
-            or gui_smoke_test.get("frozen") is not True
-            or gui_smoke_test.get("gui_tested") is not True
-            or gui_smoke_test.get("renderer") != renderer
-            or gui_smoke_test.get("app_version") != version
-            or gui_smoke_test.get("rendered_total_tokens") != 173):
-        raise RuntimeError(f"Packaged GUI smoke test did not pass: {gui_smoke_test!r}")
+    smoke_reports = [build_root / "gui-smoke-report.json"]
+    repeat_smoke = sys.platform == "darwin" and os.environ.get("CODEX_TOKEN_GUI_SMOKE_REPEAT") == "1"
+    if repeat_smoke:
+        smoke_reports.extend(build_root / f"gui-smoke-report-{attempt}.json" for attempt in range(2, 6))
+    for gui_report_path in smoke_reports:
+        run_packaged_gui_smoke(executable, stage, test_env, gui_report_path)
+        try:
+            gui_smoke_test = json.loads(gui_report_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise RuntimeError("Packaged GUI smoke test did not write a valid report.") from error
+        if (not isinstance(gui_smoke_test, dict)
+                or gui_smoke_test.get("status") != "passed"
+                or gui_smoke_test.get("frozen") is not True
+                or gui_smoke_test.get("gui_tested") is not True
+                or gui_smoke_test.get("renderer") != renderer
+                or gui_smoke_test.get("app_version") != version
+                or gui_smoke_test.get("rendered_total_tokens") != 173):
+            raise RuntimeError(f"Packaged GUI smoke test did not pass: {gui_smoke_test!r}")
+        if repeat_smoke:
+            print(gui_report_path.with_suffix(".trace").read_text(encoding="utf-8"), flush=True)
     files = file_manifest(package)
     manifest = {
         "self_test": self_test,

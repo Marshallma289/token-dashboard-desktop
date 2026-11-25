@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import tempfile
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -690,14 +690,56 @@ def _create_dashboard_window(webview, url, bridge):
     return window
 
 
+def _evaluate_cocoa_js(view: Any, script: str, parse_json: bool,
+                       schedule: Callable[[Callable[[], None]], None], stopped: threading.Event) -> Any:
+    """Release a pywebview 6.2.1 Cocoa JS waiter if closing drops its callback."""
+    if stopped.is_set() or view.closed.is_set():
+        return None
+    finished = threading.Event()
+    result = None
+
+    def complete(value, _error):
+        nonlocal result
+        result = value
+        if parse_json and value:
+            try:
+                result = json.loads(value)
+            except (TypeError, ValueError):
+                pass
+        finished.set()
+
+    def dispatch():
+        if view.webview is not None and not stopped.is_set():
+            view.webview.evaluateJavaScript_completionHandler_(script, complete)
+
+    schedule(dispatch)
+    while not (stopped.is_set() or view.closed.is_set()):
+        if finished.wait(0.05):
+            break
+    return result
+
+
 def _start_desktop_gui(webview, *, func=None, storage_path=None) -> None:
-    webview.start(
-        func=func,
-        gui="edgechromium" if sys.platform == "win32" else None,
-        debug=False,
-        private_mode=True,
-        storage_path=storage_path,
-    )
+    loop_stopped = threading.Event()
+    if sys.platform == "darwin":
+        from webview.platforms import cocoa
+
+        # The pinned renderer waits indefinitely for WKWebView to answer.
+        # Install the same close-aware evaluator for production and GUI smoke.
+        def evaluate_js(view, script, parse_json):
+            return _evaluate_cocoa_js(view, script, parse_json, cocoa.AppHelper.callAfter, loop_stopped)
+
+        cocoa.BrowserView.evaluate_js = evaluate_js
+    try:
+        webview.start(
+            func=func,
+            gui="edgechromium" if sys.platform == "win32" else None,
+            debug=False,
+            private_mode=True,
+            storage_path=storage_path,
+        )
+    finally:
+        loop_stopped.set()
 
 
 @contextmanager
@@ -786,10 +828,12 @@ def _check_gui_smoke_window(window, *, timeout=40) -> int:
     return int(state["total"])
 
 
-def run_gui_smoke_test() -> Mapping[str, Any]:
+def run_gui_smoke_test(mark=lambda _: None) -> Mapping[str, Any]:
     """Launch a real desktop window against one synthetic Codex request."""
+    mark("Importing webview")
     import webview
 
+    mark("Creating temporary dashboard profile")
     with tempfile.TemporaryDirectory(prefix="codex-token-gui-smoke-") as folder:
         root = Path(folder).resolve()
         with _gui_smoke_profile(root) as sessions:
@@ -809,6 +853,7 @@ def run_gui_smoke_test() -> Mapping[str, Any]:
             runtime = DesktopRuntime(db_path=root / "usage.sqlite3", providers_path=root / "providers.json",
                                      hermes_db=root / "missing-hermes.sqlite3")
             try:
+                mark("Starting dashboard runtime")
                 url = runtime.start()
                 bridge = _GuiSmokeBridge(runtime)
                 window = _create_dashboard_window(webview, url, bridge)
@@ -816,13 +861,17 @@ def run_gui_smoke_test() -> Mapping[str, Any]:
 
                 def check_and_close() -> None:
                     try:
+                        mark("Testing the rendered dashboard")
                         result["rendered_total_tokens"] = _check_gui_smoke_window(window)
                     except Exception as error:
                         result["error"] = str(error)
                     finally:
+                        mark(f"Closing native window; verification result: {result!r}")
                         window.destroy()
 
+                mark("Starting native event loop")
                 _start_desktop_gui(webview, func=check_and_close, storage_path=str(root / "webview"))
+                mark("Native event loop returned")
                 if result.get("rendered_total_tokens") != _GUI_SMOKE_TOKENS:
                     raise RuntimeError(result.get("error") or "Native GUI exited before smoke verification")
                 return {"status": "passed", "app_version": APP_VERSION, "gui_tested": True,
@@ -830,6 +879,7 @@ def run_gui_smoke_test() -> Mapping[str, Any]:
                         "rendered_total_tokens": result["rendered_total_tokens"],
                         "checks": ["native_window_shown", "rendered_synthetic_usage", "navigate_trends_and_overview"]}
             finally:
+                mark("Stopping dashboard runtime")
                 runtime.stop()
 
 
@@ -855,6 +905,29 @@ def probe_desktop_dependencies() -> Mapping[str, Any]:
             "renderer": renderer, "imports": imports, "gui_tested": False}
 
 
+@contextmanager
+def _gui_smoke_diagnostics(report_path: Path | None):
+    """Capture frozen windowed Python stacks before the build kills a hung process."""
+    if report_path is None:
+        yield lambda _: None
+        return
+    import faulthandler
+
+    with report_path.with_suffix(".trace").open("w", encoding="utf-8") as trace:
+        def mark(phase):
+            trace.write(f"{phase}\n")
+            trace.flush()
+
+        mark("Native GUI smoke process entered Python")
+        mark("Arming Python traceback watchdog")
+        faulthandler.dump_traceback_later(55, file=trace)
+        try:
+            yield mark
+        finally:
+            mark("Leaving Python diagnostics context")
+            faulthandler.cancel_dump_traceback_later()
+
+
 def main() -> int:
     if "--gui-smoke-test" in sys.argv:
         import argparse
@@ -862,10 +935,11 @@ def main() -> int:
         parser.add_argument("--gui-smoke-test", action="store_true")
         parser.add_argument("--gui-smoke-report", type=Path)
         args = parser.parse_args()
-        try:
-            report, code = run_gui_smoke_test(), 0
-        except Exception as error:
-            report, code = {"status": "failed", "gui_tested": False, "error": str(error)}, 1
+        with _gui_smoke_diagnostics(args.gui_smoke_report) as mark:
+            try:
+                report, code = run_gui_smoke_test(mark), 0
+            except Exception as error:
+                report, code = {"status": "failed", "gui_tested": False, "error": str(error)}, 1
         output = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
         if args.gui_smoke_report:
             args.gui_smoke_report.write_text(output, encoding="utf-8")

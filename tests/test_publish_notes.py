@@ -29,10 +29,11 @@ class GuiSmokeGateTests(unittest.TestCase):
         from publish_update import gui_smoke_verified
 
         good = {'status': 'passed', 'frozen': True, 'gui_tested': True,
-                'expected_tokens': 173, 'displayed_tokens': 173}
-        self.assertTrue(gui_smoke_verified({'gui_smoke_test': good}))
-        self.assertFalse(gui_smoke_verified({}))
+                'renderer': 'edgechromium', 'app_version': '1.8.5', 'rendered_total_tokens': 173}
+        artifact = {'platform': 'win32', 'version': '1.8.5'}
+        self.assertTrue(gui_smoke_verified({**artifact, 'gui_smoke_test': good}))
+        self.assertFalse(gui_smoke_verified(artifact))
         for field, bad in (('status', 'failed'), ('gui_tested', False), ('frozen', False),
-                           ('expected_tokens', 0), ('displayed_tokens', 174)):
+                           ('renderer', 'cocoa'), ('app_version', '1.8.4'), ('rendered_total_tokens', 174)):
             with self.subTest(field=field):
-                self.assertFalse(gui_smoke_verified({'gui_smoke_test': {**good, field: bad}}))
+                self.assertFalse(gui_smoke_verified({**artifact, 'gui_smoke_test': {**good, field: bad}}))

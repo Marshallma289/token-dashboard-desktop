@@ -36,11 +36,13 @@ def gui_smoke_verified(info):
     result = info.get('gui_smoke_test')
     if not isinstance(result, dict):
         return False
-    expected = result.get('expected_tokens')
-    displayed = result.get('displayed_tokens')
-    return (result.get('status') == 'passed' and result.get('frozen') is True
-            and result.get('gui_tested') is True and type(expected) is int and expected > 0
-            and type(displayed) is int and displayed == expected)
+    renderer = {'win32': 'edgechromium', 'darwin': 'cocoa'}.get(info.get('platform'))
+    return (renderer is not None and bool(info.get('version'))
+            and result.get('status') == 'passed' and result.get('frozen') is True
+            and result.get('gui_tested') is True and result.get('renderer') == renderer
+            and result.get('app_version') == info.get('version')
+            and type(result.get('rendered_total_tokens')) is int
+            and result['rendered_total_tokens'] == 173)
 
 
 def main():

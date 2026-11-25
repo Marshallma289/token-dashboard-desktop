@@ -36,7 +36,7 @@ def gui_smoke_verified(info):
     result = info.get('gui_smoke_test')
     if not isinstance(result, dict):
         return False
-    renderer = {'win32': 'edgechromium', 'darwin': 'cocoa'}.get(info.get('platform'))
+    renderer = {'win32': 'edgechromium', 'darwin': 'wkwebview'}.get(info.get('platform'))
     return (renderer is not None and bool(info.get('version'))
             and result.get('status') == 'passed' and result.get('frozen') is True
             and result.get('gui_tested') is True and result.get('renderer') == renderer

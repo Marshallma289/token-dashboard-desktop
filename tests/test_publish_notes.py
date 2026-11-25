@@ -32,6 +32,8 @@ class GuiSmokeGateTests(unittest.TestCase):
                 'renderer': 'edgechromium', 'app_version': '1.8.5', 'rendered_total_tokens': 173}
         artifact = {'platform': 'win32', 'version': '1.8.5'}
         self.assertTrue(gui_smoke_verified({**artifact, 'gui_smoke_test': good}))
+        self.assertTrue(gui_smoke_verified({**artifact, 'platform': 'darwin',
+                                            'gui_smoke_test': {**good, 'renderer': 'wkwebview'}}))
         self.assertFalse(gui_smoke_verified(artifact))
         for field, bad in (('status', 'failed'), ('gui_tested', False), ('frozen', False),
                            ('renderer', 'cocoa'), ('app_version', '1.8.4'), ('rendered_total_tokens', 174)):

@@ -2,6 +2,8 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -9,6 +11,53 @@ import desktop
 
 
 class GuiSmokeTests(unittest.TestCase):
+    def test_cocoa_evaluation_returns_native_result_while_window_is_open(self):
+        view = Mock(closed=threading.Event())
+        view.webview.evaluateJavaScript_completionHandler_.side_effect = (
+            lambda script, complete: complete('{"value": 173}', None)
+        )
+        schedule = lambda callback: callback()
+        self.assertEqual(
+            desktop._evaluate_cocoa_js(view, "173", True, schedule, threading.Event()), {"value": 173}
+        )
+        self.assertEqual(
+            desktop._evaluate_cocoa_js(view, "173", False, schedule, threading.Event()), '{"value": 173}'
+        )
+
+    def test_cocoa_evaluation_releases_pending_bridge_call_on_close(self):
+        view = Mock(closed=threading.Event())
+        stopped = threading.Event()
+
+        def schedule(callback):
+            callback()
+            view.closed.set()
+
+        self.assertIsNone(desktop._evaluate_cocoa_js(view, "reply()", False, schedule, stopped))
+        view.webview.evaluateJavaScript_completionHandler_.assert_called_once()
+
+    def test_cocoa_evaluation_does_not_dispatch_after_gui_loop_stops(self):
+        view = Mock(closed=threading.Event())
+        stopped = threading.Event()
+        stopped.set()
+        schedule = Mock()
+        self.assertIsNone(desktop._evaluate_cocoa_js(view, "reply()", False, schedule, stopped))
+        schedule.assert_not_called()
+
+    def test_desktop_installs_the_close_aware_evaluator_on_macos(self):
+        view = Mock(closed=threading.Event())
+        view.webview.evaluateJavaScript_completionHandler_.side_effect = (
+            lambda script, complete: complete('true', None)
+        )
+        schedule = Mock(side_effect=lambda callback: callback())
+        cocoa = SimpleNamespace(BrowserView=SimpleNamespace(), AppHelper=SimpleNamespace(callAfter=schedule))
+        webview = Mock()
+        webview.start.side_effect = lambda **_: self.assertIs(cocoa.BrowserView.evaluate_js(view, "true", True), True)
+        with patch.object(desktop.sys, "platform", "darwin"), \
+                patch.dict(desktop.sys.modules, {"webview.platforms": SimpleNamespace(cocoa=cocoa)}):
+            desktop._start_desktop_gui(webview)
+        self.assertIsNone(cocoa.BrowserView.evaluate_js(view, "reply()", False))
+        schedule.assert_called_once()
+
     def test_routes_cli_through_native_smoke_and_writes_report(self):
         with tempfile.TemporaryDirectory() as folder:
             report_path = Path(folder) / "gui.json"

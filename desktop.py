@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import tempfile
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -690,14 +690,56 @@ def _create_dashboard_window(webview, url, bridge):
     return window
 
 
+def _evaluate_cocoa_js(view: Any, script: str, parse_json: bool,
+                       schedule: Callable[[Callable[[], None]], None], stopped: threading.Event) -> Any:
+    """Release a pywebview 6.2.1 Cocoa JS waiter if closing drops its callback."""
+    if stopped.is_set() or view.closed.is_set():
+        return None
+    finished = threading.Event()
+    result = None
+
+    def complete(value, _error):
+        nonlocal result
+        result = value
+        if parse_json and value:
+            try:
+                result = json.loads(value)
+            except (TypeError, ValueError):
+                pass
+        finished.set()
+
+    def dispatch():
+        if view.webview is not None and not stopped.is_set():
+            view.webview.evaluateJavaScript_completionHandler_(script, complete)
+
+    schedule(dispatch)
+    while not (stopped.is_set() or view.closed.is_set()):
+        if finished.wait(0.05):
+            break
+    return result
+
+
 def _start_desktop_gui(webview, *, func=None, storage_path=None) -> None:
-    webview.start(
-        func=func,
-        gui="edgechromium" if sys.platform == "win32" else None,
-        debug=False,
-        private_mode=True,
-        storage_path=storage_path,
-    )
+    loop_stopped = threading.Event()
+    if sys.platform == "darwin":
+        from webview.platforms import cocoa
+
+        # The pinned renderer waits indefinitely for WKWebView to answer.
+        # Install the same close-aware evaluator for production and GUI smoke.
+        def evaluate_js(view, script, parse_json):
+            return _evaluate_cocoa_js(view, script, parse_json, cocoa.AppHelper.callAfter, loop_stopped)
+
+        cocoa.BrowserView.evaluate_js = evaluate_js
+    try:
+        webview.start(
+            func=func,
+            gui="edgechromium" if sys.platform == "win32" else None,
+            debug=False,
+            private_mode=True,
+            storage_path=storage_path,
+        )
+    finally:
+        loop_stopped.set()
 
 
 @contextmanager

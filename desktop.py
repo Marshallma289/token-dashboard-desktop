@@ -1,7 +1,9 @@
 """Shared Windows and macOS desktop shell for the Codex Token Dashboard."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 import csv
+from datetime import datetime, timezone
 import io
 import json
 import os
@@ -18,7 +20,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-from backend import DashboardDB, DashboardService, create_server, safe_csv_row, local_data_dir
+from backend import APP_VERSION, DashboardDB, DashboardService, create_server, safe_csv_row, local_data_dir
 from skills_service import check_dependencies as check_skills_dependencies
 from skills_service import forget_endpoint as forget_skills_endpoint
 from skills_service import publish_endpoint as publish_skills_endpoint
@@ -666,13 +668,176 @@ def run_self_test() -> Mapping[str, Any]:
             "gui_tested": False, "speed_sample_count": 2, "output_tokens_per_second": 33.3333, "checks": checks}
 
 
+def _create_dashboard_window(webview, url, bridge):
+    """Use the exact same native window and real JS bridge in smoke and production."""
+    window = webview.create_window(
+        "Codex Token · 实时看板",
+        url,
+        js_api=bridge,
+        width=1440,
+        height=920,
+        min_size=(980, 680),
+        maximized=True,
+        background_color="#0e151c",
+        text_select=True,
+    )
+    if window is None:
+        raise RuntimeError("无法创建客户端窗口")
+    bridge.attach_window(window)
+    return window
+
+
+def _start_desktop_gui(webview, *, func=None, storage_path=None) -> None:
+    webview.start(
+        func=func,
+        gui="edgechromium" if sys.platform == "win32" else None,
+        debug=False,
+        private_mode=True,
+        storage_path=storage_path,
+    )
+
+
+@contextmanager
+def _gui_smoke_profile(root: Path):
+    # Several runtime components independently resolve their data paths. Give
+    # all of them a temporary user profile, including the WebView browser data.
+    paths = {
+        "HOME": root / "home",
+        "USERPROFILE": root / "home",
+        "LOCALAPPDATA": root / "local",
+        "APPDATA": root / "roaming",
+        "XDG_CACHE_HOME": root / "cache",
+        "CODEX_HOME": root / "codex",
+        "HERMES_HOME": root / "hermes",
+    }
+    previous = {key: os.environ.get(key) for key in paths}
+    try:
+        for key, path in paths.items():
+            path.mkdir(exist_ok=True)
+            os.environ[key] = str(path)
+        sessions = paths["CODEX_HOME"] / "sessions"
+        sessions.mkdir()
+        (paths["CODEX_HOME"] / "archived_sessions").mkdir()
+        yield sessions
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+class _GuiSmokeBridge(DesktopBridge):
+    """Keep the real native bridge but never contact the updater in CI."""
+
+    def get_update_status(self) -> Mapping[str, Any]:
+        return {"state": "unsupported", "message": "Disabled in GUI smoke test"}
+
+    check_for_update = start_update = get_update_status
+
+
+_GUI_SMOKE_TOKENS = 173
+
+
+def _check_gui_smoke_window(window, *, timeout=40) -> int:
+    deadline = time.monotonic() + timeout
+    if not window.events.shown.wait(max(0, deadline - time.monotonic())):
+        raise RuntimeError("Native dashboard window was not shown")
+    if not window.events.loaded.wait(max(0, deadline - time.monotonic())):
+        raise RuntimeError("Dashboard WebView did not load")
+    # This is the value rendered by the production frontend, not API data.
+    # The default date range must contain today's synthetic usage.
+    probe = r"""(() => {
+        const value = index => document.querySelector(
+            '#kpiGrid article[data-metric="' + index + '"] .kpi-value'
+        )?.textContent.trim();
+        return {
+            ready: typeof window.pywebview?.api?.load_preferences === 'function',
+            total: value(1) ?? '',
+            requests: value(3) ?? '',
+            dashboardVisible: Boolean(document.querySelector('#view-overview')?.getClientRects().length)
+        };
+    })()"""
+    state = None
+    while time.monotonic() < deadline:
+        state = window.evaluate_js(probe)
+        if state == {"ready": True, "total": str(_GUI_SMOKE_TOKENS), "requests": "1", "dashboardVisible": True}:
+            break
+        time.sleep(.1)
+    else:
+        raise RuntimeError(f"Dashboard did not render {_GUI_SMOKE_TOKENS} Tokens / 1 request: {state!r}")
+    if window.evaluate_js(r"""(() => {
+        const tab = document.querySelector('#viewTabTrends');
+        tab.click();
+        return tab.getAttribute('aria-selected') === 'true' &&
+            Boolean(document.querySelector('#view-trends').getClientRects().length);
+    })()""") is not True:
+        raise RuntimeError("Trends tab did not show after clicking the native WebView control")
+    if window.evaluate_js(r"""(() => {
+        const tab = document.querySelector('#viewTabOverview');
+        tab.click();
+        return tab.getAttribute('aria-selected') === 'true' &&
+            Boolean(document.querySelector('#view-overview').getClientRects().length);
+    })()""") is not True:
+        raise RuntimeError("Overview tab did not show after clicking the native WebView control")
+    return int(state["total"])
+
+
+def run_gui_smoke_test() -> Mapping[str, Any]:
+    """Launch a real desktop window against one synthetic Codex request."""
+    import webview
+
+    with tempfile.TemporaryDirectory(prefix="codex-token-gui-smoke-") as folder:
+        root = Path(folder).resolve()
+        with _gui_smoke_profile(root) as sessions:
+            timestamp = datetime.now(timezone.utc).isoformat()
+            rows = [
+                ("session_meta", {"id": "gui-smoke-thread", "cwd": "GUI smoke workspace", "model_provider": "openai"}),
+                ("turn_context", {"turn_id": "gui-smoke-turn", "model": "gpt-5.4"}),
+                ("token_usage_record", {
+                    "thread_id": "gui-smoke-thread", "turn_id": "gui-smoke-turn", "response_id": "gui-smoke-response",
+                    "usage": {"input_tokens": 100, "output_tokens": 73, "total_tokens": _GUI_SMOKE_TOKENS},
+                }),
+            ]
+            (sessions / "rollout-gui-smoke.jsonl").write_text(
+                "".join(json.dumps({"timestamp": timestamp, "type": kind, "payload": payload}) + "\n"
+                        for kind, payload in rows), encoding="utf-8",
+            )
+            runtime = DesktopRuntime(db_path=root / "usage.sqlite3", providers_path=root / "providers.json",
+                                     hermes_db=root / "missing-hermes.sqlite3")
+            try:
+                url = runtime.start()
+                bridge = _GuiSmokeBridge(runtime)
+                window = _create_dashboard_window(webview, url, bridge)
+                result: dict[str, Any] = {}
+
+                def check_and_close() -> None:
+                    try:
+                        result["rendered_total_tokens"] = _check_gui_smoke_window(window)
+                    except Exception as error:
+                        result["error"] = str(error)
+                    finally:
+                        window.destroy()
+
+                _start_desktop_gui(webview, func=check_and_close, storage_path=str(root / "webview"))
+                if result.get("rendered_total_tokens") != _GUI_SMOKE_TOKENS:
+                    raise RuntimeError(result.get("error") or "Native GUI exited before smoke verification")
+                return {"status": "passed", "app_version": APP_VERSION, "gui_tested": True,
+                        "frozen": bool(getattr(sys, "frozen", False)), "renderer": webview.renderer,
+                        "rendered_total_tokens": result["rendered_total_tokens"],
+                        "checks": ["native_window_shown", "rendered_synthetic_usage", "navigate_trends_and_overview"]}
+            finally:
+                runtime.stop()
+
+
 def probe_desktop_dependencies() -> Mapping[str, Any]:
     """Load native dependencies without accessing history or opening a window."""
     import webview
     from webview.guilib import initialize
     imports = ["webview"]
-    renderer = "cocoa" if sys.platform == "darwin" else "edgechromium"
-    backend = initialize(renderer)
+    gui = "cocoa" if sys.platform == "darwin" else "edgechromium"
+    renderer = "wkwebview" if sys.platform == "darwin" else "edgechromium"
+    backend = initialize(gui)
     if getattr(backend, "renderer", None) != renderer:
         raise RuntimeError(f"Desktop renderer unavailable: {renderer}")
     if sys.platform == "win32":
@@ -688,6 +853,22 @@ def probe_desktop_dependencies() -> Mapping[str, Any]:
 
 
 def main() -> int:
+    if "--gui-smoke-test" in sys.argv:
+        import argparse
+        parser = argparse.ArgumentParser(description="Open the native dashboard with isolated synthetic data.")
+        parser.add_argument("--gui-smoke-test", action="store_true")
+        parser.add_argument("--gui-smoke-report", type=Path)
+        args = parser.parse_args()
+        try:
+            report, code = run_gui_smoke_test(), 0
+        except Exception as error:
+            report, code = {"status": "failed", "gui_tested": False, "error": str(error)}, 1
+        output = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+        if args.gui_smoke_report:
+            args.gui_smoke_report.write_text(output, encoding="utf-8")
+        elif sys.stdout is not None:
+            print(output, end="")
+        return code
     if "--probe-desktop-dependencies" in sys.argv:
         import argparse
         parser = argparse.ArgumentParser(description="Check native desktop dependencies without reading personal data.")
@@ -741,32 +922,13 @@ def main() -> int:
                    if '--hermes-db' in sys.argv else DesktopRuntime())
         url = runtime.start()
         bridge = DesktopBridge(runtime)
-        window = webview.create_window(
-            "Codex Token · 实时看板",
-            url,
-            js_api=bridge,
-            width=1440,
-            height=920,
-            min_size=(980, 680),
-            maximized=True,
-            background_color="#0e151c",
-            text_select=True,
-        )
-        if window is None:
-            raise RuntimeError("无法创建客户端窗口")
-        bridge.attach_window(window)
+        window = _create_dashboard_window(webview, url, bridge)
         job_path = Path(sys.argv[sys.argv.index('--update-job') + 1]) if '--update-job' in sys.argv else None
         if job_path is not None:
             window.events.loaded += lambda: confirm_startup(job_path)
         if getattr(sys, 'frozen', False):
             threading.Thread(target=cleanup_completed_updates, args=(installation_dir(), local_data_dir(), job_path), daemon=True, name='desktop-update-cleanup').start()
-        webview.start(
-            gui="edgechromium" if sys.platform == "win32" else None,
-            debug=False,
-            # An isolated profile avoids carrying browser cache or credentials
-            # inside the portable package.
-            private_mode=True,
-        )
+        _start_desktop_gui(webview)
         return 0
     except Exception as error:
         _show_startup_error(f"客户端无法启动：\n{error}")

@@ -2,6 +2,7 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -21,6 +22,16 @@ DEPENDENCY_REPORT = {
     "frozen": True,
     "renderer": "edgechromium",
     "gui_tested": False,
+}
+
+
+GUI_SMOKE_REPORT = {
+    "status": "passed",
+    "frozen": True,
+    "gui_tested": True,
+    "renderer": "edgechromium",
+    "app_version": "1.2.0",
+    "rendered_total_tokens": 173,
 }
 
 
@@ -81,7 +92,7 @@ class BuildDesktopTests(unittest.TestCase):
             original_cache.write_bytes(b"do not touch")
             calls = []
 
-            def fake_run(command, cwd, env=None):
+            def fake_run(command, cwd, env=None, *, timeout=None):
                 calls.append((command, cwd, env))
                 if "PyInstaller" in command:
                     output = Path(command[command.index("--distpath") + 1]) / "CodexTokenDesktop"
@@ -90,25 +101,30 @@ class BuildDesktopTests(unittest.TestCase):
                 if "--self-test" in command:
                     report_path = Path(command[command.index("--self-test-report") + 1])
                     report_path.write_text(json.dumps(SELF_TEST_REPORT), encoding="utf-8")
+                if "--gui-smoke-test" in command:
+                    Path(command[-1]).write_text(json.dumps(GUI_SMOKE_REPORT), encoding="utf-8")
+                    self.assertEqual(timeout, 90)
                 if "--probe-desktop-dependencies" in command:
                     report_path = Path(command[command.index("--probe-report") + 1])
                     report_path.write_text(json.dumps(DEPENDENCY_REPORT), encoding="utf-8")
 
             with patch.object(builder, "SOURCE_DIR", source), patch.object(builder.sys, "platform", "win32"), patch.object(builder, "run", side_effect=fake_run):
                 archive, manifest_path = builder.build(root / "release")
-            self.assertEqual(len(calls), 5)
+            self.assertEqual(len(calls), 6)
             self.assertTrue(all(cwd != source for _, cwd, _ in calls))
             self.assertIn("unittest", calls[0][0])
             self.assertEqual(calls[1][0][:2], ["node", "--check"])
             self.assertIn("--self-test", calls[3][0])
             self.assertIn("--self-test-report", calls[3][0])
             self.assertIn("--probe-desktop-dependencies", calls[4][0])
+            self.assertIn("--gui-smoke-test", calls[5][0])
             self.assertNotEqual(calls[0][2]["CODEX_HOME"], str(source))
             self.assertEqual(original_cache.read_bytes(), b"do not touch")
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["source_digest"], builder.source_digest(source))
             self.assertEqual(manifest["self_test"], SELF_TEST_REPORT)
             self.assertEqual(manifest["desktop_dependencies"], DEPENDENCY_REPORT)
+            self.assertEqual(manifest["gui_smoke_test"], GUI_SMOKE_REPORT)
             exe = next(item for item in manifest["files"] if item["path"] == "CodexTokenDesktop.exe")
             self.assertEqual(exe["sha256"], hashlib.sha256(b"fake executable").hexdigest())
             self.assertEqual(exe["size_bytes"], len(b"fake executable"))
@@ -140,7 +156,7 @@ class BuildDesktopTests(unittest.TestCase):
             (source / "assets" / "app-icon.png").write_bytes(b"fake PNG")
             calls = []
 
-            def fake_run(command, cwd, env=None):
+            def fake_run(command, cwd, env=None, *, timeout=None):
                 calls.append((command, cwd, env))
                 if command[0] == "iconutil":
                     Path(command[-1]).write_bytes(b"fake ICNS")
@@ -151,6 +167,8 @@ class BuildDesktopTests(unittest.TestCase):
                 elif "--self-test" in command:
                     report_path = Path(command[command.index("--self-test-report") + 1])
                     report_path.write_text(json.dumps(SELF_TEST_REPORT), encoding="utf-8")
+                elif "--gui-smoke-test" in command:
+                    Path(command[-1]).write_text(json.dumps({**GUI_SMOKE_REPORT, "renderer": "wkwebview"}), encoding="utf-8")
                 elif command[0] == "ditto":
                     Path(command[-1]).write_bytes(b"fake archive")
 
@@ -169,6 +187,7 @@ class BuildDesktopTests(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["self_test"], SELF_TEST_REPORT)
             self.assertIsNone(manifest["desktop_dependencies"])
+            self.assertEqual(manifest["gui_smoke_test"], {**GUI_SMOKE_REPORT, "renderer": "wkwebview"})
             self.assertEqual(manifest["architecture"], "arm64")
             self.assertEqual(manifest["validation"], "skipped")
             self.assertEqual(manifest["source_digest"], builder.source_digest(source))
@@ -179,7 +198,7 @@ class BuildDesktopTests(unittest.TestCase):
             source = root / "source"
             self.make_source(source)
 
-            def fake_run(command, cwd, env=None):
+            def fake_run(command, cwd, env=None, *, timeout=None):
                 if "PyInstaller" in command:
                     output = Path(command[command.index("--distpath") + 1]) / "CodexTokenDesktop"
                     output.mkdir(parents=True)
@@ -204,7 +223,7 @@ class BuildDesktopTests(unittest.TestCase):
                 source = root / "source"
                 self.make_source(source)
 
-                def fake_run(command, cwd, env=None):
+                def fake_run(command, cwd, env=None, *, timeout=None):
                     if "PyInstaller" in command:
                         output = Path(command[command.index("--distpath") + 1]) / "CodexTokenDesktop"
                         output.mkdir(parents=True)
@@ -216,6 +235,44 @@ class BuildDesktopTests(unittest.TestCase):
 
                 with patch.object(builder, "SOURCE_DIR", source), patch.object(builder.sys, "platform", "win32"), patch.object(builder, "run", side_effect=fake_run):
                     with self.assertRaisesRegex(RuntimeError, "dependency probe did not pass"):
+                        builder.build(root / "release", skip_tests=True)
+                self.assertFalse(list((root / "release").glob("*.zip")))
+
+
+    def test_windows_build_rejects_gui_failure_timeout_or_incorrect_rendered_usage(self):
+        reports = [
+            {**GUI_SMOKE_REPORT, "gui_tested": False},
+            {**GUI_SMOKE_REPORT, "renderer": "mshtml"},
+            {**GUI_SMOKE_REPORT, "rendered_total_tokens": 0},
+            {**GUI_SMOKE_REPORT, "app_version": "1.1.0"},
+            "timeout",
+            "startup error",
+        ]
+        for report in reports:
+            with self.subTest(report=report), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                source = root / "source"
+                self.make_source(source)
+
+                def fake_run(command, cwd, env=None, *, timeout=None):
+                    if "PyInstaller" in command:
+                        output = Path(command[command.index("--distpath") + 1]) / "CodexTokenDesktop"
+                        output.mkdir(parents=True)
+                        (output / "CodexTokenDesktop.exe").write_bytes(b"fake executable")
+                    elif "--self-test" in command:
+                        Path(command[-1]).write_text(json.dumps(SELF_TEST_REPORT), encoding="utf-8")
+                    elif "--probe-desktop-dependencies" in command:
+                        Path(command[-1]).write_text(json.dumps(DEPENDENCY_REPORT), encoding="utf-8")
+                    elif "--gui-smoke-test" in command:
+                        if report == "timeout":
+                            raise subprocess.TimeoutExpired(command, timeout)
+                        if report == "startup error":
+                            Path(command[-1]).write_text(json.dumps({"error": "window failed"}), encoding="utf-8")
+                            raise subprocess.CalledProcessError(1, command)
+                        Path(command[-1]).write_text(json.dumps(report), encoding="utf-8")
+
+                with patch.object(builder, "SOURCE_DIR", source), patch.object(builder.sys, "platform", "win32"), patch.object(builder, "run", side_effect=fake_run):
+                    with self.assertRaisesRegex(RuntimeError, "GUI smoke"):
                         builder.build(root / "release", skip_tests=True)
                 self.assertFalse(list((root / "release").glob("*.zip")))
 

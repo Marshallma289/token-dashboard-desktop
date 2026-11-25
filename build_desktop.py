@@ -87,9 +87,9 @@ def source_digest(source: Path) -> str:
     return digest.hexdigest()
 
 
-def run(command: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
+def run(command: list[str], cwd: Path, env: dict[str, str] | None = None, *, timeout: int | None = None) -> None:
     print("Running: " + " ".join(command), flush=True)
-    subprocess.run(command, cwd=cwd, env=env, check=True)
+    subprocess.run(command, cwd=cwd, env=env, check=True, timeout=timeout)
 
 
 def make_macos_icon(stage: Path, build_root: Path) -> None:
@@ -201,10 +201,33 @@ def build(output_dir: Path, *, skip_tests: bool = False) -> tuple[Path, Path]:
                 or desktop_dependencies.get("frozen") is not True
                 or desktop_dependencies.get("renderer") != "edgechromium"):
             raise RuntimeError("Packaged desktop dependency probe did not pass.")
+    gui_report_path = build_root / "gui-smoke-report.json"
+    try:
+        run([str(executable), "--gui-smoke-test", "--gui-smoke-report", str(gui_report_path)],
+            stage, test_env, timeout=90)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("Packaged GUI smoke test timed out after 90 seconds.") from error
+    except subprocess.CalledProcessError as error:
+        detail = gui_report_path.read_text(encoding="utf-8", errors="replace").strip() if gui_report_path.is_file() else "no report"
+        raise RuntimeError(f"Packaged GUI smoke test exited with {error.returncode}: {detail}") from error
+    try:
+        gui_smoke_test = json.loads(gui_report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise RuntimeError("Packaged GUI smoke test did not write a valid report.") from error
+    renderer = "edgechromium" if sys.platform == "win32" else "wkwebview"
+    if (not isinstance(gui_smoke_test, dict)
+            or gui_smoke_test.get("status") != "passed"
+            or gui_smoke_test.get("frozen") is not True
+            or gui_smoke_test.get("gui_tested") is not True
+            or gui_smoke_test.get("renderer") != renderer
+            or gui_smoke_test.get("app_version") != version
+            or gui_smoke_test.get("rendered_total_tokens") != 173):
+        raise RuntimeError(f"Packaged GUI smoke test did not pass: {gui_smoke_test!r}")
     files = file_manifest(package)
     manifest = {
         "self_test": self_test,
         "desktop_dependencies": desktop_dependencies,
+        "gui_smoke_test": gui_smoke_test,
         "version": version,
         "built_at": datetime.now(timezone.utc).isoformat(),
         "platform": sys.platform,

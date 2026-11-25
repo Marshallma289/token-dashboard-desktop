@@ -102,6 +102,8 @@ CSV 新增 `speed_output_tokens`、`speed_duration_ms`、`speed_sample_count`、
 
 手动自检：Windows 在终端运行 `CodexTokenDesktop.exe --self-test --self-test-report self-test-report.json`；Mac 使用 `.app/Contents/MacOS/CodexTokenDesktop` 加相同参数；源码使用 `python desktop.py --self-test`。通过时返回 0，失败时返回非 0。Windows 无控制台版本请查看指定的 JSON 报告。
 
+发版还必须通过真实窗口冒烟测试（构建清单中的 `gui_smoke_test`）：打开打包后的原生 WebView，确认界面展示一条隔离测试请求的 173 Token，并实际切换总览与趋势。不会读取个人历史或检查更新。可用 `--gui-smoke-test --gui-smoke-report gui-smoke-report.json` 手动运行；测试结束会关闭窗口。
+
 本地 Codex Token 用量看板：读取本机 rollout JSONL 日志，展示用量、请求分布和按内置参考价格或自定义规则估算的美元费用。支持 Windows x64、Apple Silicon Mac 桌面版，以及浏览器模式。
 
 [下载桌面版](https://github.com/Marshallma289/token-dashboard-desktop/releases/latest) · [构建记录](https://github.com/Marshallma289/token-dashboard-desktop/actions/workflows/build-desktop.yml) · [问题反馈](https://github.com/Marshallma289/token-dashboard-desktop/issues)

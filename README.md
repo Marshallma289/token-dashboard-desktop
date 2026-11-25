@@ -1,5 +1,12 @@
 # Codex Token Dashboard
 
+## 1.8.5：费用显示、首次启动与技能导入修复
+
+- 费用卡、趋势与周期对比区分未计价、部分计价和实际零费用；价格覆盖不完整时不计算费用涨跌比例。桌面版重启后保留折扣前／后选择。
+- 首次启动可检查 Codex 和 Hermes 的各自目录、状态及用量；缺少可选归档目录不再误报扫描异常。
+- 桌面技能导入支持选文件或文件夹；预览确认后先加入技能库，不会自动部署到 Agent。
+- Windows x64 和 Apple Silicon macOS 打包增加真实桌面窗口冒烟测试，通过后才生成并发布安装包。
+
 ## 1.8.4 自动查找技能的 GitHub 来源
 
 - 在 Codex 或 Hermes 技能详情点击「关联 GitHub」，看板会优先检查安装记录，再按技能名搜索公开 GitHub 仓库和 skills.sh。
@@ -25,7 +32,7 @@ Codex 和 Hermes 可在各自的 **技能管理 → 设置** 启用以下功能�
 从左侧 **技能管理** 进入，先选 **Codex** 或 **Hermes**。每个工作区有自己的技能文件、预设、部署目录和备份。同名技能可以有不同内容；切换工作区不会复制或启停技能。
 
 1. **查看本机技能**：默认读取 `CODEX_HOME/skills` 和 `HERMES_HOME/skills`，未指定时分别使用 `~/.codex/skills` 和 `~/.hermes/skills`。在设置里可逐个更改目录。外部安装单独标记；更新或移除前会检查文件是否被修改。
-2. **导入与部署**：从本地目录、`.zip`、`.skill`、公开 GitHub 仓库或 skills.sh 市场预览候选，勾选后导入。导入只加入技能库；点击安装才会部署到该 Agent 的全局目录。默认复制，也可选链接。停用受管技能会保留库内副本。
+2. **导入与部署**：从本地目录、`.zip`、`.skill`、公开 GitHub 仓库或 skills.sh 市场预览候选，勾选后导入。桌面版可直接选择本地文件夹或压缩包，浏览器版可填写服务主机路径。导入只加入技能库；点击「查看本次导入」可找到新项目，点击安装才会部署到该 Agent 的全局目录。默认复制，也可选链接。停用受管技能会保留库内副本。
 3. **整理与更新**：按名称、来源、标签筛选；用预设启停一组技能。详情可阅读 `SKILL.md` 和 `README.md`、查看历史、导出技能。更新先预览文件差异，再确认应用。
 4. **备份与恢复**：在当前工作区的备份页创建快照。可移植快照保存受管技能内容、标签和预设；不包含看板的用量数据库、另一工作区的技能、外部目录或本机路径设置。恢复前自动另存当前状态；影响已部署文件时需先停用对应技能。不要把凭据写入准备分享或同步的技能文件。
 5. **本机 CLI**：保持桌面看板打开，运行 `CodexTokenSkills.exe --agent codex --op state`（Hermes 改为 `--agent hermes`）。源码环境可用 `python skills_service.py --agent codex --op state`。CLI 与图形界面使用同一服务；写操作需要 `--apply`，JSON 参数可用 `--payload-stdin` 传入。无需让 Agent 直接修改看板数据库。
@@ -95,9 +102,13 @@ CSV 新增 `speed_output_tokens`、`speed_duration_ms`、`speed_sample_count`、
 
 手动自检：Windows 在终端运行 `CodexTokenDesktop.exe --self-test --self-test-report self-test-report.json`；Mac 使用 `.app/Contents/MacOS/CodexTokenDesktop` 加相同参数；源码使用 `python desktop.py --self-test`。通过时返回 0，失败时返回非 0。Windows 无控制台版本请查看指定的 JSON 报告。
 
+发版还必须通过真实窗口冒烟测试（构建清单中的 `gui_smoke_test`）：打开打包后的原生 WebView，确认界面展示一条隔离测试请求的 173 Token，并实际切换总览与趋势。不会读取个人历史或检查更新。可用 `--gui-smoke-test --gui-smoke-report gui-smoke-report.json` 手动运行；测试结束会关闭窗口。
+
 本地 Codex Token 用量看板：读取本机 rollout JSONL 日志，展示用量、请求分布和按内置参考价格或自定义规则估算的美元费用。支持 Windows x64、Apple Silicon Mac 桌面版，以及浏览器模式。
 
 [下载桌面版](https://github.com/Marshallma289/token-dashboard-desktop/releases/latest) · [构建记录](https://github.com/Marshallma289/token-dashboard-desktop/actions/workflows/build-desktop.yml) · [问题反馈](https://github.com/Marshallma289/token-dashboard-desktop/issues)
+
+首次打开没有用量时，点侧栏底部的「查看数据源」，分别核对 Codex 和 Hermes 的读取路径、已保存记录和提示。默认 `archived_sessions` 尚未创建是正常状态；手动指定的路径缺失或实际读取失败会单独标记。
 
 > 看板统计的是本机日志，费用是参考估算，不等同于 OpenAI 或第三方供应商账单，也不代表订阅额度消耗。
 

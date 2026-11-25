@@ -37,6 +37,7 @@
             <span id="connectionText">实时连接中</span>
           </div>
         </div>
+        <button id="viewSourcesButton" class="source-diagnostics-link" type="button" aria-controls="diagnosticsPanel">查看数据源</button>
         <span id="lastUpdated" class="updated-text">等待数据</span>
         <span class="version-tag" id="appVersion"></span>
       </div>
@@ -251,7 +252,7 @@
           <p id="pricingStatus" class="analytics-status" role="status" aria-live="polite"></p>
         </section>
         <section id="diagnosticsPanel" class="panel analytics-panel analytics-wide app-subview-panel layout-module" data-layout-id="pricing-diagnostics" role="tabpanel" aria-labelledby="pricingTabDiagnostics" tabindex="0" data-subview-panel="diagnostics" hidden>
-          <div class="panel-heading"><div><h2 id="diagnosticsTitle">数据来源与扫描诊断</h2></div><button id="diagnosticsRefresh" class="reset-button" type="button">刷新诊断</button></div>
+          <div class="panel-heading"><div><h2 id="diagnosticsTitle" tabindex="-1">数据来源与扫描诊断</h2></div><button id="diagnosticsRefresh" class="reset-button" type="button">刷新诊断</button></div>
           <div id="diagnosticsFacts" class="diagnostic-facts"></div>
           <div id="diagnosticsRoots" class="diagnostic-roots"></div>
           <div class="scan-options"><label><input id="autoScanEnabled" type="checkbox"> 自动扫描</label><label for="scanInterval">扫描间隔（秒）<input id="scanInterval" type="number" min="10" max="86400" step="1"></label><button id="saveScanOptions" class="reset-button" type="button">保存</button><button id="scanNow" class="export-button" type="button">立即同步</button></div>
@@ -339,6 +340,7 @@
     </form>
   </dialog>
   <script src="cache-metrics.js" defer></script>
+  <script src="pricing-status.js" defer></script>
   <script src="skills.js" defer></script>
   <script src="layout.js" defer></script>
   <script src="app.js" defer></script>

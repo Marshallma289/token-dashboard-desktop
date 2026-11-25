@@ -8,6 +8,8 @@ Codex Token Dashboard is designed to stay on the local machine.
   reasoning, and credentials are not stored in the dashboard database.
 - `auth.json` and API keys are never read.
 - The web interface contains no CDN, analytics, telemetry, or remote assets.
+- Source diagnostics show local paths and aggregate counts, not log contents.
+  The diagnostics route is available only from the local loopback listener.
 
 Do not bind the service to `0.0.0.0` on an untrusted network. If you need
 remote access, put the service behind an authenticated reverse proxy and a

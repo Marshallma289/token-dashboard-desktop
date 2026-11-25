@@ -215,6 +215,21 @@ h1, h2, h3, .kpi-value, .model-stat-value { letter-spacing: -.025em; }
 .sidebar-footer .connection-badge:is(.is-connecting, .is-scanning, .is-reconnecting) { color: #efd39a; }
 .sidebar-footer .connection-badge:is(.is-offline, .is-error) { color: #ffbaba; }
 .sidebar-footer .status-dot { flex: 0 0 6px; box-shadow: none; }
+.sidebar-footer .source-diagnostics-link {
+  justify-self: start;
+  padding: 3px 0;
+  border: 0;
+  background: transparent;
+  color: #c3d7ff;
+  font: inherit;
+  font-size: 12px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.sidebar-footer .source-diagnostics-link:hover { color: #fff; }
+.diagnostic-source h3 { margin: 12px 0 5px; }
+.diagnostic-source p { margin: 5px 0; }
 .sidebar-footer :is(.updated-text, .version-tag) {
   min-width: 0;
   margin: 0;

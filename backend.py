@@ -20,12 +20,13 @@ import mimetypes
 import os
 from pathlib import Path
 import sqlite3
+import stat as stat_mode
 import sys
 import threading
 import time
 import uuid
 import webbrowser
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
@@ -627,6 +628,8 @@ class ScanResult:
     unavailable_roots: int = 0
     hermes_rows_read: int = 0
     hermes_unavailable: int = 0
+    hermes_source_errors: int = 0
+    source_paths: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, int]:
         return {
@@ -641,6 +644,7 @@ class ScanResult:
             "unavailable_roots": self.unavailable_roots,
             "hermes_rows_read": self.hermes_rows_read,
             "hermes_unavailable": self.hermes_unavailable,
+            "hermes_source_errors": self.hermes_source_errors,
         }
 
 
@@ -1288,10 +1292,12 @@ class DashboardDB:
         timezone_name: Optional[str] = None,
         clock: Optional[Callable[[], _dt.datetime]] = None,
         hermes_db: Optional[Path | str] = None,
+        hermes_explicit: Optional[bool] = None,
     ) -> None:
         self.db_path = Path(db_path).expanduser().resolve()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.roots = [Path(root).expanduser() for root in roots] if roots else default_roots()
+        self._codex_autodiscover = not roots
         self.timezone_name = timezone_name or str(_resolve_timezone(None))
         self.timezone = _resolve_timezone(timezone_name)
         self._clock = clock or (lambda: _dt.datetime.now(self.timezone))
@@ -1299,6 +1305,7 @@ class DashboardDB:
         self.parser = RolloutParser(self.catalog, self.timezone)
         # Direct library callers opt in; executable entry points resolve defaults.
         self.hermes_db = Path(hermes_db) if hermes_db is not None else None
+        self._hermes_explicit = hermes_db is not None if hermes_explicit is None else hermes_explicit
         self.pricing = PricingCatalog()
         self.database_recovery: Optional[Dict[str, Any]] = None
         self.database_migration: Optional[Dict[str, Any]] = None
@@ -2426,31 +2433,49 @@ class DashboardDB:
         found: Dict[str, Path] = {}
         self._complete_roots = []
         self._unavailable_roots = 0
-        for root in self.roots:
+        self._codex_path_status = []
+        for index, root in enumerate(self.roots):
+            archive = self._codex_autodiscover and index == 1
+            item = {"path": str(root), "role": "archive" if archive else "sessions"}
+            self._codex_path_status.append(item)
             try:
-                if not root.is_dir():
+                mode = root.stat().st_mode
+            except FileNotFoundError:
+                # The default archive does not exist until Codex archives a
+                # session. An auto-detected primary source can also be absent
+                # on first run. A user-supplied --root must be reachable.
+                item["status"] = ("optional_missing" if archive else "not_configured"
+                                  if self._codex_autodiscover else "missing")
+                if not self._codex_autodiscover:
                     self._unavailable_roots += 1
-                    # History no longer depends on file references, so a
-                    # definitely deleted root can shed its scanning indexes.
-                    try:
-                        root.stat()
-                    except FileNotFoundError:
-                        self._complete_roots.append(root)
-                    except OSError:
-                        pass
-                    continue
+                # Definitely deleted roots can shed indexes, not durable data.
+                self._complete_roots.append(root)
+                continue
+            except OSError as error:
+                item["status"] = "invalid" if isinstance(error, NotADirectoryError) else "unreadable"
+                self._unavailable_roots += 1
+                continue
+            if not stat_mode.S_ISDIR(mode):
+                self._unavailable_roots += 1
+                item["status"] = "invalid"
+                continue
+            try:
                 errors = []
+                files_seen = 0
                 # os.walk reports enumeration failures; rglob can suppress them.
                 for directory, _, filenames in os.walk(root, onerror=errors.append):
                     for name in filenames:
                         if name.lower().endswith(".jsonl"):
                             path = (Path(directory) / name).resolve()
                             found[str(path)] = path
+                            files_seen += 1
+                item.update(status="unreadable" if errors else "readable", files_seen=files_seen)
                 if errors:
                     self._unavailable_roots += 1
                 else:
                     self._complete_roots.append(root)
             except OSError:
+                item["status"] = "unreadable"
                 self._unavailable_roots += 1
         return sorted(found.values(), key=lambda path: str(path).casefold())
 
@@ -2477,12 +2502,29 @@ class DashboardDB:
                 raise
 
     def _scan_hermes(self, result, force=False):
+        path_status = result.source_paths["hermes"] = []
         if self.hermes_db is None:
             return
         from hermes_source import HermesSource, resolve_hermes_paths
-        for path in resolve_hermes_paths(self.hermes_db):
+        for index, path in enumerate(resolve_hermes_paths(self.hermes_db)):
+            item = {"path": str(path), "role": "profile" if index else "state_db"}
+            path_status.append(item)
             result.files_seen += 1
-            if not path.is_file():
+            try:
+                if not stat_mode.S_ISREG(path.stat().st_mode):
+                    item["status"] = "invalid"
+                    result.hermes_source_errors += 1
+                    result.hermes_unavailable += 1
+                    continue
+            except FileNotFoundError:
+                required = index != 0 or self._hermes_explicit
+                item["status"] = "missing" if required else "not_configured"
+                result.hermes_source_errors += int(required)
+                result.hermes_unavailable += 1
+                continue
+            except OSError as error:
+                item["status"] = "invalid" if isinstance(error, NotADirectoryError) else "unreadable"
+                result.hermes_source_errors += 1
                 result.hermes_unavailable += 1
                 continue
             with self._lock:
@@ -2494,9 +2536,12 @@ class DashboardDB:
             try:
                 source = HermesSource(path, self.timezone)
                 rows, watermark = source.read(watermark, previous_signature[0] if previous_signature else None)
-            except (OSError, sqlite3.Error, ValueError):
+            except (OSError, sqlite3.Error, ValueError, TypeError, OverflowError) as error:
+                item["status"] = "unreadable" if isinstance(error, OSError) else "invalid"
+                result.hermes_source_errors += 1
                 result.hermes_unavailable += 1
                 continue
+            item.update(status="readable", records_seen=watermark[1])
             if rows is None:
                 result.files_unchanged += 1
                 continue
@@ -2602,6 +2647,7 @@ class DashboardDB:
         files = self._files()
         complete_roots = tuple(self._complete_roots)
         result.unavailable_roots = self._unavailable_roots
+        result.source_paths["codex"] = self._codex_path_status
         result.files_seen = len(files)
         seen = {str(path) for path in files}
         with self._lock:
@@ -4005,6 +4051,7 @@ class DashboardService:
         self._version = 0
         self._thread: Optional[threading.Thread] = None
         self.last_scan: Dict[str, int] = {}
+        self._last_source_paths: Dict[str, List[Dict[str, Any]]] = {}
         self.last_success_at: Optional[str] = None
         self.last_duration_ms: Optional[int] = None
         self.consecutive_failures = 0
@@ -4031,6 +4078,7 @@ class DashboardService:
         duration_ms = max(0, int(round((time.perf_counter() - started) * 1000)))
         with self._changed:
             self.last_scan = result.as_dict()
+            self._last_source_paths = result.source_paths
             self.last_success_at = _now_iso()
             self.last_duration_ms = duration_ms
             self.consecutive_failures = 0
@@ -4121,7 +4169,7 @@ class DashboardService:
                 scan_state = "error"
                 status = "degraded"
             elif any(self.last_scan.get(key, 0) for key in
-                     ("parse_errors", "incomplete_files", "unavailable_roots")):
+                     ("parse_errors", "incomplete_files", "unavailable_roots", "hermes_source_errors")):
                 scan_state = "partial"
                 status = "degraded"
             elif self.last_success_at is None:
@@ -4149,6 +4197,43 @@ class DashboardService:
             "history": self.database.storage_status(),
             **self.database.counts(),
         }
+
+    def source_diagnostics(self) -> List[Dict[str, Any]]:
+        """Report the previous scan and saved record counts, not log contents."""
+        database = self.database
+        with self._changed:
+            scan = dict(self.last_scan)
+            paths = {kind: [dict(item) for item in group]
+                     for kind, group in self._last_source_paths.items()}
+        if not paths:
+            paths = {"codex": [{"path": str(path), "status": "pending",
+                                "role": "archive" if database._codex_autodiscover and index == 1 else "sessions"}
+                               for index, path in enumerate(database.roots)],
+                     "hermes": ([{"path": str(database.hermes_db), "status": "pending", "role": "state_db"}]
+                                if database.hermes_db is not None else [])}
+        with database._lock:
+            counts = dict(database._connection.execute("""SELECT s.source_kind, COUNT(*)
+                FROM history_requests r JOIN history_snapshots s ON s.id=r.snapshot_id GROUP BY s.source_kind"""))
+        sources = []
+        for kind in ("codex", "hermes"):
+            entries = paths.get(kind, [])
+            count = int(counts.get(kind, 0))
+            readable = any(entry["status"] == "readable" or entry.get("files_seen", 0) for entry in entries)
+            issues = any(entry["status"] in {"invalid", "unreadable", "missing"} for entry in entries)
+            errors = (sum(scan.get(key, 0) for key in ("parse_errors", "incomplete_files", "unavailable_roots"))
+                      if kind == "codex" else scan.get("hermes_source_errors", 0))
+            if issues or errors:
+                status = "partial" if readable else "error"
+            elif readable:
+                inputs = any(entry.get("files_seen", 0) or entry.get("records_seen", 0) for entry in entries)
+                status = "loaded" if inputs and count else "empty"
+            elif any(entry["status"] == "pending" for entry in entries):
+                status = "pending"
+            else:
+                status = "not_configured"
+            sources.append({"kind": kind, "status": status, "available_records": count,
+                            "scan_errors": errors, "paths": entries})
+        return sources
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -4239,6 +4324,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
             authorities.update((f"{numeric}:80", "localhost:80"))
         host = hosts[0].lower()
         return host in authorities and origins[0].lower() == f"http://{host.removesuffix(':80') if port == 80 else host}"
+
+    def _local_diagnostics_allowed(self) -> bool:
+        # Reads can omit Origin, but filesystem paths must never be published
+        # via a LAN-bound listener or a browser request from another site.
+        try:
+            bound = ipaddress.ip_address(self.server.server_address[0])
+            local = ipaddress.ip_address(self.connection.getsockname()[0])
+            peer = ipaddress.ip_address(self.client_address[0])
+        except (ValueError, OSError):
+            return False
+        if not (bound.is_loopback and local == bound and peer.is_loopback):
+            return False
+        hosts = self.headers.get_all("Host", [])
+        origins = self.headers.get_all("Origin", [])
+        if len(hosts) != 1 or self.headers.get_all("Sec-Fetch-Site", []) not in ([], ["same-origin"]):
+            return False
+        port = int(self.server.server_port)
+        numeric = f"[{local}]" if local.version == 6 else str(local)
+        authorities = {f"{host}:{port}" for host in (numeric, "localhost")}
+        if port == 80:
+            authorities.update((numeric, "localhost"))
+        host = hosts[0].lower()
+        origin = host.removesuffix(":80") if port == 80 else host
+        return host in authorities and (not origins or [value.lower() for value in origins] == [f"http://{origin}"])
 
     def _mutation_error(self, error: str, status: int, *, skills: bool = False) -> None:
         self._write_json({"ok": False, "error": error} if skills else {"error": error}, status)
@@ -4348,7 +4457,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         service, _host = self.app
         route = urlparse(self.path).path
         static_routes = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js",
-                         "/cache-metrics.js": "cache-metrics.js",
+                         "/cache-metrics.js": "cache-metrics.js", "/pricing-status.js": "pricing-status.js",
                          "/layout.js": "layout.js",
                          "/analytics.js": "analytics.js", "/data-settings.js": "data-settings.js",
                          "/skills.js": "skills.js",
@@ -4433,6 +4542,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._write_json({"error": "sessions_unavailable"}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
         if route == "/api/diagnostics":
+            if not self._local_diagnostics_allowed():
+                self._write_json({"error": "diagnostics_local_only"}, HTTPStatus.FORBIDDEN)
+                return
             try:
                 database = service.database
                 with database._query_lock, database._lock:
@@ -4442,18 +4554,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                             "SELECT usage_format,COUNT(*) AS count FROM source_files GROUP BY usage_format"):
                         if row["usage_format"] in formats:
                             formats[row["usage_format"]] = int(row["count"])
-                    roots = []
-                    for root in database.roots:
-                        try:
-                            available = root.is_dir() and os.access(str(root), os.R_OK)
-                        except OSError:
-                            available = False
-                        roots.append({"path": str(root), "available": bool(available)})
+                    sources = service.source_diagnostics()
+                    roots = [{"path": item["path"], "available": item["status"] == "readable"}
+                             for item in sources[0]["paths"]]
                     scan_options = database.scan_options()
                     storage = database.storage_status()
                     scan_health = service.health()
                     diagnostics = {
-                        "scan": scan_health, "roots": roots, "formats": formats,
+                        "scan": scan_health, "sources": sources, "roots": roots, "formats": formats,
                         "unpriced_models": all_history["pricing"].get("unpriced_model_usage", []),
                         "scan_options": scan_options, "storage": storage,
                         "speed_exclusions": all_history.get("speed_exclusions", {}),
@@ -4622,7 +4730,8 @@ def _database_from_args(args: argparse.Namespace) -> DashboardDB:
     roots = args.root if args.root else None
     from hermes_source import resolve_hermes_paths
     return DashboardDB(args.db, roots=roots, providers_path=args.providers, timezone_name=args.timezone,
-                       hermes_db=resolve_hermes_paths(args.hermes_db)[0])
+                       hermes_db=resolve_hermes_paths(args.hermes_db)[0],
+                       hermes_explicit=args.hermes_db is not None or bool(os.environ.get("HERMES_HOME")))
 
 
 def _print_json(value: Any) -> None:
@@ -4699,10 +4808,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.format == "json":
                 output = json.dumps(dashboard, ensure_ascii=False, indent=2, sort_keys=True)
             else:
-                rows = [dict(row, cost_display_mode=args.cost_mode,
-                             displayed_cost_usd=row["cost_%s_discount_usd" % args.cost_mode],
-                             estimated_cost_usd=row["cost_%s_discount_usd" % args.cost_mode])
-                        for row in dashboard["daily_model_usage"]]
+                rows = []
+                for row in dashboard["daily_model_usage"]:
+                    cost = row["cost_%s_discount_usd" % args.cost_mode]
+                    item = dict(row, cost_display_mode=args.cost_mode,
+                                displayed_cost_usd=cost, estimated_cost_usd=cost)
+                    if row["pricing_status"] == "unpriced":
+                        for field in ("displayed_cost_usd", "estimated_cost_usd",
+                                      "cost_before_discount_usd", "cost_after_discount_usd",
+                                      "cache_savings_before_discount_usd", "cache_savings_after_discount_usd"):
+                            item[field] = None
+                    rows.append(item)
                 columns = [
                     "date",
                     "source_kind",

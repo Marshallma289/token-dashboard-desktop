@@ -96,7 +96,7 @@
 
   const workspaces = Object.fromEntries(Object.keys(agents).map(agent => [agent, {
     agent, view: 'library', data: null, busy: '', loadError: '', notice: '', error: '',
-    query: '', source: '', tag: '', filter: 'all', preset: '', updates: new Map(), selection: new Set(),
+    query: '', source: '', tag: '', filter: 'all', preset: '', updates: new Map(), selection: new Set(), lastImport: [],
     market: { query: '', board: 'hot', items: null, pending: false, error: '' },
     backups: null, sync: null, conflict: null, autoSync: null, resolvedConflict: '', rootInfo: null, readErrors: {}, pending: new Set(),
     automation: null, translations: new Map(), translationError: '', translationRetry: 0
@@ -381,6 +381,7 @@
     <nav class="skills-nav" aria-label="技能管理页面">${Object.entries(views).map(([key, label]) => `<button type="button" data-skill-action="view" data-value="${key}" ${key === ws.view ? 'aria-current="page"' : ''}><span>${label}</span>${ws.data && key in counts ? `<span class="skills-count">${counts[key]}</span>` : ''}</button>`).join('')}</nav>
     ${ws.loadError ? `<div class="skills-retry">${note(`读取工作区失败：${ws.loadError}`, 'alert')}${btn('重试', 'refresh')}</div>` : ''}
     ${note(ws.error, 'alert')}${!ws.busy ? note(ws.notice) : loading(ws.busy)}
+    ${!ws.busy && ws.lastImport.length ? `<div class="skills-actions">${btn('查看本次导入', 'import-result', { glyph: 'arrow' })}</div>` : ''}
     ${ws.view === 'market' ? renderMarket(ws) : ws.view === 'backup' ? renderBackup(ws) : ws.view === 'settings' ? renderSettings(ws) : renderList(ws)}`;
     if (previous && !dialog?.open) {
       const replacement = focusKey(previous) || (previous.dataset.skillAction === 'view' ? host.querySelector('[aria-current="page"]') : null);
@@ -481,11 +482,38 @@
     else if (ws.view === 'market') searchMarket(ws);
   }
 
+  function importPicker(mode) {
+    const bridge = window.pywebview?.api;
+    const method = { local: 'choose_skills_directory', archive: 'choose_skills_archive' }[mode];
+    return method && typeof bridge?.[method] === 'function' ? agent => bridge[method](agent) : null;
+  }
+
+  async function browseImport(ws, mode, control) {
+    const ticket = modal;
+    const picker = importPicker(mode);
+    if (!ticket || !dialog.open || !picker || !dialog.contains(control)) return;
+    control.disabled = true;
+    try {
+      const result = await picker(ws.agent);
+      // An open native picker must not populate a newer/different import form.
+      if (modal !== ticket || !dialog.open || result?.cancelled) return;
+      if (!result?.ok || !result.path) throw new Error('无法打开选择窗口，也可以手动输入本机路径。');
+      dialog.querySelector('input[name="path"]').value = result.path;
+      dialog.querySelector('[data-dialog-error]').hidden = true;
+      dialog.querySelector('button[type="submit"]')?.focus();
+    } catch (_) {
+      if (modal === ticket && dialog.open) modalError(new Error('无法打开选择窗口，也可以手动输入本机路径。'));
+    } finally {
+      control.disabled = false;
+    }
+  }
+
   function showImport(ws, mode = 'local', values = {}) {
     const [, fieldName, hint] = importModes[mode];
     const remote = mode === 'github';
     showModal(`导入到 ${agents[ws.agent]} 技能库`, `<div class="skills-segment" role="group" aria-label="导入来源">${Object.entries(importModes).map(([key, [label]]) => `<button type="button" data-skill-action="import-mode" data-value="${key}" aria-pressed="${key === mode}">${label}</button>`).join('')}</div>
       ${field(fieldName, remote ? 'url' : 'path', { hint, value: values[remote ? 'url' : 'path'], required: true })}
+      ${importPicker(mode) ? `<div class="skills-actions">${btn(mode === 'local' ? '选择文件夹' : '选择文件', 'import-browse', { value: mode, glyph: mode === 'local' ? 'layers' : 'archive' })}</div>` : ''}
       ${remote ? `<div class="skills-form-columns">${field('分支或标签（可选）', 'ref', { value: values.ref })}${field('子目录（可选）', 'subdir', { value: values.subdir })}</div>` : ''}`, {
       label: '预览技能', submit: form => {
         const payload = remote ? { url: fieldValue(form, 'url') } : { path: fieldValue(form, 'path') };
@@ -510,9 +538,15 @@
       label: '导入所选技能', submit: async form => {
         const ids = form.getAll('candidate').map(index => idOf(candidates[Number(index)])).filter(Boolean);
         if (!ids.length) throw new Error('请至少选择一项技能。');
-        const imported = await change(ws, 'import_selected', { preview_id: result.preview_id, ids }, data => `已导入 ${list(data?.imported).length} 项，失败 ${list(data?.errors).length} 项。`);
+        const imported = await change(ws, 'import_selected', { preview_id: result.preview_id, ids }, data => {
+          const added = list(data?.imported);
+          ws.lastImport = added.map(item => idOf(item.skill) || idOf(item)).filter(Boolean);
+          const status = added.length && added.every(item => item.skill?.installed === false)
+            ? '已加入技能库，尚未安装。' : added.length ? '已加入技能库，导入不会自动安装。' : '';
+          return `已导入 ${added.length} 项，失败 ${list(data?.errors).length} 项。${status}`;
+        });
         const failures = list(imported?.errors);
-        if (failures.length) showModal('导入结果', `<p>${esc(ws.notice)}</p><ul class="skills-records">${failures.map(item => `<li><div><strong>${esc(nameOf(candidates.find(entry => idOf(entry) === idOf(item))) || idOf(item))}</strong><span>${esc(apiMessage(item.error ?? item))}</span></div></li>`).join('')}</ul>${btn('重新预览', 'import-mode', { value: mode })}`);
+        if (failures.length) showModal('导入结果', `<p>${esc(ws.notice)}</p><ul class="skills-records">${failures.map(item => `<li><div><strong>${esc(nameOf(candidates.find(entry => idOf(entry) === idOf(item))) || idOf(item))}</strong><span>${esc(apiMessage(item.error ?? item))}</span></div></li>`).join('')}</ul><div class="skills-actions">${ws.lastImport.length ? btn('查看本次导入', 'import-result', { glyph: 'arrow' }) : ''}${btn('重新预览', 'import-mode', { value: mode })}</div>`);
       }
     });
   }
@@ -817,6 +851,19 @@
     }
     if (action === 'import') return showImport(ws);
     if (action === 'import-mode' && Object.hasOwn(importModes, value)) return showImport(ws, value);
+    if (action === 'import-browse') return browseImport(ws, value, control);
+    if (action === 'import-result' && ws.lastImport.length) {
+      if (dialog.open) dialog.close();
+      ws.view = 'library';
+      ws.query = ws.source = ws.tag = '';
+      ws.filter = 'all';
+      ws.selection = new Set(ws.lastImport);
+      ws.lastImport = [];
+      render();
+      const first = host.querySelector('input[data-skill-selection]:checked');
+      setTimeout(() => { if (first?.isConnected) first.focus(); }, 0);
+      return;
+    }
     if (action === 'select-all') {
       const checks = [...dialog.querySelectorAll('input[name="candidate"]')];
       const select = checks.some(input => !input.checked);

@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -16,6 +17,32 @@ def request(path, *, method='GET', data=None, content_type='application/json'):
     payload = json.dumps(data).encode() if isinstance(data, dict) else data
     with urlopen(Request(path if path.startswith('https://uploads.github.com/') else BASE + path, headers=headers, data=payload, method=method), timeout=120) as response:
         return json.load(response)
+
+
+def release_notes(version, readme=None):
+    path = readme if readme is not None else Path(__file__).with_name('README.md')
+    markdown = path.read_text(encoding='utf-8')
+    heading = re.compile(r'^##[ \t]+' + re.escape(version) + r'(?=$|[ \t:：])[^\n]*$', re.M)
+    start = heading.search(markdown)
+    details = ''
+    if start:
+        section = markdown[start.end():]
+        details = re.split(r'^#{1,2}[ \t]+', section, maxsplit=1, flags=re.M)[0].strip()
+    compatibility = 'Windows x64 与 Apple Silicon macOS arm64 共用源码。安装命令见仓库 README；macOS 要求 14 或更新版本，当前采用临时签名，未公证。'
+    return '\n\n'.join(part for part in (details, compatibility) if part)
+
+
+def gui_smoke_verified(info):
+    result = info.get('gui_smoke_test')
+    if not isinstance(result, dict):
+        return False
+    renderer = {'win32': 'edgechromium', 'darwin': 'wkwebview'}.get(info.get('platform'))
+    return (renderer is not None and bool(info.get('version'))
+            and result.get('status') == 'passed' and result.get('frozen') is True
+            and result.get('gui_tested') is True and result.get('renderer') == renderer
+            and result.get('app_version') == info.get('version')
+            and type(result.get('rendered_total_tokens')) is int
+            and result['rendered_total_tokens'] == 173)
 
 
 def main():
@@ -32,6 +59,8 @@ def main():
     for path in manifests:
         info = json.loads(path.read_text(encoding='utf-8'))
         assert info['source_commit'] == commit and info['validation'] == 'unittest-and-node-check-passed'
+        if not gui_smoke_verified(info):
+            raise ValueError(f'Usable native GUI smoke test required: {path.name}')
         key = {('win32', 'x64'): 'windows-x64', ('darwin', 'arm64'): 'macos-arm64'}[(info['platform'], info['architecture'])]
         assert key not in records
         archive = path.with_name(path.name.replace('.build-manifest.json', '.zip'))
@@ -51,13 +80,7 @@ def main():
         installer = Path(__file__).resolve().parent / name
         assert installer.is_file(), 'Both terminal installers are required'
         upload_files.append(installer)
-    release_body = """点击「关联 GitHub」即可自动查找技能来源。
-
-- Codex 和 Hermes 技能管理优先检查安装记录，再按技能名搜索公开 GitHub 仓库和 skills.sh。
-- 看板会核对技能目录中的全部文件，只列出与本地副本一致的候选。选定来源并确认后即可跟踪上游更新。
-- 仍可手动指定仓库、分支、标签或目录。
-
-Windows x64 与 Apple Silicon macOS arm64 共用源码。安装命令见仓库 README；macOS 要求 14 或更新版本，当前采用临时签名，未公证。"""
+    release_body = release_notes(version)
     release = request('/releases', method='POST', data={'tag_name': tag, 'target_commitish': commit, 'name': f'Codex Token {version} · Build {number}', 'draft': True, 'prerelease': False, 'body': release_body})
     upload_url = release['upload_url'].split('{', 1)[0]
     for file in upload_files:

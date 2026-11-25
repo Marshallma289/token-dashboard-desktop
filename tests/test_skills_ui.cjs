@@ -89,13 +89,34 @@ async function main() {
     await section('技能库');
 
     await ws.locator('.skills-context').getByRole('button', { name: '导入技能' }).click();
+    assert.equal(await dialog.getByRole('button', { name: '选择文件夹' }).count(), 0);
     await dialog.getByLabel('路径', { exact: true }).fill(input);
+    await page.keyboard.press('Escape');
+    await dialog.waitFor({ state: 'hidden' });
+
+    // The browser keeps its manual-path fallback; a desktop bridge fills the same form.
+    const archivePath = path.join(root, 'chosen.skill');
+    await page.evaluate(({ input, archivePath }) => {
+      window.pywebview = { api: {
+        choose_skills_directory: async agent => ({ ok: agent === 'codex', path: input }),
+        choose_skills_archive: async agent => ({ ok: agent === 'codex', path: archivePath })
+      } };
+    }, { input, archivePath });
+    await ws.locator('.skills-context').getByRole('button', { name: '导入技能' }).click();
+    await dialog.getByRole('button', { name: '压缩包', exact: true }).click();
+    await dialog.getByRole('button', { name: '选择文件', exact: true }).click();
+    await page.waitForFunction(archivePath => document.querySelector('dialog[open] input[name=path]')?.value === archivePath, archivePath);
+    await dialog.getByRole('button', { name: '本地目录', exact: true }).click();
+    await dialog.getByRole('button', { name: '选择文件夹', exact: true }).click();
+    await page.waitForFunction(input => document.querySelector('dialog[open] input[name=path]')?.value === input, input);
+    assert.equal(calls.filter(call => /_preview$/.test(call.op)).length, 0);
     await dialog.getByRole('button', { name: '预览技能' }).click();
     await dialog.getByRole('button', { name: '全选', exact: true }).click();
     await dialog.getByRole('button', { name: '导入所选技能' }).click();
     await dialog.waitFor({ state: 'hidden' });
-    await wait(ws.locator('.skills-notice').getByText('已导入 2 项，失败 0 项。'));
-    await ws.getByRole('button', { name: '全选结果' }).click();
+    await wait(ws.locator('.skills-notice').getByText('已导入 2 项，失败 0 项。已加入技能库，尚未安装。'));
+    assert.equal(calls.filter(call => call.op === 'install').length, 0);
+    await ws.getByRole('button', { name: '查看本次导入' }).click();
     await ws.getByRole('button', { name: '批量安装' }).click();
     await dialog.getByRole('button', { name: '确认安装' }).click();
     await dialog.waitFor({ state: 'hidden' });

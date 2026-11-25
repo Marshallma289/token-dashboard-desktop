@@ -312,6 +312,35 @@ class SkillsServiceTests(unittest.TestCase):
             self.assertEqual(bridge.choose_skills_directory("hermes"), {"ok": True, "path": str(self.root / "not-created")})
         self.assertFalse((self.root / "not-created").exists())
 
+    def test_native_archive_picker_is_open_only_and_checks_origin_again(self):
+        url = "http://127.0.0.1:49123/?desktop=1"
+        bridge = desktop.DesktopBridge(types.SimpleNamespace(url=url))
+        window = Mock()
+        bridge.attach_window(window)
+        archive = self.root / "fixture.skill"
+        webview = types.SimpleNamespace(FileDialog=types.SimpleNamespace(OPEN=2))
+        with patch.dict(sys.modules, {"webview": webview}):
+            chooser = getattr(bridge, "choose_skills_archive", None)
+            self.assertTrue(callable(chooser))
+            self.assertEqual(chooser("unknown")["error"], "invalid_agent")
+            window.get_current_url.return_value = "https://example.invalid/"
+            self.assertEqual(chooser("codex")["error"], "forbidden_origin")
+            window.create_file_dialog.assert_not_called()
+
+            window.get_current_url.return_value = url
+            window.create_file_dialog.return_value = None
+            self.assertEqual(chooser("codex"), {"ok": False, "cancelled": True})
+            window.create_file_dialog.assert_called_with(
+                2, directory=str(Path.home()), allow_multiple=False,
+                file_types=("技能压缩包 (*.zip;*.skill)",),
+            )
+
+            window.create_file_dialog.return_value = (str(archive),)
+            self.assertEqual(chooser("hermes"), {"ok": True, "path": str(archive)})
+            window.get_current_url.side_effect = [url, "https://example.invalid/"]
+            self.assertEqual(chooser("codex")["error"], "forbidden_origin")
+        self.assertFalse(archive.exists())
+
     def test_packaging_stages_and_hashes_runtime_modules_and_bundled_skill(self):
         source = self.root / "source"
         source.mkdir()

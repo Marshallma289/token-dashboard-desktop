@@ -391,8 +391,9 @@ class DesktopBridge:
         active, expected = urlsplit(current), urlsplit(self._runtime.url)
         return (active.scheme, active.netloc) == (expected.scheme, expected.netloc)
 
-    def choose_skills_directory(self, agent: str) -> Mapping[str, Any]:
-        """Pick one local directory; the HTTP API must perform any import."""
+    def _choose_skills_path(self, agent: str, *, archive: bool) -> Mapping[str, Any]:
+        # Selection returns only a path. The skills preview/import service owns
+        # validation and all writes, regardless of how the path was entered.
         if agent not in ("codex", "hermes"):
             return {"ok": False, "error": "invalid_agent"}
         try:
@@ -400,8 +401,10 @@ class DesktopBridge:
                 return {"ok": False, "error": "forbidden_origin"}
             import webview
 
+            options = {"file_types": ("技能压缩包 (*.zip;*.skill)",)} if archive else {}
             selected = self._window.create_file_dialog(
-                webview.FileDialog.FOLDER, directory=str(Path.home()), allow_multiple=False,
+                webview.FileDialog.OPEN if archive else webview.FileDialog.FOLDER,
+                directory=str(Path.home()), allow_multiple=False, **options,
             )
             if not self._is_skills_dialog_origin():
                 return {"ok": False, "error": "forbidden_origin"}
@@ -410,7 +413,13 @@ class DesktopBridge:
             path = selected[0] if isinstance(selected, (list, tuple)) else selected
             return {"ok": True, "path": str(path)}
         except Exception:
-            return {"ok": False, "error": "choose_directory_failed"}
+            return {"ok": False, "error": "choose_archive_failed" if archive else "choose_directory_failed"}
+
+    def choose_skills_directory(self, agent: str) -> Mapping[str, Any]:
+        return self._choose_skills_path(agent, archive=False)
+
+    def choose_skills_archive(self, agent: str) -> Mapping[str, Any]:
+        return self._choose_skills_path(agent, archive=True)
 
     def set_data_directory(self, directory: str) -> Mapping[str, Any]:
         if not self._data_lock.acquire(blocking=False):

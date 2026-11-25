@@ -8,6 +8,7 @@ import errno
 import hashlib
 import io
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -15,6 +16,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unicodedata
 from urllib.parse import urlsplit
 import uuid
@@ -22,6 +24,7 @@ import zipfile
 import zlib
 
 
+_LOG = logging.getLogger(__name__)
 _MAX_FILES = 10_000
 _MAX_FILE = 32 * 1024 * 1024
 _MAX_TOTAL = 128 * 1024 * 1024
@@ -377,7 +380,10 @@ class _Git:
                                            "-o PermitLocalCommand=no -o ClearAllForwardings=yes")
         self.command = [exe, "-c", f"core.hooksPath={cwd / 'no-hooks'}", "-c", "credential.helper=",
                         "-c", "http.followRedirects=false", "-c", "http.sslVerify=true", "-c",
-                        "transfer.fsckObjects=true", "-c", "fetch.writeCommitGraph=false"]
+                        "transfer.fsckObjects=true", "-c", "fetch.writeCommitGraph=false",
+                        # Fetch otherwise starts detached maintenance in the private
+                        # directory, racing cleanup at the end of this operation.
+                        "-c", "maintenance.auto=false", "-c", "gc.auto=0"]
         if credential_helper == "gh":
             try:
                 from skills_github import credential_helper as github_helper
@@ -744,6 +750,26 @@ def _resolve(git, lib, payload, root, agent, library_id, current, local_digest, 
     return head, remote_digest, copies
 
 
+@contextmanager
+def _git_workspace(root):
+    temp = tempfile.TemporaryDirectory(prefix="git-", dir=root)
+    try:
+        yield Path(temp.name)
+    finally:
+        # A transient file lock (e.g. on Windows) must not turn an already
+        # completed sync or a genuine conflict into a misleading I/O failure.
+        retryable = {errno.EACCES, errno.EBUSY, errno.ENOTEMPTY, errno.EPERM}
+        for attempt in range(3):
+            try:
+                temp.cleanup()
+            except OSError as exc:
+                if attempt < 2 and exc.errno in retryable:
+                    time.sleep(0.025 * (attempt + 1))
+                    continue
+                _LOG.warning("Skill sync scratch cleanup failed (%s, errno=%s)", type(exc).__name__, exc.errno)
+            break
+
+
 def _sync(lib, op, payload, root, agent, library_id, cfg):
     if cfg is None:
         raise _Error("sync_not_connected", "Configure the Git remote before syncing.")
@@ -755,8 +781,8 @@ def _sync(lib, op, payload, root, agent, library_id, cfg):
     remote_url, protocol = _remote(cfg["remote_url"])
     safety_backup, changed = None, False
     extra = {}
-    with tempfile.TemporaryDirectory(prefix="git-", dir=root) as temp:
-        git = _Git(exe, Path(temp), remote_url, protocol, agent, cfg.get("credential_helper"))
+    with _git_workspace(root) as temp:
+        git = _Git(exe, temp, remote_url, protocol, agent, cfg.get("credential_helper"))
         head, remote_digest, remote_files = git.fetch(agent)
         base = cfg["digest"]
         local_changed = (not _is_empty(local_files)) if base is None else local_digest != base
@@ -901,6 +927,11 @@ def handle(lib, op, payload):
         return {"ok": True, "agent": agent, **result}
     except _Error as exc:
         return {"ok": False, "agent": agent, "error": {"code": exc.code, "message": str(exc)}, **exc.details}
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError) as exc:
+        # Local diagnostics must never include exception text, paths, Git
+        # output, repository URLs or credentials returned by helpers.
+        operation = op if isinstance(op, str) and op in _OP_FIELDS else "unknown"
+        _LOG.warning("Skill backup operation %s failed (%s, errno=%s)", operation, type(exc).__name__,
+                     exc.errno if isinstance(exc, OSError) else None)
         return {"ok": False, "agent": agent,
                 "error": {"code": "backup_io_failed", "message": "Could not read or write the backup data."}}

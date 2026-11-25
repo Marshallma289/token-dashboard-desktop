@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 from pathlib import Path
@@ -284,6 +285,56 @@ class GitTests(unittest.TestCase):
             self.assertEqual(record["reason"], "conflict_" + side)
             self.success(self.b, "backup_restore", backup_id=record["backup_id"], confirm=True)
             self.assertEqual(self.b.files, portable(side + " side"))
+
+    def test_disposable_git_workspace_disables_background_maintenance(self):
+        with tempfile.TemporaryDirectory(dir=self.root) as folder:
+            git = backup._Git(shutil.which("git"), Path(folder), str(self.remote), "file", "codex")
+            self.assertEqual(git.run("config", "--bool", "--get", "maintenance.auto",
+                                     allowed=(0, 1)).stdout.strip(), b"false")
+            self.assertEqual(git.run("config", "--get", "gc.auto", allowed=(0, 1)).stdout.strip(), b"0")
+
+    def test_transient_scratch_cleanup_does_not_hide_sync_conflict(self):
+        self.seed()
+        self.a.files = portable("remote side")
+        self.b.files = portable("local side")
+        self.success(self.a, "sync_push", confirm=True)
+        before = self.remote_head()
+        cleanup = tempfile.TemporaryDirectory.cleanup
+        attempts = []
+
+        def delayed_cleanup(directory):
+            path = Path(directory.name)
+            if path.name.startswith("git-"):
+                attempts.append(path)
+                if len(attempts) == 1:
+                    raise OSError(errno.ENOTEMPTY, "simulated helper race", directory.name)
+            return cleanup(directory)
+
+        with patch.object(tempfile.TemporaryDirectory, "cleanup", delayed_cleanup):
+            result = self.failure(self.b, "sync_pull", "sync_conflict", confirm=True)
+        self.assertEqual(len(attempts), 2)
+        self.assertFalse(attempts[0].exists())
+        self.assertEqual(result["conflict"]["remote_revision"], before)
+        self.assertEqual(self.remote_head(), before)
+        self.assertEqual(self.b.files, portable("local side"))
+
+    def test_persistent_scratch_cleanup_preserves_completed_push_and_logs_safely(self):
+        rmtree = shutil.rmtree
+
+        def denied_cleanup(path, *args, **kwargs):
+            if Path(path).name.startswith("git-"):
+                raise PermissionError(errno.EACCES, "private token or path", path)
+            return rmtree(path, *args, **kwargs)
+
+        with self.assertLogs("skills_backup", level="WARNING") as logs:
+            with patch.object(shutil, "rmtree", denied_cleanup):
+                result = self.success(self.a, "sync_push", confirm=True)
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["status"]["revision"], self.remote_head())
+        logged = " ".join(logs.output)
+        self.assertIn("PermissionError", logged)
+        self.assertNotIn("private token or path", logged)
+        self.assertNotIn(str(self.root), logged)
 
     def test_push_pull_and_agent_branches(self):
         self.seed()

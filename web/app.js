@@ -10,6 +10,7 @@
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
   const cacheMetrics = window.CodexCacheMetrics;
+  const pricingStatus = window.CodexPricingStatus;
   const nf = new Intl.NumberFormat('zh-CN');
   const compactNf = new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 });
   const svgEscape = value => String(value == null ? '' : value).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
@@ -43,8 +44,10 @@
     healthTimer: null,
     tablePage: 1,
     tablePageSize: 50,
-    preferencesLoading: false,
+    preferencesPromise: null,
     preferencesLoaded: false,
+    costModeEdited: false,
+    costModeSave: Promise.resolve(),
     theme: readTheme(),
     costMode: readCostMode(),
     customStartDate: '',
@@ -169,22 +172,34 @@
     }
   }
 
-  async function loadDesktopPreferences() {
+  function loadDesktopPreferences() {
     const bridge = desktopBridge();
-    if (!bridge || typeof bridge.load_preferences !== 'function' || state.preferencesLoading || state.preferencesLoaded) return;
-    state.preferencesLoading = true;
-    try {
-      const preferences = await bridge.load_preferences();
-      if (preferences && (preferences.theme === 'light' || preferences.theme === 'dark')) {
-        setTheme(preferences.theme);
-        if (state.data) renderAll(state.data);
+    if (!bridge || typeof bridge.load_preferences !== 'function' || state.preferencesLoaded) return;
+    if (state.preferencesPromise) return state.preferencesPromise;
+    state.preferencesPromise = Promise.resolve().then(() => bridge.load_preferences()).then(preferences => {
+      const restoredTheme = preferences && (preferences.theme === 'light' || preferences.theme === 'dark');
+      const restoredCostMode = preferences && (preferences.cost_mode === 'before' || preferences.cost_mode === 'after');
+      if (restoredTheme) setTheme(preferences.theme);
+      if (state.costModeEdited) {
+        // A click while the bridge was loading takes precedence over the stored preference.
+        saveDesktopCostMode();
+      } else if (restoredCostMode) {
+        setCostMode(preferences.cost_mode, { persist: false });
       }
+      if (state.data && restoredTheme && (!restoredCostMode || state.costModeEdited)) renderAll(state.data);
       state.preferencesLoaded = true;
-    } catch (_) {
+    }).catch(() => {
       // Browser storage remains the fallback when the desktop bridge is unavailable.
-    } finally {
-      state.preferencesLoading = false;
-    }
+    }).finally(() => { state.preferencesPromise = null; });
+    return state.preferencesPromise;
+  }
+
+  function saveDesktopCostMode() {
+    const bridge = desktopBridge();
+    if (!bridge || typeof bridge.save_preferences !== 'function') return;
+    const mode = state.costMode;
+    // Bridge calls are asynchronous and can otherwise finish out of order.
+    state.costModeSave = state.costModeSave.then(() => bridge.save_preferences({ cost_mode: mode })).catch(() => {});
   }
 
   function toNumber(value) {
@@ -413,7 +428,7 @@
       costBefore: costBeforeRaw == null ? oldCost : toNumber(costBeforeRaw),
       costAfter: costAfterRaw == null ? (costBeforeRaw == null ? oldCost : toNumber(costBeforeRaw)) : toNumber(costAfterRaw),
       cost: costAfterRaw == null ? oldCost : toNumber(costAfterRaw),
-      pricingStatus: text(pick(item, 'pricing_status', 'pricingStatus')),
+      pricingStatus: pricingStatus.status(item),
       pricingModel: text(pick(item, 'pricing_model', 'pricingModel')),
       pricingRateBand: text(pick(item, 'pricing_rate_band', 'pricingRateBand')),
       pricingNote: text(pick(item, 'pricing_note', 'pricingNote'))
@@ -457,7 +472,7 @@
     });
     return Array.from(grouped.values()).map(row => ({
       ...row,
-      pricingStatus: row.pricingStatuses.size === 1 ? Array.from(row.pricingStatuses)[0] : row.pricingStatuses.size ? 'partial' : ''
+      pricingStatus: pricingStatus.combine(row.pricingStatuses)
     })).sort((a, b) => b.total - a.total);
   }
 
@@ -588,6 +603,10 @@
     const coverageTokens = pricedTokens + unpricedTokens;
     const coverage = summaryMetric(data.summary, ['pricing_coverage', 'pricingCoverage'], coverageTokens ? pricedTokens / coverageTokens : 0);
     const summary = data.summary || {};
+    const availability = pick(summary, 'priced_tokens', 'pricedTokens', 'unpriced_tokens', 'unpricedTokens',
+      'priced_request_count', 'unpriced_request_count', 'pricing_coverage', 'pricingCoverage') === undefined
+      ? pricingStatus.combine(modelRows.map(row => row.pricingStatus))
+      : pricingStatus.status(summary);
     const summaryCacheInput = Object.prototype.hasOwnProperty.call(summary, 'cache_read_input_tokens')
       ? summary.cache_read_input_tokens
       : pick(summary, 'cacheReadInputTokens');
@@ -614,7 +633,7 @@
     const cacheCoverageText = requests > 0
       ? `${formatNumber(cacheReadAvailableCount)} / ${formatNumber(requests)} 条请求提供缓存字段${cacheReadAvailableCount > 0 && cacheReadAvailableCount < requests ? ' · 部分记录可用' : ''}`
       : cacheReadAvailableCount > 0 ? `${formatNumber(cacheReadAvailableCount)} 条提供缓存字段` : '暂无可用缓存记录';
-    return { total, input, output, requests, active, models, cache, cacheInput, cacheRate, cacheRateText: formatCachePercent(cacheRate || 0, cacheAvailable), cacheAvailable, cacheCoverageText, cacheReadAvailableCount, cacheWriteAvailableCount, freshInput, cost, costBefore, costAfter, pricedTokens, unpricedTokens, coverage, ...speed };
+    return { total, input, output, requests, active, models, cache, cacheInput, cacheRate, cacheRateText: formatCachePercent(cacheRate || 0, cacheAvailable), cacheAvailable, cacheCoverageText, cacheReadAvailableCount, cacheWriteAvailableCount, freshInput, cost, costBefore, costAfter, pricedTokens, unpricedTokens, coverage, pricingStatus: availability, ...speed };
   }
 
   function setConnection(status, message) {
@@ -772,11 +791,11 @@
       ? `${formatCompact(m.unpricedTokens)} token 未计价${unpriced.length ? ` · ${unpriced.slice(0, 2).join('、')}${unpriced.length > 2 ? '等' : ''}` : ''}`
       : '全部 Token 已按配置的计价规则计算';
     const costSub = m.total > 0
-      ? `计价覆盖率 ${formatPercent(m.coverage)} · ${m.unpricedTokens ? `${formatCompact(m.unpricedTokens)} Token 未计价` : '全部已计价'}`
+      ? `计价覆盖率 ${formatPercent(m.coverage)} · ${m.unpricedTokens ? `${formatCompact(m.unpricedTokens)} Token 未计价` : m.pricingStatus !== 'priced' ? '含未计价请求' : '全部已计价'}`
       : '计价覆盖率 — · 暂无用量';
     const activeCost = state.costMode === 'before' ? m.costBefore : m.costAfter;
     const cards = [
-      [`预估费用 USD · ${state.costMode === 'before' ? '折扣前' : '折扣后'}`, m.total > 0 && m.coverage === 0 ? '未计价' : formatCurrency(activeCost), costSub, activeCost, costDetails],
+      [`预估费用 USD · ${state.costMode === 'before' ? '折扣前' : '折扣后'}`, pricingStatus.label(m.pricingStatus, formatCurrency(activeCost)), costSub, activeCost, costDetails],
       [timeAttribution.summary_incomplete ? '总 Token（已确认）' : '总 Token', formatCompact(m.total), timeAttribution.summary_incomplete ? '跨日累计未能完整归入当前范围' : '含 Hermes 独立缓存桶；Reasoning 为输出子集', m.total],
       ['今日 Token', timeAttribution.today_incomplete ? '未完整' : formatCompact(today), timeAttribution.today_incomplete ? `已确认 ${formatNumber(today)} Token · 跨日累计未分日` : todayRows.length ? `${todayRows.length} 条模型记录` : '今日暂无记录', timeAttribution.today_incomplete ? '未完整' : today],
       ['请求数', formatCompact(m.requests), 'Hermes 按 API 调用次数计数', m.requests],
@@ -1052,7 +1071,7 @@
       const displayCost = state.costMode === 'before' ? row.costBefore : row.costAfter;
       const cost = row.pricingStatus === 'unpriced'
         ? '<span class="provider-pill" title="官方价格未公开或尚未配置">未计价</span>'
-        : `<strong title="${htmlEscape(formatCurrencyDetailed(displayCost))}">${htmlEscape(formatCurrency(displayCost))}${row.pricingStatus === 'partial' ? '*' : ''}</strong>`;
+        : `<strong title="${htmlEscape(formatCurrencyDetailed(displayCost))}">${htmlEscape(pricingStatus.label(row.pricingStatus, formatCurrency(displayCost)))}</strong>`;
       const pricingTitle = row.pricingStatus === 'unpriced'
         ? (row.pricingNote || '未计价')
         : `${row.pricingModel || row.model}${row.pricingRateBand ? ` · ${row.pricingRateBand}` : ''}`;
@@ -1088,9 +1107,7 @@
     const models = summarizeRows(rowsForView(data.dailyModelUsage));
     const total = models.reduce((sum, row) => sum + row.total, 0);
     $('#modelTotals').innerHTML = models.length ? models.map((row, index) => {
-      const costLabel = row.pricingStatus === 'unpriced'
-        ? '未计价'
-        : `预估 ${formatCurrency(row.cost)}${row.pricingStatus === 'partial' ? ' *' : ''}`;
+      const costLabel = pricingStatus.label(row.pricingStatus, `预估 ${formatCurrency(row.cost)}`);
       const share = total ? row.total / total : 0;
       return `<article class="model-stat"><div class="model-stat-heading"><strong>${htmlEscape(row.model)}</strong><span class="provider-pill">${htmlEscape(row.provider)}</span><span class="model-stat-meta">输入 ${formatCompact(row.input)} · 输出 ${formatCompact(row.output)}</span></div><div class="model-stat-volume"><div class="model-stat-value" title="${formatNumber(row.total)} Token">${formatCompact(row.total)} <small>${formatPercent(share)}</small></div><div class="model-stat-bar" aria-hidden="true"><i style="width:${share * 100}%;background:${modelColor(modelKey(row))}"></i></div></div><div class="model-stat-requests"><span class="mobile-column-label">请求</span>${formatNumber(row.requests)}</div><div class="model-stat-cost"><span class="mobile-column-label">预估费用</span>${htmlEscape(costLabel)}</div><div class="model-stat-speed">轮次平均输出速度 ${htmlEscape(row.sourceKind === 'hermes' ? '不适用' : formatSpeed(row))} · ${row.sourceKind === 'hermes' ? 'Hermes 未提供请求边界' : `${formatNumber(row.speedSampleCount)} 个完整轮次样本`}</div></article>`;
     }).join('') : '<div class="empty-state">当前组合暂无模型用量，可直接切换任一筛选项。</div>';
@@ -1380,6 +1397,7 @@
 
   async function exportCsv() {
     if (!state.data) return;
+    if (state.preferencesPromise) await state.preferencesPromise;
     const fields = ['source_kind', 'date', 'model', 'provider', 'provider_label', 'input_tokens', 'fresh_input_tokens', 'output_tokens', 'cached_input_tokens', 'cache_read_input_tokens', 'cache_hit_rate', 'cache_read_available_count', 'cache_write_input_tokens', 'cache_write_available_count', 'reasoning_output_tokens', 'total_tokens', 'cost_display_mode', 'displayed_cost_usd', 'estimated_cost_usd', 'cost_before_discount_usd', 'cost_after_discount_usd', 'cache_savings_before_discount_usd', 'cache_savings_after_discount_usd', 'ttft_median_ms', 'ttft_p90_ms', 'ttft_sample_count', 'ttft_coverage', 'pricing_status', 'pricing_model', 'pricing_rate_band', 'request_count', 'speed_output_tokens', 'speed_duration_ms', 'speed_sample_count', 'output_tokens_per_second'];
     const rows = rowsForView(state.data.dailyModelUsage)
       .filter(row => state.workspace === 'all' || !row.workspace || row.workspace === state.workspace)
@@ -1406,8 +1424,8 @@
         estimated_cost_usd: row.pricingStatus === 'unpriced' ? '' : (state.costMode === 'before' ? row.costBefore : row.costAfter).toFixed(8),
         cost_before_discount_usd: row.pricingStatus === 'unpriced' ? '' : row.costBefore.toFixed(8),
         cost_after_discount_usd: row.pricingStatus === 'unpriced' ? '' : row.costAfter.toFixed(8),
-        cache_savings_before_discount_usd: row.cacheSavingsBefore == null ? '' : toNumber(row.cacheSavingsBefore).toFixed(8),
-        cache_savings_after_discount_usd: row.cacheSavingsAfter == null ? '' : toNumber(row.cacheSavingsAfter).toFixed(8),
+        cache_savings_before_discount_usd: row.pricingStatus === 'unpriced' || row.cacheSavingsBefore == null ? '' : toNumber(row.cacheSavingsBefore).toFixed(8),
+        cache_savings_after_discount_usd: row.pricingStatus === 'unpriced' || row.cacheSavingsAfter == null ? '' : toNumber(row.cacheSavingsAfter).toFixed(8),
         ttft_median_ms: row.ttftMedianMs == null ? '' : row.ttftMedianMs,
         ttft_p90_ms: row.ttftP90Ms == null ? '' : row.ttftP90Ms,
         ttft_sample_count: row.ttftSampleCount == null ? '' : row.ttftSampleCount,
@@ -1519,9 +1537,13 @@
     return { range: state.range, startDate, endDate, sourceKind: state.sourceKind, provider: state.provider, workspace: state.workspace, model: state.model, costMode: state.costMode };
   }
 
-  function setCostMode(mode) {
+  function setCostMode(mode, { persist = true } = {}) {
     state.costMode = mode === 'before' ? 'before' : 'after';
-    try { localStorage.setItem('codex-token-cost-mode', state.costMode); } catch (_) { /* browser storage is optional */ }
+    if (persist) {
+      state.costModeEdited = true;
+      try { localStorage.setItem('codex-token-cost-mode', state.costMode); } catch (_) { /* browser storage is optional */ }
+      if (state.preferencesLoaded || !state.preferencesPromise) saveDesktopCostMode();
+    }
     if (state.data) renderAll(state.data);
     window.dispatchEvent(new CustomEvent('codex-dashboard:cost-mode', { detail: { mode: state.costMode } }));
   }

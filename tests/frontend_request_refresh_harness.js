@@ -59,7 +59,7 @@ function environment() {
     }
   }
   const window = {
-    CodexCacheMetrics: cacheMetrics, location: { search: '' },
+    CodexCacheMetrics: cacheMetrics, CodexPricingStatus: require(path.join(root, 'web', 'pricing-status.js')), location: { search: '' },
     addEventListener(name, callback) {
       if (!listeners.has(name)) listeners.set(name, []);
       listeners.get(name).push(callback);

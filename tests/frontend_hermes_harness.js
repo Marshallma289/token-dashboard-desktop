@@ -6,7 +6,7 @@ const vm = require('node:vm');
 const root = path.resolve(__dirname, '..');
 const fixture = fs.readFileSync(path.join(__dirname, 'frontend_request_refresh_harness.js'), 'utf8');
 const setup = fixture.slice(fixture.indexOf('function environment() {'), fixture.indexOf('async function settle()'));
-const env = new Function('vm', 'cacheMetrics', setup + '\nreturn environment();')(vm, require(path.join(root, 'web/cache-metrics.js')));
+const env = new Function('vm', 'cacheMetrics', 'require', 'path', 'root', setup + '\nreturn environment();')(vm, require(path.join(root, 'web/cache-metrics.js')), require, path, root);
 let app = fs.readFileSync(path.join(root, 'web/app.js'), 'utf8');
 app = app.replace('getData: () => state.data,', 'getData: () => state.data, __renderTest: payload => renderAll(normalize(payload)),');
 vm.runInContext(app, env.context);

@@ -65,6 +65,7 @@ CSV_FIELDS = [
 ]
 
 _PREFERENCES_LOCK = threading.RLock()
+_UI_PREFERENCES = {"theme": ("light", "dark"), "cost_mode": ("before", "after")}
 
 
 def _validated_layout(value: Any) -> Optional[dict[str, Any]]:
@@ -299,19 +300,20 @@ class DesktopBridge:
         with self._preferences_lock:
             try:
                 value = _read_preferences()
-                return {"theme": value["theme"]} if isinstance(value, dict) and value.get("theme") in ("light", "dark") else {}
+                return {key: value[key] for key, allowed in _UI_PREFERENCES.items() if value.get(key) in allowed}
             except (OSError, ValueError):
                 return {}
 
     def save_preferences(self, preferences: Mapping[str, Any]) -> Mapping[str, Any]:
-        if not isinstance(preferences, dict) or preferences.get("theme") not in ("light", "dark"):
-            return {"ok": False, "error": "无效的主题设置"}
+        changes = {key: preferences[key] for key in _UI_PREFERENCES if key in preferences} if isinstance(preferences, dict) else {}
+        if not changes or any(value not in _UI_PREFERENCES[key] for key, value in changes.items()):
+            return {"ok": False, "error": "无效的显示设置"}
         with self._preferences_lock:
             try:
-                _write_preferences({"theme": preferences["theme"]})
+                _write_preferences(changes)
                 return {"ok": True}
             except (OSError, ValueError):
-                return {"ok": False, "error": "无法保存主题设置"}
+                return {"ok": False, "error": "无法保存显示设置"}
 
     def load_layout(self) -> Mapping[str, Any]:
         """Layout survives private WebView sessions and changing loopback ports."""

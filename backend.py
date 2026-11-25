@@ -4348,7 +4348,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         service, _host = self.app
         route = urlparse(self.path).path
         static_routes = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js",
-                         "/cache-metrics.js": "cache-metrics.js",
+                         "/cache-metrics.js": "cache-metrics.js", "/pricing-status.js": "pricing-status.js",
                          "/layout.js": "layout.js",
                          "/analytics.js": "analytics.js", "/data-settings.js": "data-settings.js",
                          "/skills.js": "skills.js",
@@ -4699,10 +4699,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.format == "json":
                 output = json.dumps(dashboard, ensure_ascii=False, indent=2, sort_keys=True)
             else:
-                rows = [dict(row, cost_display_mode=args.cost_mode,
-                             displayed_cost_usd=row["cost_%s_discount_usd" % args.cost_mode],
-                             estimated_cost_usd=row["cost_%s_discount_usd" % args.cost_mode])
-                        for row in dashboard["daily_model_usage"]]
+                rows = []
+                for row in dashboard["daily_model_usage"]:
+                    cost = row["cost_%s_discount_usd" % args.cost_mode]
+                    item = dict(row, cost_display_mode=args.cost_mode,
+                                displayed_cost_usd=cost, estimated_cost_usd=cost)
+                    if row["pricing_status"] == "unpriced":
+                        for field in ("displayed_cost_usd", "estimated_cost_usd",
+                                      "cost_before_discount_usd", "cost_after_discount_usd",
+                                      "cache_savings_before_discount_usd", "cache_savings_after_discount_usd"):
+                            item[field] = None
+                    rows.append(item)
                 columns = [
                     "date",
                     "source_kind",

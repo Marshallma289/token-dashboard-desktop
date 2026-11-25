@@ -6,6 +6,7 @@
   const nf = new Intl.NumberFormat('zh-CN');
   const compactNf = new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 });
   const cacheMetrics = window.CodexCacheMetrics;
+  const pricingStatus = window.CodexPricingStatus;
   const state = {
     snapshot: null,
     dashboard: null,
@@ -185,6 +186,8 @@
     const comparison = data && data.comparison || {};
     const prior = comparison.summary || {};
     const current = data && data.summary || {};
+    const currentPricing = pricingStatus.status(current);
+    const priorPricing = pricingStatus.status(prior);
     const start = comparison.start_date || comparison.startDate;
     const end = comparison.end_date || comparison.endDate;
     $('#comparisonMeta').textContent = start && end ? `${dateLabel(start)} — ${dateLabel(end)}` : '上一等长期间';
@@ -195,15 +198,20 @@
     const curr = [
       { label: 'Token', value: numeric(get(current, 'total', 'total_tokens', 'totalTokens', 'tokens')), old: numeric(get(prior, 'total', 'total_tokens', 'totalTokens', 'tokens')), format: compact },
       { label: '请求数', value: numeric(get(current, 'requests', 'request_count', 'requestCount')), old: numeric(get(prior, 'requests', 'request_count', 'requestCount')), format: number },
-      { label: `费用（${currentCostLabel()}）`, value: selectedCost(current), old: selectedCost(prior), format: currency },
+      { label: `费用（${currentCostLabel()}）`, value: selectedCost(current), old: selectedCost(prior),
+        currentLabel: pricingStatus.label(currentPricing, currency(selectedCost(current))),
+        priorLabel: comparison.summary ? pricingStatus.label(priorPricing, currency(selectedCost(prior))) : '—',
+        comparable: Boolean(comparison.summary) && currentPricing === 'priced' && priorPricing === 'priced' },
       { label: '缓存读取', value: numeric(get(current, 'cache', 'cache_read_tokens', 'cached_input_tokens')), old: numeric(get(prior, 'cache', 'cache_read_tokens', 'cached_input_tokens')), format: compact, available: cacheAvailable(current), oldAvailable: cacheAvailable(prior) }
     ];
     $('#comparisonMetrics').innerHTML = curr.map(item => {
       const delta = item.value - item.old;
-      const known = item.available !== false && item.oldAvailable !== false;
+      const known = item.comparable !== false && item.available !== false && item.oldAvailable !== false;
       const percent = !known ? '—' : item.old > 0 ? `${delta > 0 ? '+' : ''}${(delta / item.old * 100).toFixed(1)}%` : item.value > 0 ? '基期为 0' : '0.0%';
-      const sign = delta > 0 ? 'up' : delta < 0 ? 'down' : 'flat';
-      return `<article class="analytics-metric"><span>${esc(item.label)}</span><strong>${esc(item.available === false ? '未提供' : item.format(item.value))}</strong><small>上期 ${esc(item.oldAvailable === false ? '未提供' : item.format(item.old))} · <i class="delta-${sign}">${esc(percent)}</i></small></article>`;
+      const sign = !known ? 'flat' : delta > 0 ? 'up' : delta < 0 ? 'down' : 'flat';
+      const currentLabel = item.currentLabel ?? (item.available === false ? '未提供' : item.format(item.value));
+      const priorLabel = item.priorLabel ?? (item.oldAvailable === false ? '未提供' : item.format(item.old));
+      return `<article class="analytics-metric"><span>${esc(item.label)}</span><strong>${esc(currentLabel)}</strong><small>上期 ${esc(priorLabel)} · <i class="delta-${sign}">${esc(percent)}</i></small></article>`;
     }).join('');
   }
 
@@ -239,11 +247,12 @@
     const savingsBefore = get(summary, 'cache_savings_before_discount_usd', 'cacheSavingsBeforeDiscountUsd');
     const savingsAfter = get(summary, 'cache_savings_after_discount_usd', 'cacheSavingsAfterDiscountUsd');
     const selectedSavings = currentCostKey() === 'costBefore' ? savingsBefore : savingsAfter;
+    const savingsStatus = pricingStatus.status(summary);
     const items = [
       ['未缓存输入', freshInput === undefined ? '未提供' : compact(freshInput), freshInput === undefined ? '日志未提供拆分' : `${number(input)} 输入 Token`],
       ['缓存读取', !readAvailable ? '未提供' : compact(cacheRead), !readAvailable ? '日志未提供' : `${number(readCount || requestCount)} / ${number(requestCount || readCount)} 条请求提供字段${requestCount > readCount && readCount > 0 ? ' · 部分记录可用' : ''}`],
       ['缓存写入', !writeAvailable ? '未提供' : compact(cacheWrite), !writeAvailable ? '日志未提供' : `${number(writeCount || requestCount)} 条请求提供字段`],
-      [`缓存节省（${currentCostLabel()}）`, selectedSavings === undefined ? '未提供' : currency(selectedSavings), selectedSavings === undefined ? '缺少可用缓存价格' : '按当前价格规则估算']
+      [`缓存节省（${currentCostLabel()}）`, selectedSavings === undefined ? '未提供' : pricingStatus.label(savingsStatus, currency(selectedSavings)), selectedSavings === undefined ? '缺少可用缓存价格' : '按当前价格规则估算']
     ];
     const validRate = rate !== null && readAvailable && Number.isFinite(rate) && rate >= 0 && rate <= 1;
     $('#cacheOverview').innerHTML = `<div class="cache-rate"><span>缓存命中率 <small>按输入 Token</small></span><strong>${esc(cachePercent(rate, validRate))}</strong></div><div class="cache-track" ${validRate ? `role="meter" aria-label="缓存命中率，按提供缓存字段样本的输入 Token" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${(rate * 100).toFixed(1)}"` : 'aria-hidden="true"'}><i style="width:${validRate ? rate * 100 : 0}%"></i></div><p class="cache-scale">${validRate ? `<span>命中 ${cachePercent(rate, true)}</span><span>未命中 ${cachePercent(1 - rate, true)}</span>` : '<span>缺少有效样本，暂不显示占用比例</span>'}</p>`;
@@ -334,11 +343,11 @@
     (data && data.dailyModelUsage || []).forEach(row => {
       const date = String(row.date || '');
       if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return;
-      if (!grouped.has(date)) grouped.set(date, { date, total: 0, requests: 0, costBefore: 0, costAfter: 0, cacheSavingsBefore: 0, cacheSavingsAfter: 0, cache: 0, input: 0, cacheInput: 0, cacheReadAvailableCount: 0, cacheInputKnown: false, cacheAvailable: false, costAvailable: false });
+      if (!grouped.has(date)) grouped.set(date, { date, total: 0, requests: 0, costBefore: 0, costAfter: 0, cacheSavingsBefore: 0, cacheSavingsAfter: 0, cache: 0, input: 0, cacheInput: 0, cacheReadAvailableCount: 0, cacheInputKnown: false, cacheAvailable: false, costStatuses: new Set() });
       const item = grouped.get(date);
       item.total += numeric(row.total);
       item.requests += numeric(row.requests);
-      item.costAvailable = item.costAvailable || row.pricingStatus !== 'unpriced';
+      item.costStatuses.add(pricingStatus.status(row));
       item.costBefore += numeric(row.costBefore);
       item.costAfter += numeric(row.costAfter);
       item.cacheSavingsBefore += numeric(row.cacheSavingsBefore);
@@ -361,7 +370,9 @@
       }
       item.cacheAvailable = item.cacheAvailable || rowReadCount > 0;
     });
-    return Array.from(grouped.values()).sort((a, b) => a.date.localeCompare(b.date));
+    return Array.from(grouped.values(), item => ({ ...item,
+      pricingStatus: pricingStatus.combine(item.costStatuses),
+    })).sort((a, b) => a.date.localeCompare(b.date));
   }
 
   function renderTrend() {
@@ -373,7 +384,7 @@
     const metricName = { tokens: 'Token', requests: '请求数', cost: `费用（${currentCostLabel()}）`, cache: '缓存读取 Token', cache_savings: `缓存节省（${currentCostLabel()}）` }[metric] || 'Token';
     const monetaryMetric = metric === 'cost' || metric === 'cache_savings';
     const value = row => metric === 'requests' ? row.requests : metric === 'cost' ? (before ? row.costBefore : row.costAfter) : metric === 'cache_savings' ? (before ? row.cacheSavingsBefore : row.cacheSavingsAfter) : metric === 'cache' ? row.cache : row.total;
-    const available = row => !monetaryMetric || row.costAvailable;
+    const available = row => !monetaryMetric || row.pricingStatus !== 'unpriced';
     if (monetaryMetric && !rows.some(available)) {
       $('#trendSummary').innerHTML = '';
       host.innerHTML = '<div class="chart-empty"><div><strong>当前范围暂无可计价数据</strong><p>请在“价格与数据”中核对价格规则，或切换 Token 指标查看用量。</p></div></div>';
@@ -382,11 +393,13 @@
     }
     const values = rows.map(row => available(row) ? value(row) : null);
     const max = Math.max(...values, monetaryMetric ? .000001 : 1);
-    const formatValue = amount => monetaryMetric ? currency(amount) : number(amount);
+    const rangePricing = pricingStatus.combine(rows.map(row => row.pricingStatus));
+    const formatValue = (amount, priceStatus = 'priced') => monetaryMetric
+      ? pricingStatus.label(priceStatus, currency(amount)) : number(amount);
     const sum = values.reduce((a, b) => a + (b || 0), 0);
-    const peak = Math.max(...values);
+    const peak = Math.max(...values.filter(amount => amount !== null));
     const peakRow = rows[values.indexOf(peak)];
-    $('#trendSummary').innerHTML = `<div><span>区间合计 · ${esc(metricName)}</span><strong>${esc(formatValue(sum))}</strong></div><div><span>单日峰值 · ${esc(peakRow.date)}</span><strong>${esc(formatValue(peak))}</strong></div><div><span>有记录的日期</span><strong>${number(rows.length)} <small>天</small></strong></div>`;
+    $('#trendSummary').innerHTML = `<div><span>区间合计 · ${esc(metricName)}</span><strong>${esc(formatValue(sum, rangePricing))}</strong></div><div><span>单日峰值 · ${esc(peakRow.date)}</span><strong>${esc(formatValue(peak, rangePricing))}</strong></div><div><span>有记录的日期</span><strong>${number(rows.length)} <small>天</small></strong></div>`;
     const width = Math.max(host.clientWidth || 680, 280);
     const height = window.innerHeight <= 720 ? 190 : window.innerHeight <= 800 ? 220 : 256;
     const left = monetaryMetric ? 72 : 52, right = 24, top = 18, bottom = 34;
@@ -416,7 +429,7 @@
       if (!available(row)) return;
       const amount = value(row);
       const cacheRate = cacheMetrics.calculateRate({ cachedTokens: row.cache, cacheReadInputTokens: row.cacheInput, denominatorProvided: row.cacheInputKnown });
-      const tip = `${dateLabel(row.date)} · ${metricName}: ${monetaryMetric ? currency(amount) : number(amount)}${cacheRate === null ? '' : ` · 缓存占比 ${cachePercent(cacheRate, true)}`}`;
+      const tip = `${dateLabel(row.date)} · ${metricName}: ${formatValue(amount, row.pricingStatus)}${cacheRate === null ? '' : ` · 缓存占比 ${cachePercent(cacheRate, true)}`}`;
       const isPeak = row === peakRow;
       if (isPeak) {
         svg += `<circle cx="${x(index)}" cy="${y(amount)}" r="9" fill="none" stroke="var(--signal-peak)" opacity=".55" pointer-events="none" aria-hidden="true"/>`;
@@ -424,7 +437,7 @@
       svg += `<circle cx="${x(index)}" cy="${y(amount)}" r="${isPeak ? 4.5 : 3.5}" fill="var(--surface)" stroke="${isPeak ? 'var(--signal-peak)' : 'url(#overview-trend-stroke)'}" stroke-width="2"><title>${esc(tip)}</title></circle>`;
     });
     svg += '</svg>';
-    host.innerHTML = svg + `<details class="chart-data"><summary>查看每日数据</summary><div class="table-wrap"><table><caption class="sr-only">每日${esc(metricName)}趋势数据</caption><thead><tr><th scope="col">日期</th><th scope="col" class="num">${esc(metricName)}</th></tr></thead><tbody>${rows.map(row => `<tr><td>${esc(row.date)}</td><td class="num">${esc((available(row) ? formatValue(value(row)) : '未计价'))}</td></tr>`).join('')}</tbody></table></div></details>`;
+    host.innerHTML = svg + `<details class="chart-data"><summary>查看每日数据</summary><div class="table-wrap"><table><caption class="sr-only">每日${esc(metricName)}趋势数据</caption><thead><tr><th scope="col">日期</th><th scope="col" class="num">${esc(metricName)}</th></tr></thead><tbody>${rows.map(row => `<tr><td>${esc(row.date)}</td><td class="num">${esc((available(row) ? formatValue(value(row), row.pricingStatus) : '未计价'))}</td></tr>`).join('')}</tbody></table></div></details>`;
     if (window.CodexDashboard && window.CodexDashboard.enhanceChartTooltips) window.CodexDashboard.enhanceChartTooltips();
     $('#trendMetricNote').textContent = metric === 'cost' ? `费用趋势按${currentCostLabel()}显示；未计价记录不计入费用。` : metric === 'cache' ? '缓存趋势按可用的缓存读取 Token 汇总。' : metric === 'cache_savings' ? `缓存节省按${currentCostLabel()}显示，并依赖缓存单价配置。` : `当前显示每日${metricName}。`;
   }
@@ -574,9 +587,9 @@
     const start = (state.sessionPage - 1) * 20;
     $('#sessionsTable tbody').innerHTML = rows.slice(start, start + 20).map(row => {
       const key = str(row.thread_key);
-      const unknownCost = numeric(row.unpriced_request_count) >= numeric(row.request_count);
+      const costStatus = pricingStatus.status(row);
       const cost = currentCostKey() === 'costBefore' ? row.cost_before_discount_usd : row.cost_after_discount_usd;
-      return `<tr><td><strong title="${esc(key)}">${esc(key.slice(0, 12))}…</strong><small class="session-workspace">${esc(row.workspace || '工作空间未提供')}</small></td><td>${(row.models || []).map(esc).join('<br>')}</td><td class="num">${number(row.request_count)}</td><td class="num" title="${number(row.total_tokens)}">${compact(row.total_tokens)}</td><td class="num">${unknownCost ? '未计价' : esc(currency(cost))}${!unknownCost && row.unpriced_request_count ? '<small class="session-workspace">部分未计价</small>' : ''}</td><td>${esc(timestamp(row.last_seen))}</td><td><button class="reset-button" type="button" data-session-thread="${esc(key)}" data-session-source="${esc(row.source_kind || '')}" data-session-identity="${esc(row.source_identity || '')}" aria-label="查看会话 ${esc(key.slice(0, 12))} 的请求">查看请求</button></td></tr>`;
+      return `<tr><td><strong title="${esc(key)}">${esc(key.slice(0, 12))}…</strong><small class="session-workspace">${esc(row.workspace || '工作空间未提供')}</small></td><td>${(row.models || []).map(esc).join('<br>')}</td><td class="num">${number(row.request_count)}</td><td class="num" title="${number(row.total_tokens)}">${compact(row.total_tokens)}</td><td class="num">${esc(pricingStatus.label(costStatus, currency(cost)))}</td><td>${esc(timestamp(row.last_seen))}</td><td><button class="reset-button" type="button" data-session-thread="${esc(key)}" data-session-source="${esc(row.source_kind || '')}" data-session-identity="${esc(row.source_identity || '')}" aria-label="查看会话 ${esc(key.slice(0, 12))} 的请求">查看请求</button></td></tr>`;
     }).join('');
     $('#sessionsPanel').setAttribute('aria-busy', String(state.sessionsLoading));
     $('#sessionsMeta').textContent = `${number(rows.length)} 个会话`;
@@ -598,9 +611,10 @@
     const mode = currentCostKey();
     body.innerHTML = rows.map(row => {
       const id = str(get(row, 'request_id', 'id', 'requestId'));
-      const pricing = str(get(row, 'pricing_status', 'pricingStatus'), 'priced');
+      const costStatus = pricingStatus.status(row);
+      const pricing = str(get(row, 'pricing_status', 'pricingStatus'), costStatus);
       const price = get(row, mode === 'costBefore' ? 'cost_before_discount_usd' : 'cost_after_discount_usd', mode === 'costBefore' ? 'costBeforeDiscountUsd' : 'costAfterDiscountUsd', 'estimated_cost_usd');
-      const fee = pricing === 'unpriced' ? '未计价' : price === undefined ? '—' : currency(price);
+      const fee = pricingStatus.label(costStatus, price === undefined ? '—' : currency(price));
       const cacheRead = showMissingCache(row, 'cache_read_available', ['cache_read_tokens', 'cached_input_tokens', 'cache']);
       const cacheWrite = showMissingCache(row, 'cache_write_available', ['cache_write_tokens', 'cache_write_input_tokens', 'cache_write']);
       const speed = requestSpeedInfo(row);
@@ -639,26 +653,29 @@
     $('#tasksTable').setAttribute('aria-busy', String(state.tasksLoading));
     const summary = state.dashboard && state.dashboard.summary || {};
     const totalCost = selectedCost(summary);
+    const totalPricing = pricingStatus.status(summary);
     const mode = currentCostKey();
     body.innerHTML = tasks.map((task, index) => {
       const metrics = task.summary || {};
       const cost = costFor(metrics, mode);
       const tokens = tokenSummary(metrics);
       const requests = requestsOf(metrics);
-      const share = totalCost > 0 ? `${(cost / totalCost * 100).toFixed(1)}%` : '—';
+      const taskPricing = pricingStatus.status(metrics);
+      const share = totalCost > 0 && totalPricing === 'priced' && taskPricing === 'priced' ? `${(cost / totalCost * 100).toFixed(1)}%` : '—';
       const agents = Array.isArray(task.agents) ? task.agents : [];
       const agentRows = agents.map(agent => {
         const agentSummary = agent.summary || {};
         const agentPrice = costFor(agentSummary, mode);
         const agentTokens = tokenSummary(agentSummary);
-        const agentShare = cost > 0 ? `${(agentPrice / cost * 100).toFixed(1)}%` : '—';
+        const agentPricing = pricingStatus.status(agentSummary);
+        const agentShare = cost > 0 && taskPricing === 'priced' && agentPricing === 'priced' ? `${(agentPrice / cost * 100).toFixed(1)}%` : '—';
         const role = get(agent, 'agent_role', 'role');
         const roleName = ({main:'主代理',subagent:'子代理',unknown:'未提供'})[role] || role;
-        return `<tr><td>${esc(roleName)}</td><td>${esc(get(agent, 'model'))}</td><td title="${esc(get(agent, 'thread_key'))}">${esc(str(get(agent, 'thread_key'), '—').slice(0, 22))}</td><td class="num">${esc(compact(agentTokens))}</td><td class="num">${esc(currency(agentPrice))}</td><td class="num">${esc(agentShare)}</td></tr>`;
+        return `<tr><td>${esc(roleName)}</td><td>${esc(get(agent, 'model'))}</td><td title="${esc(get(agent, 'thread_key'))}">${esc(str(get(agent, 'thread_key'), '—').slice(0, 22))}</td><td class="num">${esc(compact(agentTokens))}</td><td class="num">${esc(pricingStatus.label(agentPricing, currency(agentPrice)))}</td><td class="num">${esc(agentShare)}</td></tr>`;
       }).join('');
       const detail = task.source_kind === 'hermes' ? 'Hermes 任务分类；父子代理关系未提供' : agents.length ? `<details class="agent-details"><summary>${number(agents.length)} 个代理</summary><div class="table-wrap nested-table"><table><thead><tr><th>角色</th><th>模型</th><th>线程</th><th class="num">Token</th><th class="num">费用 USD</th><th class="num">任务占比</th></tr></thead><tbody>${agentRows}</tbody></table></div></details>` : '—';
       const id = str(get(task, 'task_id', 'id'), `task-${index + 1}`);
-      return `<tr><td title="${esc(id)}"><strong>${esc(id.length > 34 ? `${id.slice(0, 33)}…` : id)}</strong></td><td>${esc(get(task, 'workspace'))}</td><td class="num">${esc(number(requests))}</td><td class="num">${esc(compact(tokens))}</td><td class="num">${esc(currency(cost))}</td><td class="num">${esc(share)}</td><td>${detail}</td></tr>`;
+      return `<tr><td title="${esc(id)}"><strong>${esc(id.length > 34 ? `${id.slice(0, 33)}…` : id)}</strong></td><td>${esc(get(task, 'workspace'))}</td><td class="num">${esc(number(requests))}</td><td class="num">${esc(compact(tokens))}</td><td class="num">${esc(pricingStatus.label(taskPricing, currency(cost)))}</td><td class="num">${esc(share)}</td><td>${detail}</td></tr>`;
     }).join('');
     const meta = tasks.length ? `${number(tasks.length)} 个任务 · 费用${currentCostLabel()}` : '当前筛选范围';
     $('#tasksMeta').textContent = state.tasksLoading ? `${meta} · 更新中…` : error ? `${meta} · 更新失败` : meta;
@@ -700,6 +717,7 @@
     const rates = get(rateSnapshot, 'rates', 'rate_snapshot', 'token_rates') || rateSnapshot;
     const mode = currentCostKey();
     const currentCost = mode === 'costBefore' ? before : after;
+    const costText = value => pricingStatus.label(pricingStatus.status(request), value === undefined ? '—' : currencyExact(value));
     const detailInput = get(request, 'cache_read_input_tokens', 'input_tokens', 'input');
     const detailCache = get(request, 'cache_read_tokens', 'cached_input_tokens', 'cache');
     const detailRate = cacheMetrics.calculateRate({ cachedTokens: detailCache, inputTokens: detailInput, available: get(request, 'cache_read_available') === true });
@@ -716,14 +734,14 @@
       ['缓存占比', detailCacheRate],
       ['缓存写入 Token', cacheStateText(request, 'cache_write_available', ['cache_write_tokens', 'cache_write_input_tokens', 'cache_write'])],
       ['输出 Token', number(get(request, 'output_tokens', 'output'))], ['Reasoning Token', number(get(request, 'reasoning_output_tokens', 'reasoning_tokens', 'reasoning'))],
-      ['总 Token', number(get(request, 'total_tokens', 'total'))], [`费用（当前显示：${currentCostLabel()}）`, currentCost === undefined ? '—' : currencyExact(currentCost)],
+      ['总 Token', number(get(request, 'total_tokens', 'total'))], [`费用（当前显示：${currentCostLabel()}）`, costText(currentCost)],
       ['单次请求速度（日志估算）', speed.text],
       ['请求估算耗时（含首字等待）', duration === undefined ? '—' : `≈ ${(numeric(duration) / 1000).toFixed(3)} 秒`],
       ['请求计时来源', timingSource ? requestTimingSourceLabels[timingSource] || timingSource : '—'],
       ['请求速度说明', requestSpeedNote],
       ['请求速度缺失原因', speed.reason || undefined],
-      ['费用（折扣前）', before === undefined ? '—' : currencyExact(before)],
-      ['费用（折扣后）', after === undefined ? '—' : currencyExact(after)], ['计价状态', pricingStatusLabel(get(request, 'pricing_status', 'pricingStatus'))],
+      ['费用（折扣前）', costText(before)],
+      ['费用（折扣后）', costText(after)], ['计价状态', pricingStatusLabel(get(request, 'pricing_status', 'pricingStatus'))],
       ['计价模型', get(request, 'pricing_model', 'pricingModel', 'model')],
       ['价格来源', get(request, 'pricing_source', 'price_source', 'source') ?? get(rateSnapshot, 'source', 'pricing_source')],
       ['价格规则 ID', get(request, 'pricing_rule_id', 'rule_id') ?? get(rateSnapshot, 'rule_id', 'id')],
@@ -803,20 +821,27 @@
 
   function exportRequestPage() {
     const fields = ['source_kind', 'date_attribution', 'api_call_count', 'record_kind', 'hermes_estimated_cost_usd', 'hermes_actual_cost_usd', 'cost_status', 'cost_source', 'workspace_source', 'request_id', 'timestamp', 'provider', 'workspace', 'model', 'input_tokens', 'fresh_input_tokens', 'cache_read_tokens', 'cache_read_input_tokens', 'cache_hit_rate', 'cache_write_input_tokens', 'output_tokens', 'reasoning_tokens', 'total_tokens', 'request_duration_estimate_ms', 'request_output_tokens_per_second_estimate', 'request_timing_source', 'request_speed_exclusion_reason', 'cost_display_mode', 'displayed_cost_usd', 'estimated_cost_usd', 'cost_before_discount_usd', 'cost_after_discount_usd', 'pricing_status', 'task_id', 'agent_role'];
-    const rows = (state.requests.data || []).map(row => ({
-      source_kind: row.source_kind, date_attribution: row.date_attribution, api_call_count: row.api_call_count, record_kind: row.record_kind, hermes_estimated_cost_usd: row.hermes_estimated_cost_usd, hermes_actual_cost_usd: row.hermes_actual_cost_usd, cost_status: row.cost_status, cost_source: row.cost_source, workspace_source: row.workspace_source,
-      request_id: get(row, 'request_id', 'id'), timestamp: get(row, 'timestamp', 'time'), provider: get(row, 'provider'), workspace: get(row, 'workspace'), model: get(row, 'model'),
-      input_tokens: get(row, 'input_tokens', 'input'), fresh_input_tokens: get(row, 'fresh_input_tokens'), cache_read_tokens: get(row, 'cache_read_available') === true ? get(row, 'cache_read_tokens', 'cached_input_tokens', 'cache') : '未提供',
-      cache_read_input_tokens: get(row, 'cache_read_available') === true ? get(row, 'cache_read_input_tokens', 'input_tokens', 'input') : '',
-      cache_hit_rate: get(row, 'cache_read_available') === true && numeric(get(row, 'cache_read_input_tokens', 'input_tokens', 'input')) > 0 ? (numeric(get(row, 'cache_read_tokens', 'cached_input_tokens', 'cache')) / numeric(get(row, 'cache_read_input_tokens', 'input_tokens', 'input'))).toFixed(6) : '',
-      cache_write_input_tokens: get(row, 'cache_write_available') === true ? get(row, 'cache_write_tokens', 'cache_write_input_tokens', 'cache_write') : '未提供',
-      output_tokens: get(row, 'output_tokens', 'output'), reasoning_tokens: get(row, 'reasoning_output_tokens', 'reasoning_tokens', 'reasoning'), total_tokens: totalOf(row),
-      request_duration_estimate_ms: get(row, 'request_duration_estimate_ms'),
-      request_output_tokens_per_second_estimate: get(row, 'request_output_tokens_per_second_estimate'),
-      request_timing_source: get(row, 'request_timing_source'), request_speed_exclusion_reason: get(row, 'request_speed_exclusion_reason'),
-      cost_display_mode: currentCostLabel(), displayed_cost_usd: costFor(row), estimated_cost_usd: costFor(row), cost_before_discount_usd: get(row, 'cost_before_discount_usd'), cost_after_discount_usd: get(row, 'cost_after_discount_usd'),
-      pricing_status: get(row, 'pricing_status'), task_id: get(row, 'task_id'), agent_role: get(row, 'agent_role')
-    }));
+    const mode = currentCostKey() === 'costBefore' ? 'before' : 'after';
+    const rows = (state.requests.data || []).map(row => {
+      const available = pricingStatus.status(row) !== 'unpriced';
+      const before = available ? get(row, 'cost_before_discount_usd', 'costBeforeDiscountUsd') : undefined;
+      const after = available ? get(row, 'cost_after_discount_usd', 'costAfterDiscountUsd') : undefined;
+      const displayed = (mode === 'before' ? before : after) ?? (available ? get(row, 'estimated_cost_usd') : undefined);
+      return {
+        source_kind: row.source_kind, date_attribution: row.date_attribution, api_call_count: row.api_call_count, record_kind: row.record_kind, hermes_estimated_cost_usd: row.hermes_estimated_cost_usd, hermes_actual_cost_usd: row.hermes_actual_cost_usd, cost_status: row.cost_status, cost_source: row.cost_source, workspace_source: row.workspace_source,
+        request_id: get(row, 'request_id', 'id'), timestamp: get(row, 'timestamp', 'time'), provider: get(row, 'provider'), workspace: get(row, 'workspace'), model: get(row, 'model'),
+        input_tokens: get(row, 'input_tokens', 'input'), fresh_input_tokens: get(row, 'fresh_input_tokens'), cache_read_tokens: get(row, 'cache_read_available') === true ? get(row, 'cache_read_tokens', 'cached_input_tokens', 'cache') : '未提供',
+        cache_read_input_tokens: get(row, 'cache_read_available') === true ? get(row, 'cache_read_input_tokens', 'input_tokens', 'input') : '',
+        cache_hit_rate: get(row, 'cache_read_available') === true && numeric(get(row, 'cache_read_input_tokens', 'input_tokens', 'input')) > 0 ? (numeric(get(row, 'cache_read_tokens', 'cached_input_tokens', 'cache')) / numeric(get(row, 'cache_read_input_tokens', 'input_tokens', 'input'))).toFixed(6) : '',
+        cache_write_input_tokens: get(row, 'cache_write_available') === true ? get(row, 'cache_write_tokens', 'cache_write_input_tokens', 'cache_write') : '未提供',
+        output_tokens: get(row, 'output_tokens', 'output'), reasoning_tokens: get(row, 'reasoning_output_tokens', 'reasoning_tokens', 'reasoning'), total_tokens: totalOf(row),
+        request_duration_estimate_ms: get(row, 'request_duration_estimate_ms'),
+        request_output_tokens_per_second_estimate: get(row, 'request_output_tokens_per_second_estimate'),
+        request_timing_source: get(row, 'request_timing_source'), request_speed_exclusion_reason: get(row, 'request_speed_exclusion_reason'),
+        cost_display_mode: mode, displayed_cost_usd: displayed, estimated_cost_usd: displayed, cost_before_discount_usd: before, cost_after_discount_usd: after,
+        pricing_status: get(row, 'pricing_status', 'pricingStatus') ?? pricingStatus.status(row), task_id: get(row, 'task_id'), agent_role: get(row, 'agent_role')
+      };
+    });
     downloadCsv(`codex-token-requests-${new Date().toISOString().slice(0, 10)}.csv`, fields, rows);
   }
 

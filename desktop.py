@@ -786,8 +786,9 @@ def _check_gui_smoke_window(window, *, timeout=40) -> int:
     return int(state["total"])
 
 
-def run_gui_smoke_test() -> Mapping[str, Any]:
+def run_gui_smoke_test(mark=lambda _: None) -> Mapping[str, Any]:
     """Launch a real desktop window against one synthetic Codex request."""
+    mark("Importing webview")
     import webview
 
     with tempfile.TemporaryDirectory(prefix="codex-token-gui-smoke-") as folder:
@@ -809,6 +810,7 @@ def run_gui_smoke_test() -> Mapping[str, Any]:
             runtime = DesktopRuntime(db_path=root / "usage.sqlite3", providers_path=root / "providers.json",
                                      hermes_db=root / "missing-hermes.sqlite3")
             try:
+                mark("Starting dashboard runtime")
                 url = runtime.start()
                 bridge = _GuiSmokeBridge(runtime)
                 window = _create_dashboard_window(webview, url, bridge)
@@ -816,13 +818,17 @@ def run_gui_smoke_test() -> Mapping[str, Any]:
 
                 def check_and_close() -> None:
                     try:
+                        mark("Testing the rendered dashboard")
                         result["rendered_total_tokens"] = _check_gui_smoke_window(window)
                     except Exception as error:
                         result["error"] = str(error)
                     finally:
+                        mark(f"Closing native window; verification result: {result!r}")
                         window.destroy()
 
+                mark("Starting native event loop")
                 _start_desktop_gui(webview, func=check_and_close, storage_path=str(root / "webview"))
+                mark("Native event loop returned")
                 if result.get("rendered_total_tokens") != _GUI_SMOKE_TOKENS:
                     raise RuntimeError(result.get("error") or "Native GUI exited before smoke verification")
                 return {"status": "passed", "app_version": APP_VERSION, "gui_tested": True,
@@ -830,6 +836,7 @@ def run_gui_smoke_test() -> Mapping[str, Any]:
                         "rendered_total_tokens": result["rendered_total_tokens"],
                         "checks": ["native_window_shown", "rendered_synthetic_usage", "navigate_trends_and_overview"]}
             finally:
+                mark("Stopping dashboard runtime")
                 runtime.stop()
 
 
@@ -859,17 +866,21 @@ def probe_desktop_dependencies() -> Mapping[str, Any]:
 def _gui_smoke_diagnostics(report_path: Path | None):
     """Capture frozen windowed Python stacks before the build kills a hung process."""
     if report_path is None:
-        yield
+        yield lambda _: None
         return
     import faulthandler
 
     with report_path.with_suffix(".trace").open("w", encoding="utf-8") as trace:
-        trace.write("Native GUI smoke process entered Python.\n")
-        trace.flush()
+        def mark(phase):
+            trace.write(f"{phase}\n")
+            trace.flush()
+
+        mark("Native GUI smoke process entered Python")
         faulthandler.dump_traceback_later(55, file=trace)
         try:
-            yield
+            yield mark
         finally:
+            mark("Leaving Python diagnostics context")
             faulthandler.cancel_dump_traceback_later()
 
 
@@ -880,9 +891,9 @@ def main() -> int:
         parser.add_argument("--gui-smoke-test", action="store_true")
         parser.add_argument("--gui-smoke-report", type=Path)
         args = parser.parse_args()
-        with _gui_smoke_diagnostics(args.gui_smoke_report):
+        with _gui_smoke_diagnostics(args.gui_smoke_report) as mark:
             try:
-                report, code = run_gui_smoke_test(), 0
+                report, code = run_gui_smoke_test(mark), 0
             except Exception as error:
                 report, code = {"status": "failed", "gui_tested": False, "error": str(error)}, 1
         output = json.dumps(report, ensure_ascii=False, indent=2) + "\n"

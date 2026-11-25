@@ -89,6 +89,25 @@ def source_digest(source: Path) -> str:
 
 def run(command: list[str], cwd: Path, env: dict[str, str] | None = None, *, timeout: int | None = None) -> None:
     print("Running: " + " ".join(command), flush=True)
+    if sys.platform == "darwin" and "--gui-smoke-test" in command and timeout == 90:
+        sample_path = Path(command[-1]).with_suffix(".native.txt")
+        with subprocess.Popen(command, cwd=cwd, env=env) as child:
+            try:
+                code = child.wait(timeout=65)
+            except subprocess.TimeoutExpired:
+                try:
+                    subprocess.run(["/usr/bin/sample", str(child.pid), "3", "1", "-file", str(sample_path)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8, check=False)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+                try:
+                    code = child.wait(timeout=17)
+                except subprocess.TimeoutExpired as error:
+                    child.kill()
+                    raise subprocess.TimeoutExpired(command, timeout) from error
+            if code:
+                raise subprocess.CalledProcessError(code, command)
+        return
     subprocess.run(command, cwd=cwd, env=env, check=True, timeout=timeout)
 
 
@@ -129,7 +148,10 @@ def run_packaged_gui_smoke(executable, stage, test_env, report_path):
     except subprocess.TimeoutExpired as error:
         trace_path = report_path.with_suffix(".trace")
         detail = trace_path.read_text(encoding="utf-8", errors="replace") if trace_path.is_file() else "no child trace"
-        raise RuntimeError(f"Packaged GUI smoke test timed out after 90 seconds.\n{detail}") from error
+        report = report_path.read_text(encoding="utf-8", errors="replace").strip() if report_path.is_file() else "no final report"
+        sample_path = report_path.with_suffix(".native.txt")
+        sample = sample_path.read_text(encoding="utf-8", errors="replace") if sample_path.is_file() else "no native sample"
+        raise RuntimeError(f"Packaged GUI smoke test timed out after 90 seconds.\n{detail}\nFinal report: {report}\n{sample[:18000]}") from error
     except subprocess.CalledProcessError as error:
         detail = report_path.read_text(encoding="utf-8", errors="replace").strip() if report_path.is_file() else "no report"
         raise RuntimeError(f"Packaged GUI smoke test exited with {error.returncode}: {detail}") from error

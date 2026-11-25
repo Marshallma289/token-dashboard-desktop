@@ -285,8 +285,9 @@ class GuiSmokeTimeoutDiagnosticsTests(unittest.TestCase):
             report.with_suffix(".trace").write_text(
                 "Current thread: blocked in Cocoa callback", encoding="utf-8"
             )
+            report.write_text('{"status": "rendered-but-not-exited"}', encoding="utf-8")
             with patch.object(builder, "run", side_effect=subprocess.TimeoutExpired("smoke", 90)):
-                with self.assertRaisesRegex(RuntimeError, "blocked in Cocoa callback"):
+                with self.assertRaisesRegex(RuntimeError, r"(?s)blocked in Cocoa callback.*rendered-but-not-exited"):
                     builder.run_packaged_gui_smoke(root / "app", root, {}, report)
 
 if __name__ == "__main__":

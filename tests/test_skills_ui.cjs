@@ -283,10 +283,44 @@ async function main() {
     await fs.mkdir(git);
     await fs.writeFile(path.join(git, 'config'), '[remote "origin"]\n  url = https://github.com/fixture-user/skills.git\n');
     await fs.writeFile(path.join(git, 'HEAD'), 'ref: refs/heads/main\n');
-    await dialog.getByRole('button', { name: '关联 GitHub' }).click();
+    await page.route(`${url}/api/skills`, async route => {
+      const { op, payload } = route.request().postDataJSON();
+      if (op !== 'github_discover') return route.fallback();
+      const external = payload.id.startsWith('external:');
+      await route.fulfill({ json: { ok: true, result: {
+        status: external ? 'ambiguous' : 'request_failed', matches: [], preview_id: null,
+        suggestions: external ? [
+          { url: 'https://github.com/example/skills', ref: 'main', subdir: 'skills/sample',
+            evidence: ['documented_path', 'name'], comparison: 'different' },
+          { url: 'https://github.com/other/sample', subdir: 'different-skill',
+            evidence: ['name'], fork: true, comparison: 'different' },
+        ] : [],
+        errors: external ? [] : ['github_rate_limited'], incomplete: !external,
+      } } });
+    });
+    await dialog.getByRole('button', { name: '查找 GitHub 来源' }).click();
+    await wait(dialog.getByText('GitHub 请求达到限额，稍后可以重试。'));
+    await dialog.getByRole('button', { name: '手动指定来源' }).click();
     assert.equal(await dialog.getByLabel('GitHub 仓库或技能链接').inputValue(), 'https://github.com/fixture-user/skills');
     assert.equal(await dialog.getByLabel('子目录（可选）').inputValue(), 'catalog-beta');
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    await page.keyboard.press('Escape');
+    await section('外部');
+    const externalCard = ws.locator('.skills-card').filter({
+      has: page.getByRole('button', { name: `查看 ${names.codex} 详情` }),
+    });
+    await externalCard.getByRole('button', { name: '查找 GitHub 来源' }).click();
+    await wait(dialog.getByText('找到多个候选，请按仓库和子目录核对。'));
+    await wait(dialog.getByText('文档明确指向此技能目录', { exact: false }));
+    assert.equal(await dialog.getByRole('button', { name: '确认关联' }).count(), 0);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    if (process.env.SKILLS_QA_DIR) {
+      await page.screenshot({ path: path.join(process.env.SKILLS_QA_DIR, 'skill-upstream-narrow.png') });
+      await page.setViewportSize({ width: 1120, height: 720 });
+      await page.screenshot({ path: path.join(process.env.SKILLS_QA_DIR, 'skill-upstream-desktop.png') });
+    }
+    await dialog.getByRole('button', { name: '手动核对' }).first().click();
+    assert.equal(await dialog.locator('input[name="url"]').inputValue(), 'https://github.com/example/skills');
     await page.keyboard.press('Escape');
     await ws.getByRole('button', { name: 'Hermes', exact: true }).click();
     await section('设置');

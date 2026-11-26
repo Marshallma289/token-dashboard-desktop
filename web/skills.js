@@ -33,6 +33,8 @@
   const isInstalled = item => item?.installed === true;
   const canInstall = item => !isInstalled(item) && !list(item?.install_conflicts).length;
   const canDisable = item => !isExternal(item) && isInstalled(item) && item.installed_externally !== true;
+  const canPreviewUpdate = item => !isExternal(item) && !!item?.source?.digest
+    && ['github', 'archive', 'local'].includes(item.source.kind);
   const installedSkills = skills => {
     const importedPaths = new Set(skills.filter(item => item.installed_externally).map(item => item.installed_path));
     return skills.filter(item => isInstalled(item) && !(isExternal(item) && importedPaths.has(item.installed_path)));
@@ -231,7 +233,8 @@
     const version = versionOf(skill);
     const options = { value: id, disabled: !!ws.busy };
     let action = '';
-    if (external) action = btn('导入库', 'adopt', { ...options, disabled: !text(skill.path) || !!ws.busy });
+    if (external) action = btn('查找 GitHub 来源', 'external-github-source', options)
+      + btn('导入库', 'adopt', { ...options, disabled: !text(skill.path) || skill.mode === 'link' || !!ws.busy });
     else if (canDisable(skill)) action = btn('停用', 'disable', options);
     else if (canInstall(skill)) action = btn('安装', 'install', { ...options, tone: 'quiet-primary' });
     else if (list(skill.install_conflicts).length) action = btn('查看冲突', 'detail', options);
@@ -253,6 +256,7 @@
   function renderList(ws) {
     if (!ws.data) return ws.pending.has('state') ? loading('正在读取技能工作区…') : '';
     const results = getResults(ws);
+    const missing = ws.view === 'installed' || ws.view === 'external' ? list(ws.data.missing_skill_docs) : [];
     return `<div class="skills-toolbar">
       <label class="skills-search">${icon('search')}<span class="skills-visually-hidden">搜索技能</span><input id="skillsSearch" type="search" value="${esc(ws.query)}" placeholder="搜索名称、说明或标签" autocomplete="off"></label>
       <label class="skills-visually-hidden" for="skillsSource">技能来源</label><select id="skillsSource">${option('', '全部来源', ws.source)}${results.sources.map(source => option(source, sourceLabel(source), ws.source)).join('')}</select>
@@ -260,6 +264,7 @@
       ${ws.view === 'library' ? `<label class="skills-visually-hidden" for="skillsFilter">安装和更新状态</label><select id="skillsFilter">${option('all', '全部状态', ws.filter)}${option('available', '未安装', ws.filter)}${option('updates', '可更新', ws.filter)}</select>` : ''}
       ${ws.view === 'library' ? btn('检查更新', 'check-updates', { glyph: 'refresh', disabled: !!ws.busy || !ws.data.skills.some(item => !isExternal(item)) }) : ''}
     </div>
+    ${missing.length ? `<details class="skills-document"><summary>${missing.length} 个目录缺少 SKILL.md</summary><ul class="skills-records">${missing.map(path => `<li><code>${esc(path)}</code></li>`).join('')}</ul></details>` : ''}
     ${ws.view !== 'external' ? presets(ws) : ''}
     <div id="skillsResults">${renderResults(ws, results.items)}</div>`;
   }
@@ -565,8 +570,10 @@
       const item = { ...skill, ...(result?.skill ?? result?.detail ?? result) };
       const content = text(result?.content ?? item.content ?? item.markdown ?? item.skill_md);
       const upstream = item.source?.kind === 'github' ? item.source : null;
-      const detailRows = [['工作区', agents[ws.agent]], ['状态', statusLabel(item)], ['来源', sourceLabel(sourceOf(item))],
+      const detailRows = [['作用域', `${agents[ws.agent]} · 本机全局`], ['安装根目录', rootPath(ws.data?.root)],
+        ['状态', statusLabel(item)], ['来源', sourceLabel(sourceOf(item))], ['GitHub 来源', upstream ? '已关联' : '待核实'],
         ['GitHub 仓库', upstream?.url], ['分支或标签', upstream?.ref], ['仓库内目录', upstream?.subdir],
+        ['来源提交', upstream?.revision],
         ['自动更新', upstream && item.automatic_update_paused ? '回滚后已暂停，手动应用更新后恢复' : ''],
         ['版本', versionOf(item)], ['库内目录', external ? '' : text(item.path)], ['安装目录', text(item.installed_path)],
         ...list(item.install_conflicts).map(path => ['同名冲突目录', path])];
@@ -576,46 +583,72 @@
       ${tagsOf(item).length ? `<div class="skills-tags">${tagsOf(item).map(tag).join('')}</div>` : ''}
       ${content ? `<details class="skills-document" open><summary>SKILL.md</summary><pre>${esc(content)}</pre></details>` : ''}
       ${item.readme_md ? `<details class="skills-document"><summary>README.md</summary><pre>${esc(item.readme_md)}</pre></details>` : ''}
-      <div class="skills-actions">${external ? `${btn('导入库', 'adopt', { value: id, disabled: !skill.path })}${btn('查找 GitHub 来源', 'external-github-source', { value: id })}` : `${btn('编辑标签', 'tags', { value: id, glyph: 'tag' })}${btn('版本历史', 'history', { value: id, glyph: 'clock' })}${btn('预览更新', 'update', { value: id })}${btn(upstream ? '更改 GitHub 来源' : '关联 GitHub', 'github-source', { value: id })}${btn('导出', 'export', { value: id, glyph: 'download' })}${btn('删除', 'delete', { value: id, tone: 'danger-quiet' })}`}</div>`);
+      <div class="skills-actions">${external ? `${btn('导入库', 'adopt', { value: id, disabled: !skill.path || skill.mode === 'link' })}${btn('查找 GitHub 来源', 'external-github-source', { value: id })}` : `${btn('编辑标签', 'tags', { value: id, glyph: 'tag' })}${btn('版本历史', 'history', { value: id, glyph: 'clock' })}${canPreviewUpdate(item) ? btn('预览更新', 'update', { value: id }) : ''}${btn(upstream ? '更改 GitHub 来源' : '查找 GitHub 来源', 'github-source', { value: id })}${btn('导出', 'export', { value: id, glyph: 'download' })}${btn('删除', 'delete', { value: id, tone: 'danger-quiet' })}`}</div>`);
     });
   }
 
+  const sourceEvidence = {
+    bound_source: '已关联仓库及路径', installed_source: '安装记录或本地 Git 远端及路径',
+    documented_path: '文档明确指向此技能目录', documented_repo: '文档中声明的仓库',
+    same_files: '技能文件完全一致', line_endings: '文件仅换行格式不同', same_skill_doc: 'SKILL.md 一致',
+    name: '目录名或声明名相符', shared_files: '有共同的附属文件名'
+  };
+  function discoveryCandidate(source) {
+    const repo = text(source.url).replace(/^https:\/\/github\.com\//, '');
+    const where = [source.ref || '默认分支', source.subdir || '仓库根目录'].map(esc).join(' · ');
+    const proof = list(source.evidence).map(key => sourceEvidence[key]).filter(Boolean);
+    if (source.fork) proof.push('Fork');
+    if (source.comparison === 'different') proof.push('本地文件与该提交有内容差异');
+    if (source.comparison === 'unavailable') proof.push('链接目标内容未读取');
+    return `<strong>${esc(repo)}</strong><small>${where}</small><small>${esc(proof.join(' · '))}</small>`;
+  }
   function discoverGitHubSource(ws, skill) {
     const id = idOf(skill);
+    const external = isExternal(skill);
     const title = `GitHub 来源 · ${nameOf(skill)}`;
-    const manual = btn('手动指定来源', 'github-source-manual', { value: id });
+    const action = external ? 'external-github-source' : 'github-source';
+    const manual = btn('手动指定来源', external ? 'external-github-manual' : 'github-source-manual', { value: id });
     return modalRead(ws, title, async stillOpen => {
       let result;
       try {
         result = await request(ws.agent, 'github_discover', { id });
       } catch (error) {
-        if (stillOpen()) showModal(title, `${note(error.message, 'alert')}<div class="skills-actions">${btn('重试查找', 'github-source', { value: id })}${manual}</div>`);
+        if (stillOpen()) showModal(title, `${note(error.message, 'alert')}<div class="skills-actions">${btn('重试查找', action, { value: id })}${manual}</div>`);
         return;
       }
       if (!stillOpen()) return;
       const matches = list(result?.matches);
-      const incomplete = result?.incomplete ? note('部分来源暂时无法核对，可重试查找。') : '';
-      if (!matches.length || !result?.preview_id) {
-        showModal(title, `<p>未找到与本地文件一致的公开 GitHub 版本。</p>${incomplete}<div class="skills-actions">${result?.incomplete ? btn('重试查找', 'github-source', { value: id }) : ''}${manual}</div>`);
-        return;
-      }
-      const rows = matches.map((source, index) => `<label class="skills-check-row"><input type="radio" name="candidate" value="${index}"${matches.length === 1 ? ' checked' : ''} required><span><strong>${esc(text(source.url).replace(/^https:\/\/github\.com\//, ''))}</strong><small>${esc(source.ref || '默认分支')} · ${esc(source.subdir || '仓库根目录')}</small><small>提交 ${esc(text(source.revision).slice(0, 12))}</small></span></label>`).join('');
-      showModal(title, `<p>${matches.length === 1 ? '找到一项与本地文件一致的 GitHub 来源。' : `找到 ${matches.length} 项与本地文件一致的 GitHub 来源，请选择要跟踪的仓库。`}</p>${incomplete}
-        <div class="skills-check-list" role="radiogroup" aria-label="GitHub 来源">${rows}</div><div class="skills-actions">${manual}</div>`, {
+      const suggestions = list(result?.suggestions);
+      const canLink = !external && matches.length && !!result.preview_id;
+      const messages = { matched: '已核实一个 GitHub 来源。', ambiguous: '找到多个候选，请按仓库和子目录核对。',
+        candidates: '找到可能的来源，现有证据还不足以关联。', request_failed: 'GitHub 查找未完成。',
+        not_found: '没有找到可核实的公开 GitHub 来源。' };
+      const error = list(result.errors).includes('github_rate_limited') ? 'GitHub 请求达到限额，稍后可以重试。'
+        : result.incomplete ? '部分请求失败，结果可能不完整。' : '';
+      const rows = canLink ? `<div class="skills-check-list" role="radiogroup" aria-label="已核实的 GitHub 来源">${matches.map((source, index) =>
+        `<label class="skills-check-row"><input type="radio" name="candidate" value="${index}"${matches.length === 1 ? ' checked' : ''} required><span>${discoveryCandidate(source)}</span></label>`).join('')}</div>` : '';
+      const candidates = canLink ? suggestions : [...matches, ...suggestions];
+      const alternatives = candidates.length ? `<ul class="skills-records skills-source-candidates" aria-label="GitHub 来源候选">${candidates.map((source, index) =>
+        `<li><div>${discoveryCandidate(source)}</div>${btn('手动核对', 'github-source-candidate', { value: index })}</li>`).join('')}</ul>` : '';
+      const adopt = external && matches.length && skill.mode !== 'link' ? btn('导入本机副本', 'adopt', { value: id }) : '';
+      showModal(title, `<p>${esc(messages[result.status] || messages.not_found)}</p>${note(error, 'alert')}
+        ${external ? '<p class="skills-muted">外部安装保留原文件。可以导入技能库副本，再关联和更新。</p>' : ''}
+        ${rows}${alternatives}<div class="skills-actions">${adopt}${error ? btn('重试查找', action, { value: id }) : ''}${manual}</div>`, canLink ? {
         label: '确认关联', submit: form => {
           const selected = fieldValue(form, 'candidate');
           if (selected === '' || !matches[Number(selected)]) throw new Error('请选择 GitHub 来源。');
-          return change(ws, 'github_link_discovered', { id, preview_id: result.preview_id, candidate: Number(selected) }, '已关联 GitHub 来源。');
+          return change(ws, 'github_link_discovered', { id, preview_id: result.preview_id, candidate: Number(selected) }, '已关联 GitHub 来源，当前文件已保留。');
         }
-      });
+      } : {});
+      modal.githubDiscovery = { skill, candidates };
     }, '正在查找并核对 GitHub 来源…');
   }
 
-  function showGitHubSource(ws, skill, external) {
+  function showGitHubSource(ws, skill, external, candidate = null) {
     const id = idOf(skill);
     const title = `GitHub 来源 · ${nameOf(skill)}`;
     return modalRead(ws, title, async stillOpen => {
-      const { source } = await request(ws.agent, 'github_source', { id });
+      const source = candidate ?? (await request(ws.agent, 'github_source', { id })).source;
       if (!stillOpen()) return;
       if (external) {
         if (source) showImport(ws, 'github', source);
@@ -657,7 +690,7 @@
       const result = await request(ws.agent, 'check_updates');
       const updates = list(result?.updates ?? result);
       ws.updates = new Map(updates.map(item => [idOf(item), item]));
-      ws.notice = `已检查 ${updates.length} 项：${updates.filter(item => item.status === 'available').length} 项可更新，${updates.filter(item => item.status === 'unsupported').length} 项来源不支持更新。${result?.truncated ? '本次未覆盖全部技能。' : ''}`;
+      ws.notice = `已检查 ${updates.length} 项：${updates.filter(item => item.status === 'available').length} 项可更新，${updates.filter(item => item.status === 'unsupported').length} 项没有可核对的更新来源。${result?.truncated ? '本次未覆盖全部技能。' : ''}`;
       const errors = updates.filter(item => item.status === 'error');
       if (errors.length) ws.error = `检查失败（${errors.length} 项）：${errors.map(item => `${idOf(item)}：${apiMessage(item.error ?? item)}`).join('；')}`;
     } catch (error) { ws.error = error.message; }
@@ -671,7 +704,11 @@
       if (!stillOpen()) return;
       const changes = list(result?.changes);
       const statuses = { added: '新增', modified: '修改', deleted: '删除' };
-      const body = `<p>${changes.length ? `${changes.length} 个文件有变更` : '没有可应用的更新。'}</p>${result?.local_modified ? note('已检测到本地修改，更新被阻止，现有内容会保留。', 'alert') : ''}${result?.truncated ? note('预览已截断，部分差异未展示。') : ''}<div class="skills-diff">${changes.map(item => `<details class="skills-document"><summary>${esc(statuses[item.status] || item.status)} · ${esc(item.path)}</summary><pre>${esc(text(item.diff) || (item.binary ? '二进制文件' : '未展示差异'))}</pre></details>`).join('')}</div>`;
+      const body = `<p>${changes.length ? `${changes.length} 个文件有变更` : '没有实质内容变更。'}</p>
+        ${result?.revision ? `<p class="skills-muted">来源提交 <code>${esc(text(result.revision).slice(0, 12))}</code></p>` : ''}
+        ${result?.local_modified ? note('已保留本地改动。请先导出现有副本或核对差异，再决定如何处理。', 'alert') : ''}
+        ${result?.truncated ? note('预览已截断，部分差异未展示。') : ''}<div class="skills-diff">${changes.map(item => `<details class="skills-document"><summary>${esc(statuses[item.status] || item.status)} · ${esc(item.path)}</summary><pre>${esc(text(item.diff) || (item.binary ? '二进制文件' : '未展示差异'))}</pre></details>`).join('')}</div>
+        ${result?.local_modified ? `<div class="skills-actions">${btn('导出本地副本', 'export', { value: id, glyph: 'download' })}</div>` : ''}`;
       showModal(title, body, result?.update_token && !result.local_modified ? { label: '应用更新', submit: async () => {
         await change(ws, 'apply_update', { id, update_token: result.update_token, confirm: true }, '已应用更新。');
         ws.updates.delete(id);
@@ -953,14 +990,18 @@
       if (!version) return;
       return confirmAction('回滚技能版本', `将 ${agents[ws.agent]} 中的「${nameOf(skill)}」回滚到版本 ${version}。`, () => change(ws, 'rollback', { id: idOf(skill), version }, '已回滚版本。'), { label: '确认回滚', danger: true });
     }
-    const external = ['external-detail', 'adopt', 'external-github-source'].includes(action);
+    if (action === 'github-source-candidate' && modal?.githubDiscovery) {
+      const { skill, candidates } = modal.githubDiscovery;
+      if (candidates[Number(value)]) return showGitHubSource(ws, skill, isExternal(skill), candidates[Number(value)]);
+    }
+    const external = ['external-detail', 'adopt', 'external-github-source', 'external-github-manual'].includes(action);
     const skill = selectedSkill(ws, value, external);
     if (!skill) return;
     const id = idOf(skill);
     const name = nameOf(skill);
     if (action === 'detail' || action === 'external-detail') return showDetail(ws, skill, external);
-    if (action === 'github-source' && skill.source?.kind !== 'github') return discoverGitHubSource(ws, skill);
-    if (['github-source', 'github-source-manual', 'external-github-source'].includes(action)) return showGitHubSource(ws, skill, external);
+    if (action === 'external-github-source' || action === 'github-source' && skill.source?.kind !== 'github') return discoverGitHubSource(ws, skill);
+    if (['github-source', 'github-source-manual', 'external-github-manual'].includes(action)) return showGitHubSource(ws, skill, external);
     if (action === 'adopt') return showImport(ws, 'local', { path: skill.path });
     if (action === 'update') return showUpdate(ws, skill);
     if (action === 'history') return showHistory(ws, skill);

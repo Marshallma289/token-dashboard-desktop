@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from configparser import RawConfigParser, Error as ConfigError
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -95,6 +96,8 @@ class Discovery:
                 hint = self._lock_hint(path.relative_to(self.root).as_posix(), path.name)
                 if hint:
                     return hint
+            if row["external"] and row.get("mode") == "link":
+                return None
             return _git_origin(path)
         except (ValueError, OSError, TypeError, KeyError, ConfigError):
             return None
@@ -128,8 +131,10 @@ class Discovery:
 
 def _snapshot_source(source, repo, revision):
     remote = sources._subdir(repo, source["subdir"])
-    checksum = sources._digest(sources._manifest(remote))
-    return remote, dict(source, digest=checksum, revision=revision)
+    normalized = {}
+    manifest = sources._manifest(remote, normalized=normalized)
+    return remote, dict(source, digest=sources._digest(manifest), content_digest=sources._digest(normalized),
+                        revision=revision)
 
 
 def _guard(before, checksum, *, automatic=False):
@@ -142,12 +147,14 @@ def _guard(before, checksum, *, automatic=False):
 
 
 def _link(lib, row, incoming, *, automatic=False):
-    checksum = incoming["digest"]
-    if sources._digest(sources._manifest(Path(row["path"]))) != checksum:
+    normalized = {}
+    checksum = sources._digest(sources._manifest(Path(row["path"]), normalized=normalized))
+    if checksum != incoming["digest"] and sources._digest(normalized) != incoming.get("content_digest"):
         raise SkillError("github_version_mismatch", "Local files do not match this GitHub version")
     # A managed copy of an external installation can be associated, but its
     # external deployment remains under the original installer's control.
-    return lib.link_github(row["id"], incoming, _guard(row["source"], checksum), automatic=automatic)
+    return lib.link_github(row["id"], dict(incoming, digest=checksum), _guard(row["source"], checksum),
+                           automatic=automatic)
 
 
 def skill_source(lib, payload, *, link=False):
@@ -178,7 +185,10 @@ def skill_source(lib, payload, *, link=False):
 
 
 _DISCOVERY_REPOS = 6
-_DISCOVERY_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+_DISCOVERY_SLUG = re.compile(sources._PUBLIC_SKILL_SLUG)
+_DOCUMENT_SOURCE = re.compile(
+    r"^[\s>*|_-]*(?:repository|source|upstream|github(?: repository)?|仓库|来源|上游)[*\s]*[:：|]"
+    r"[^\r\n]*?(https://github\.com/[^\s<>()\[\]\"'|]+)", re.I | re.M)
 
 
 def _market_repos(slug):
@@ -186,54 +196,132 @@ def _market_repos(slug):
     return [item["url"] for item in items if slug in (item["skill_id"].casefold(), item["name"].casefold())]
 
 
-def _repository_matches(source, manifest, *, exact_path=False):
+def _document_sources(path):
+    result = {}
+    for filename in ("SKILL.md", "README.md"):
+        try:
+            value = _read_text(path / filename)
+        except (OSError, ValueError):
+            continue
+        for url in _DOCUMENT_SOURCE.findall(value):
+            try:
+                spec = sources._github_spec({"url": url.rstrip(".,;。")})
+            except ValueError:
+                continue
+            result.setdefault((spec["url"], spec["ref"], spec["subdir"]), spec)
+    return list(result.values())[:3]
+
+
+def _discovery_names(row, path, read_files):
+    names = [row["name"], path.name]
+    if read_files:
+        try:
+            text = _read_text(path / "SKILL.md")
+        except (OSError, ValueError):
+            text = ""
+        if text.startswith("---\n"):
+            frontmatter = text.partition("\n---\n")[0]
+            for alias in re.findall(r"^aliases:[ \t]*(.*)$", frontmatter, re.M | re.I):
+                names.extend(value.strip(" \t[]\"'") for value in alias.split(",")[:3])
+    names.append(row["id"])
+    return tuple(dict.fromkeys(name.casefold() for name in names if _DISCOVERY_SLUG.fullmatch(name)))[:3]
+
+
+def _repository_matches(source, manifest, normalized, slugs, *, origin=None, exact_path=False):
     with TemporaryDirectory(prefix="skills-discover-") as temp:
         root, revision = sources._github_checkout(source, Path(temp).resolve(), source.get("revision"))
         base = sources._subdir(root, source["subdir"])
-        matches = []
-        for directory, path, files, is_skill in sources._walk(base, stop_at_skill=exact_path):
+        matches, suggestions = [], []
+        for directory, path, _, is_skill in sources._walk(base, stop_at_skill=exact_path):
             if not is_skill:
                 if exact_path:
                     break
                 continue
-            doc = next(file for file, rel in files if rel.rsplit("/", 1)[-1] == "SKILL.md")
-            if sources._checked_stat(doc).st_size != manifest["SKILL.md"][1]:
-                continue
-            if sources._manifest(directory) == manifest:
-                subdir = "/".join(part for part in (source["subdir"], path) if part)
-                matches.append(dict(source, subdir=subdir, revision=revision))
-                if len(matches) >= sources.MAX_CANDIDATES:
-                    break
-        return matches
+            declared, _ = sources._metadata(directory, directory.name)
+            names = {directory.name.casefold(), declared.casefold()}
+            matching_name = bool(names.intersection(slugs))
+            if not exact_path and not matching_name:
+                if manifest is None:
+                    continue
+                with sources._regular_file(directory / "SKILL.md") as (file, size):
+                    if size > sources.MiB:
+                        continue
+                    body = sources._normalize_text_bytes(file.read(size + 1))
+                    if (hashlib.sha256(body).hexdigest(), len(body)) != normalized["SKILL.md"]:
+                        continue
+            upstream_text = {}
+            remote = sources._manifest(directory, normalized=upstream_text)
+            same = manifest is not None and remote == manifest
+            equivalent = manifest is not None and upstream_text == normalized
+            doc_equal = upstream_text["SKILL.md"] == normalized.get("SKILL.md")
+            trusted = exact_path and origin in {"installed_source", "bound_source"}
+            evidence = [origin] if origin else []
+            if same or equivalent:
+                evidence.append("same_files" if same else "line_endings")
+            elif doc_equal:
+                evidence.append("same_skill_doc")
+            if matching_name:
+                evidence.append("name")
+            if manifest is not None and (remote.keys() & manifest.keys()) - {"SKILL.md", "README.md", "LICENSE"}:
+                evidence.append("shared_files")
+            subdir = "/".join(part for part in (source["subdir"], path) if part)
+            candidate = dict(source, subdir=subdir, revision=revision, evidence=evidence, name=declared,
+                             comparison="exact" if same else "line_endings" if equivalent
+                             else "different" if manifest is not None else "unavailable")
+            provenance = origin or not source.get("fork")
+            if ((same or equivalent) and provenance) or (trusted and manifest is not None):
+                candidate["digest"] = sources._digest(manifest if equivalent else remote)
+                candidate["content_digest"] = sources._digest(upstream_text)
+                matches.append(candidate)
+            elif len(suggestions) < 8:
+                suggestions.append(candidate)
+            if len(matches) >= sources.MAX_CANDIDATES or exact_path:
+                break
+        return matches, suggestions
 
 
-def _search_repositories(slug, manifest):
-    matches, incomplete = [], False
+def _discovery_error(exc):
+    code = getattr(exc, "code", None)
+    if isinstance(exc, FileNotFoundError) or code == "not_found":
+        return None
+    return code if code else "network"
+
+
+def _search_repositories(slugs, manifest, normalized, exclude):
+    matches, suggestions, errors = [], [], set()
     with ThreadPoolExecutor(max_workers=3) as pool:
-        providers = [pool.submit(_market_repos, slug),
-                     pool.submit(sources._github_search_repos, slug, _DISCOVERY_REPOS)]
+        providers = [pool.submit(fetch, slug) for slug in slugs
+                     for fetch in (_market_repos, lambda name: sources._github_search_repos(name, _DISCOVERY_REPOS))]
         results = []
         for provider in providers:
             try:
                 results.append(provider.result())
-            except (ValueError, OSError):
+            except (ValueError, OSError) as exc:
                 results.append([])
-                incomplete = True
-        # Alternate providers so marketplace results cannot crowd out GitHub repository-name matches.
+                if code := _discovery_error(exc):
+                    errors.add(code)
         urls = {}
-        for index in range(max(map(len, results))):
+        for index in range(max(map(len, results), default=0)):
             for result in results:
                 if index < len(result):
-                    spec = sources._github_spec({"url": result[index]})
-                    urls.setdefault(spec["url"], spec)
+                    item = result[index]
+                    spec = sources._github_spec({"url": item["url"] if isinstance(item, dict) else item})
+                    if spec["url"] in exclude:
+                        continue
+                    entry = urls.setdefault(spec["url"], spec)
+                    if isinstance(item, dict):
+                        entry["fork"] = item.get("fork", False)
         repos = list(urls.values())[:_DISCOVERY_REPOS]
-        checks = [pool.submit(_repository_matches, repo, manifest) for repo in repos]
+        checks = [pool.submit(_repository_matches, repo, manifest, normalized, slugs) for repo in repos]
         for check in checks:
             try:
-                matches.extend(check.result())
-            except (ValueError, OSError):
-                incomplete = True
-    return matches[:sources.MAX_CANDIDATES], incomplete
+                found, possible = check.result()
+                matches.extend(found)
+                suggestions.extend(possible)
+            except (ValueError, OSError) as exc:
+                if code := _discovery_error(exc):
+                    errors.add(code)
+    return matches[:sources.MAX_CANDIDATES], suggestions, errors
 
 
 def discover_github(lib, payload, *, confirm=False):
@@ -245,9 +333,9 @@ def discover_github(lib, payload, *, confirm=False):
     row = next((item for item in state["skills"] if item["id"] == sid), None)
     if row is None:
         raise SkillError("not_found", "Unknown skill")
-    if row["external"]:
-        raise SkillError("external_skill", "Import a copy before managing its source")
     if confirm:
+        if row["external"]:
+            raise SkillError("external_skill", "Import a copy before managing its source")
         selected = payload["candidate"]
 
         def validate(preview):
@@ -257,30 +345,65 @@ def discover_github(lib, payload, *, confirm=False):
         preview = sources._claim(lib, payload, "preview_id", "github_discovery", validate)
         incoming = preview["matches"][selected]
         # The preview already verified the immutable commit. Recheck local bytes and source at commit time.
-        return {"skill": lib.link_github(sid, incoming, _guard(preview["before"], incoming["digest"]))}
+        return {"skill": lib.link_github(sid, incoming, _guard(preview["before"], preview["local_digest"]))}
 
-    manifest = sources._manifest(Path(row["path"]))
+    path = Path(row["path"])
+    read_files = not (row["external"] and row.get("mode") == "link")
+    normalized = {}
+    manifest = sources._manifest(path, normalized=normalized) if read_files else None
     stored = row["source"]
     tracked = stored if isinstance(stored, dict) and stored.get("kind") == "github" else None
     hint = tracked or Discovery(lib, Path(state["root"])).hint(row)
-    matches, incomplete = [], False
+    slugs = _discovery_names(row, path, read_files)
+    matches, suggestions, errors, scanned = [], [], set(), set()
     if hint is not None:
         try:
-            matches = _repository_matches(hint, manifest, exact_path=True)
-        except (ValueError, OSError):
-            incomplete = True
-    if not matches:
-        slug = next((name.casefold() for name in (row["name"], sid) if _DISCOVERY_SLUG.fullmatch(name)), None)
-        if slug:
-            matches, search_incomplete = _search_repositories(slug, manifest)
-            incomplete |= search_incomplete
+            matches, suggestions = _repository_matches(
+                hint, manifest, normalized, slugs, origin="bound_source" if tracked else "installed_source",
+                exact_path=True)
+        except (ValueError, OSError) as exc:
+            if code := _discovery_error(exc):
+                errors.add(code)
+    if not matches and read_files:
+        for spec in _document_sources(path):
+            if hint and (spec["url"], spec["ref"], spec["subdir"]) == (hint["url"], hint["ref"], hint["subdir"]):
+                continue
+            try:
+                found, possible = _repository_matches(
+                    spec, manifest, normalized, slugs, origin="documented_path" if spec["subdir"] else "documented_repo",
+                    exact_path=bool(spec["subdir"]))
+                matches.extend(found)
+                suggestions.extend(possible)
+                if not spec["subdir"]:
+                    scanned.add(spec["url"])
+            except (ValueError, OSError) as exc:
+                if code := _discovery_error(exc):
+                    errors.add(code)
+    if not matches and not (hint is not None and suggestions and not read_files):
+        found, possible, failed = _search_repositories(slugs, manifest, normalized, scanned)
+        matches.extend(found)
+        suggestions.extend(possible)
+        errors |= failed
+    match_by_source = {}
+    for candidate in matches:
+        match_by_source.setdefault((candidate["url"], candidate["subdir"]), candidate)
+    matches = list(match_by_source.values())[:sources.MAX_CANDIDATES]
+    seen = set(match_by_source)
+    alternatives = []
+    for candidate in suggestions:
+        key = candidate["url"], candidate["subdir"]
+        if key not in seen and len(alternatives) < 8:
+            alternatives.append(candidate)
+            seen.add(key)
     preview_id = None
-    if matches:
-        checksum = sources._digest(manifest)
-        for candidate in matches:
-            candidate["digest"] = checksum
-        preview_id = sources._keep(lib, "github_discovery", {"id": sid, "before": stored, "matches": matches})
-    return {"matches": matches, "preview_id": preview_id, "incomplete": incomplete}
+    if matches and not row["external"]:
+        preview_id = sources._keep(lib, "github_discovery", {
+            "id": sid, "before": stored, "matches": matches, "local_digest": sources._digest(manifest)})
+    count = len(matches) + len(alternatives)
+    status = ("matched" if len(matches) == 1 else "ambiguous") if matches else (
+        "ambiguous" if count > 1 else "candidates" if count else "request_failed" if errors else "not_found")
+    return {"matches": matches, "suggestions": alternatives, "preview_id": preview_id, "status": status,
+            "errors": sorted(errors), "incomplete": bool(errors)}
 
 
 def run_updates(lib, cancelled=lambda: False):
@@ -332,6 +455,10 @@ def run_updates(lib, cancelled=lambda: False):
                         _link(lib, row, incoming, automatic=True)
                         summary["linked"] += 1
                     elif checksum != source["digest"]:
+                        normalized = {}
+                        sources._manifest(Path(row["path"]), normalized=normalized)
+                        if incoming["content_digest"] == sources._digest(normalized):
+                            continue
                         staged = sources._stage(work, index, sid)
                         if sources._digest(sources._manifest(remote, staged)) != checksum:
                             raise SkillError("source_changed", "Snapshot changed during update")

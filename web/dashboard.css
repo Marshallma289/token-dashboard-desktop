@@ -788,7 +788,9 @@ body[data-theme="dark"] :is(.update-dialog, .data-settings-dialog, .analytics-di
 .skills-records { list-style: none; margin: 10px 0; padding: 0; }
 .skills-records > li { display: flex; gap: 10px; justify-content: space-between; align-items: center; padding: 9px 0; border-top: 1px solid var(--border); }
 .skills-records > li > div { min-width: 0; overflow-wrap: anywhere; }
-.skills-records > li > div > span, .skills-check-row small { display: block; color: var(--text-muted); font-size: 12px; }
+.skills-records > li > div > span, .skills-check-row small, .skills-source-candidates small { display: block; color: var(--text-muted); font-size: 12px; }
+.skills-source-candidates .skills-btn { flex: none; }
+.skills-document li > code { padding-inline: 10px; overflow-wrap: anywhere; }
 .skills-dialog { position: fixed; width: min(650px, calc(100% - 26px)); max-width: none; max-height: calc(100dvh - 28px); margin: auto; padding: 0; border: 1px solid var(--border-strong); border-radius: var(--panel-radius); background: var(--surface); }
 .skills-dialog::backdrop { background: rgb(8 13 34 / .66); }
 .skills-dialog-form { display: flex; flex-direction: column; min-height: 0; max-height: inherit; }

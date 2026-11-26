@@ -366,7 +366,16 @@ class SkillsService:
             except (ValueError, OSError) as error:
                 raise InvalidSkillsRequest(_public_error(op, getattr(error, "code", None))) from None
 
-        # Reads can inspect several files, so they share the write lock too.
+        # Source discovery can block on public network requests. The library
+        # snapshots its state separately, and confirmation rechecks local bytes
+        # and the previous association inside the write transaction.
+        if op == "github_discover":
+            try:
+                return self._dispatch(agent, op, payload)
+            except (ValueError, OSError) as error:
+                raise InvalidSkillsRequest(_public_error(op, getattr(error, "code", None))) from None
+
+        # Other reads can inspect several files, so they share the write lock too.
         # The lock covers construction and both agents, across server instances.
         with self._lock:
             if op in {"activity", "activity_export"}:

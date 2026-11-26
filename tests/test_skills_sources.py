@@ -7,6 +7,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import urlencode
 
 import skills_sources as sources
 from skills_core import SkillLibrary
@@ -240,6 +241,41 @@ class SkillSourcesTest(unittest.TestCase):
         self.assertFalse(self.call("apply_update", id=sid, update_token=preview["update_token"], confirm=True)["ok"])
         self.assertIn("deployed edits", deployed.read_text(encoding="utf-8"))
         self.assertIn("original", (self.lib.skill_path(sid) / "SKILL.md").read_text(encoding="utf-8"))
+
+    def test_text_line_endings_do_not_hide_a_real_skill_update_or_binary_change(self):
+        directory = self.skill("demo")
+        source_doc = directory / "SKILL.md"
+        source_doc.write_bytes(doc("demo").replace("\n", "\r\n").encode())
+        (directory / "example.txt").write_bytes(b"same\r\n")
+        (directory / "opaque.bin").write_bytes(b"opaque\r\n")
+        sid = self.imported(directory)
+        source_doc.write_bytes(doc("demo").encode())
+        (directory / "example.txt").write_bytes(b"same\n")
+        status = self.ok("check_updates", ids=[sid])["updates"][0]
+        self.assertEqual(status["status"], "unchanged")
+        self.assertFalse(status["local_modified"])
+        self.assertEqual(self.ok("update_preview", id=sid)["changes"], [])
+        source_doc.write_bytes(doc("demo", "a different version").encode())
+        (directory / "opaque.bin").write_bytes(b"opaque\n")
+        diff = self.ok("update_preview", id=sid)
+        self.assertEqual([row["path"] for row in diff["changes"]], ["SKILL.md", "opaque.bin"])
+        self.assertIn("+a different version", diff["changes"][0]["diff"])
+        self.assertIn(b"\r\n", (self.lib.skill_path(sid) / "SKILL.md").read_bytes())
+
+    def test_public_github_search_allowlist_accepts_only_a_skill_slug(self):
+        base = "https://api.github.com/search/repositories?"
+        hosts = {"api.github.com"}
+        valid = {"q": '"researchwrite" in:name,description,readme', "per_page": 6}
+        self.assertEqual(sources._network_url(base + urlencode(valid), hosts).path, "/search/repositories")
+        for invalid in (
+            {**valid, "q": '"C:/Users/private/project" in:name,description,readme'},
+            {**valid, "q": '"sample owner:private-user" in:name,description,readme'},
+            {**valid, "per_page": 100},
+            {**valid, "access_token": "fixture"},
+        ):
+            with self.subTest(query=invalid), self.assertRaises(sources.SourceError) as failure:
+                sources._network_url(base + urlencode(invalid), hosts)
+            self.assertEqual(failure.exception.code, "network_target")
 
     def test_github_subdir_market_filter_and_pinned_commit(self):
         first, second = "a" * 40, "b" * 40

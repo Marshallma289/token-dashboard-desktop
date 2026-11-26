@@ -236,6 +236,10 @@ python backend.py serve --db work/hermes-usage.sqlite3 --root work/empty-codex -
 
 如果设置了 `CODEX_HOME`，则读取其下的 `sessions` 和 `archived_sessions`。浏览器模式及命令行也可重复传入 `--root` 指定扫描目录。
 
+看板只统计可识别的 Token 用量事件。ChatGPT 派发的任务即使在本机执行，如果没有在扫描目录写入这类事件，用量仍未知，也不会加入合计。要核对本机数据源，可在 **数据来源与扫描诊断** 刷新，确认显示的目录与运行 Codex 的 `CODEX_HOME` 一致。
+
+直接使用本机 Codex CLI 时，保留会话的执行可生成供看板读取的会话文件。官方 `codex exec --json` 的标准输出是独立的事件流，当前看板扫描的是会话文件。 [Codex 非交互模式](https://developers.openai.com/codex/non-interactive-mode)
+
 ### 数据保存位置
 
 桌面版和浏览器版默认使用相同的独立数据目录：

@@ -873,10 +873,13 @@
     };
     const roles = { sessions: '会话日志', archive: '归档日志', state_db: '主数据库', profile: '配置数据库' };
     return sources.filter(source => ['codex', 'hermes'].includes(source.kind)).map(source => {
-      const title = source.kind === 'codex' ? 'Codex' : 'Hermes';
+      const codex = source.kind === 'codex';
+      const title = codex ? 'Codex' : 'Hermes';
       const paths = Array.isArray(source.paths) ? source.paths : [];
-      const hint = statusHints[source.status];
-      const locationHint = source.kind === 'codex' ? '非默认位置请核对启动环境的 CODEX_HOME。' : '非默认位置请核对 HERMES_HOME，或用 --hermes-db 指定数据库。';
+      const missingUsage = codex && ['not_configured', 'empty'].includes(source.status);
+      const hint = missingUsage ? '请核对 CODEX_HOME，并在本机 Codex 里完成一次会保存会话的请求，再刷新诊断。' : statusHints[source.status];
+      const locationHint = codex ? '非默认位置请核对启动环境的 CODEX_HOME。' : '非默认位置请核对 HERMES_HOME，或用 --hermes-db 指定数据库。';
+      const scope = codex ? '<p class="analytics-muted">看板只统计这些目录里的 Token 用量事件。ChatGPT 派发的任务即使在本机执行，缺少这类事件时，用量仍未知。</p>' : '';
       const rows = paths.map(item => {
         const count = item.records_seen !== undefined ? ` · ${knownNumber(item.records_seen)} 条源记录`
           : item.files_seen !== undefined ? ` · ${knownNumber(item.files_seen)} 个 JSONL` : '';
@@ -884,7 +887,8 @@
         const colorClass = item.status === 'readable' ? ' is-available' : ['unreadable', 'invalid', 'missing'].includes(item.status) ? ' is-unavailable' : '';
         return `<li><span>${esc(roles[item.role] || '路径')} · ${esc(item.path)}${esc(count)}</span><b class="root-state${colorClass}">${esc(state)}</b></li>`;
       }).join('');
-      return `<section class="diagnostic-source"><h3>${title} · ${esc(statusLabels[source.status] || '状态未知')}</h3><p>已保存 ${knownNumber(source.available_records)} 条用量记录${source.scan_errors ? ` · 扫描异常 ${knownNumber(source.scan_errors)}` : ''}</p>${hint ? `<p class="analytics-muted">${esc(hint)}${esc(locationHint)}</p>` : ''}${rows ? `<ul>${rows}</ul>` : ''}</section>`;
+      const status = missingUsage ? '暂无可计量记录' : (statusLabels[source.status] || '状态未知');
+      return `<section class="diagnostic-source"><h3>${title} · ${esc(status)}</h3><p>已保存 ${knownNumber(source.available_records)} 条用量记录${source.scan_errors ? ` · 扫描异常 ${knownNumber(source.scan_errors)}` : ''}</p>${scope}${hint ? `<p class="analytics-muted">${esc(hint)}${missingUsage ? '' : esc(locationHint)}</p>` : ''}${rows ? `<ul>${rows}</ul>` : ''}</section>`;
     }).join('');
   }
 

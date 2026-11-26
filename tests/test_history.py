@@ -151,11 +151,13 @@ class DurableHistoryTests(unittest.TestCase):
 
     def test_transaction_failure_retries_without_duplicates(self):
         self.save()
-        self.save(200, response='r2')
+        # Equal-size rewrites can share an mtime on Windows.
+        write_lines(self.path, [session(), turn('gpt-6.1-sol'), usage('thread-a', 'r2', 200)])
+        self.db.scan(force=True)
         write_lines(self.path, [session(), turn('gpt-6.1-sol'), usage('thread-a', 'r3', 300)])
         with patch.object(self.db, '_rebuild_logical_records', side_effect=RuntimeError('interrupted')):
             with self.assertRaises(RuntimeError):
-                self.db.scan()
+                self.db.scan(force=True)
         self.reopen()
         self.db.scan()
         self.assertEqual(self.totals()['total_tokens'], 600)

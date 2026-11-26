@@ -553,7 +553,7 @@ class SkillLibrary:
             'automatic_update_paused': rec['history'][-1]['reason'] == 'rollback',
         }
 
-    def _externals(self, root, owned=()):
+    def _externals(self, root, owned=(), *, missing_docs=None):
         if info(root) is None:
             return
         device = root.lstat().st_dev
@@ -574,7 +574,12 @@ class SkillLibrary:
                 elif stat.S_ISDIR(st.st_mode) and not path.is_mount():
                     text = doc(path, 'SKILL.md')
                     if text is None:
-                        yield from walk(path)
+                        found = False
+                        for skill in walk(path):
+                            found = True
+                            yield skill
+                        if missing_docs is not None and parent == root and path.name != '.system' and not found:
+                            missing_docs.append(str(path))
                         continue
                 else:
                     continue
@@ -594,12 +599,13 @@ class SkillLibrary:
         active = [rec for rec in data['skills'].values() if not rec['deleted']]
         deployments = {rec['id']: self._deployment_status(root, rec) for rec in active}
         owned = {root / skill_id for skill_id, (installed, _) in deployments.items() if installed}
-        externals = list(self._externals(root, owned if self.agent == 'hermes' else ()))
+        missing_docs = []
+        externals = list(self._externals(root, owned if self.agent == 'hermes' else (), missing_docs=missing_docs))
         records = [self._record(root, rec, deployment_status=deployments[rec['id']], externals=externals)
                    for rec in active]
         records.extend(row for row in externals if root / row['relative_path'].partition('/')[0] not in owned)
         records.sort(key=lambda rec: (rec['name'].casefold(), rec['id']))
-        return {'skills': records, 'presets': self._presets(data), 'root': str(root),
+        return {'skills': records, 'presets': self._presets(data), 'root': str(root), 'missing_skill_docs': missing_docs,
                 'automation': data.get('automation', {})}
 
     def automation(self, changes=None):

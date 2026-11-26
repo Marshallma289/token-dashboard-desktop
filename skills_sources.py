@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import unquote, urlencode, urljoin, urlsplit
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlsplit
 from urllib.error import HTTPError
 from urllib.request import HTTPSHandler, HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
@@ -40,6 +40,9 @@ _DEVICE = re.compile(r"(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|(?:COM|LPT)[1-9\u00b9
 _OWNER = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9-]{0,38}")
 _REPO = re.compile(r"[a-zA-Z0-9_.-]{1,100}")
 _SHA = re.compile(r"[0-9a-f]{40}", re.I)
+_PUBLIC_SKILL_SLUG = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}"
+_TEXT_FILES = frozenset({".md", ".txt", ".json", ".toml", ".yaml", ".yml", ".py", ".sh", ".ps1",
+                         ".js", ".mjs", ".cjs", ".ts", ".html", ".css", ".xml", ".csv", ".tsv"})
 _GROUPS = (frozenset(("api.github.com", "codeload.github.com")), frozenset(("skills.sh", "www.skills.sh")))
 _tickets = {}
 _ticket_lock = threading.Lock()
@@ -266,11 +269,22 @@ def _snapshot_file(root, rel):
             yield file
 
 
-def _manifest(root, dest=None, budget=MAX_TREE):
+def _normalize_text_bytes(raw):
+    if b"\r\n" not in raw or b"\0" in raw:
+        return raw
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw
+    return raw.replace(b"\r\n", b"\n")
+
+
+def _manifest(root, dest=None, budget=MAX_TREE, *, normalized=None):
     files, total = {}, 0
     for _, _, entries, _ in _walk(root):
         for path, rel in entries:
             h = hashlib.sha256()
+            text = bytearray() if normalized is not None and path.suffix.lower() in _TEXT_FILES else None
             with _regular_file(path) as (file, size):
                 if size > MAX_FILE or total + size > min(MAX_TREE, budget):
                     _fail("limit", "Skill exceeds the file or total size limit.")
@@ -281,12 +295,17 @@ def _manifest(root, dest=None, budget=MAX_TREE):
                         if count > size:
                             _fail("source_changed", "File grew while being read.")
                         h.update(chunk)
+                        if text is not None:
+                            text.extend(chunk)
                         if out is not None:
                             out.write(chunk)
                 if count != size:
                     _fail("source_changed", "File size changed while being read.")
             total += size
             files[rel] = (h.hexdigest(), size)
+            if normalized is not None:
+                canonical = _normalize_text_bytes(text) if text is not None else None
+                normalized[rel] = (hashlib.sha256(canonical).hexdigest(), len(canonical)) if canonical is not text else files[rel]
     if "SKILL.md" not in files:
         _fail("no_skill", "The selected directory has no SKILL.md.")
     return files
@@ -340,13 +359,23 @@ def _network_url(url, hosts):
             or any(ord(c) < 33 or ord(c) > 126 or c == "\\" for c in url)):
         _fail("network_target", "Network target is not on this provider's HTTPS allowlist.")
     allowed = {
-        "api.github.com": r"/(?:repos/[\w.-]+/[\w.-]+|repositories/[0-9]+)/commits/?",
+        "api.github.com": r"/(?:(?:repos/[\w.-]+/[\w.-]+|repositories/[0-9]+)/commits|search/repositories)/?",
         "codeload.github.com": r"/[\w.-]+/[\w.-]+/(?:legacy\.zip|zip)/[0-9a-fA-F]{40}/?",
         "skills.sh": r"/(?:hot/?|trending/?|api/search/?)?",
         "www.skills.sh": r"/(?:hot/?|trending/?|api/search/?)?",
     }
     if not re.fullmatch(allowed[p.hostname], p.path, re.ASCII):
         _fail("network_target", "Network endpoint is not on the provider's allowlist.")
+    if p.hostname == "api.github.com" and p.path.rstrip("/") == "/search/repositories":
+        try:
+            search = parse_qs(p.query, strict_parsing=True, max_num_fields=2)
+        except ValueError as exc:
+            raise SourceError("network_target", "Invalid GitHub search parameters.") from exc
+        query, count = search.get("q", []), search.get("per_page", [])
+        if (set(search) != {"q", "per_page"} or len(query) != 1 or len(count) != 1
+                or not re.fullmatch(rf'"{_PUBLIC_SKILL_SLUG}" in:name,description,readme', query[0])
+                or not re.fullmatch(r"[1-9]|10", count[0])):
+            _fail("network_target", "Invalid GitHub search parameters.")
     return p
 
 
@@ -379,6 +408,9 @@ def _fetch(url, limit, output=None):
                         _fail("network_target", "Invalid redirect location.")
                     url = urljoin(url, location)
                     continue
+                if status == 429 or (status == 403 and (response.headers.get("X-RateLimit-Remaining") == "0"
+                                                       or response.headers.get("Retry-After"))):
+                    _fail("github_rate_limited" if "api.github.com" in hosts else "network", "Provider rate limit reached.")
                 if status != 200:
                     _fail("not_found" if status == 404 else "network", f"Provider returned HTTP {status}.")
                 length = response.headers.get("Content-Length")
@@ -416,7 +448,7 @@ def _json(raw):
 
 
 def _github_search_repos(slug, limit):
-    params = urlencode({"q": f"{slug} in:name", "per_page": limit})
+    params = urlencode({"q": f'"{slug}" in:name,description,readme', "per_page": limit})
     result = _json(_fetch(f"https://api.github.com/search/repositories?{params}", 2 * MiB))
     items = result.get("items") if isinstance(result, dict) else None
     if not isinstance(items, list):
@@ -430,7 +462,7 @@ def _github_search_repos(slug, limit):
             owner, repo = _repo_name(*name.split("/"))
         except SourceError:
             continue
-        repos.append(f"https://github.com/{owner}/{repo}")
+        repos.append({"url": f"https://github.com/{owner}/{repo}", "fork": item.get("fork") is True})
     return repos
 
 
@@ -647,11 +679,13 @@ def _preview(lib, op, payload, work):
             continue
         if len(candidates) >= MAX_CANDIDATES:
             _fail("limit", "Too many skills; select a narrower directory.")
-        manifest = _manifest(directory, budget=budget)
+        normalized = {} if revision else None
+        manifest = _manifest(directory, budget=budget, normalized=normalized)
         budget -= _size(manifest)
         actual_source = dict(source, subdir=rel, digest=_digest(manifest))
         if revision:
             actual_source["revision"] = revision
+            actual_source["content_digest"] = _digest(normalized)
         candidate_id = hashlib.sha256(rel.encode("utf-8")).hexdigest()[:24]
         candidates.append({"id": candidate_id, "name": name, "description": description,
                            "path": rel or ".", "source": actual_source})
@@ -755,15 +789,23 @@ def _comparison(lib, sid, row, work, *, snapshot=False, checkout=None):
     source = _stored(row)
     current = _local_path(str(lib.skill_path(sid)))
     old_path = work / "current" if snapshot else None
-    old = _manifest(current, old_path)
+    old_text, new_text = {}, {}
+    old = _manifest(current, old_path, normalized=old_text)
     root, revision = (checkout(source, work) if checkout else _checkout(source, work))
     source_root = _subdir(root, source["subdir"])
     new_path = work / "proposed" if snapshot else None
-    new = _manifest(source_root, new_path)
+    new = _manifest(source_root, new_path, normalized=new_text)
     incoming = dict(source, digest=_digest(new))
     if revision:
         incoming["revision"] = revision
-    return source, incoming, old, new, old_path, new_path
+        incoming["content_digest"] = _digest(new_text)
+    return source, incoming, old, old_text, new_text, old_path, new_path
+
+
+def _locally_modified(row, source, old, old_text, new_text):
+    reference = source.get("content_digest")
+    return bool(row.get("modified")) or (old_text != new_text and _digest(old) != source["digest"]
+                                          and (not reference or _digest(old_text) != reference))
 
 
 def _check_updates(lib, payload, work):
@@ -793,9 +835,10 @@ def _check_updates(lib, payload, work):
             directory = work / str(index)
             directory.mkdir()
             row = rows.get(sid) or _record(lib, sid)
-            source, incoming, old, new, _, _ = _comparison(lib, sid, row, directory, checkout=checkout)
-            local_modified = bool(row.get("modified")) or _digest(old) != source["digest"]
-            available = incoming["digest"] != source["digest"] and old != new
+            source, incoming, old, old_text, new_text, _, _ = _comparison(lib, sid, row, directory, checkout=checkout)
+            local_modified = _locally_modified(row, source, old, old_text, new_text)
+            available = (old_text != new_text and incoming["digest"] != source["digest"]
+                         and (not source.get("content_digest") or incoming.get("content_digest") != source["content_digest"]))
             updates.append({"id": sid, "status": "available" if available else "unchanged", "local_modified": local_modified,
                             "revision": incoming.get("revision")})
         except (ValueError, OSError, RuntimeError) as exc:
@@ -816,6 +859,8 @@ def _diff_text(root, rel, entry):
         return [], True, False
     if "\x00" in text:
         return [], True, False
+    if Path(rel).suffix.lower() in _TEXT_FILES:
+        text = text.replace("\r\n", "\n")
     lines = text.splitlines(keepends=True)
     return lines, False, len(lines) > 400
 
@@ -847,11 +892,11 @@ def _changes(old, new, old_path, new_path):
 def _update_preview(lib, payload, work):
     sid = _string(payload, "id", limit=256)
     row = _record(lib, sid)
-    source, incoming, old, new, old_path, new_path = _comparison(lib, sid, row, work, snapshot=True)
-    changes, truncated = _changes(old, new, old_path, new_path)
+    source, incoming, old, old_text, new_text, old_path, new_path = _comparison(lib, sid, row, work, snapshot=True)
+    changes, truncated = _changes(old_text, new_text, old_path, new_path)
     base = _digest(old)
     token = _keep(lib, "update", (sid, source, base, incoming)) if changes else None
-    return {"id": sid, "update_token": token, "local_modified": bool(row.get("modified")) or base != source["digest"],
+    return {"id": sid, "update_token": token, "local_modified": _locally_modified(row, source, old, old_text, new_text),
             "changes": changes, "truncated": truncated, "revision": incoming.get("revision")}
 
 
